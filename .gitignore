@@ -1,0 +1,4 @@
+/stapler-mcp
+/dist/
+*.log
+.DS_Store
