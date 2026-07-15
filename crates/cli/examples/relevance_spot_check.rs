@@ -17,7 +17,9 @@ use serde_json::json;
 
 use stapler_mcp_core::client::{self, EnsureOptions};
 use stapler_mcp_core::paths;
-use stapler_mcp_native::{NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner};
+use stapler_mcp_native::{
+    NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
+};
 
 const SEED_URL: &str = "https://tokio.rs/tokio/tutorial";
 const SOURCE_NAME: &str = "tokio-tutorial-spot-check";
@@ -42,7 +44,10 @@ async fn main() {
     // `CARGO_BIN_EXE_*` is only set by cargo for integration tests, not
     // examples — fall back to the standard workspace target-dir layout.
     let exe = std::env::var("STAPLER_MCP_BIN").unwrap_or_else(|_| {
-        format!("{}/../../target/debug/stapler-mcp", env!("CARGO_MANIFEST_DIR"))
+        format!(
+            "{}/../../target/debug/stapler-mcp",
+            env!("CARGO_MANIFEST_DIR")
+        )
     });
 
     println!("Starting/ensuring daemon (first run downloads the ~90MB embedding model)...");

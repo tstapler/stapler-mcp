@@ -83,8 +83,11 @@ where
         .spawn_daemon(opts.exe_hint.as_deref(), log_path)
         .await?;
 
-    let deadline =
-        clock.now_millis() + opts.startup_timeout.unwrap_or(DEFAULT_STARTUP_TIMEOUT).as_millis() as u64;
+    let deadline = clock.now_millis()
+        + opts
+            .startup_timeout
+            .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
+            .as_millis() as u64;
     let mut backoff = POLL_START;
     let mut last_err = PortError::Other("daemon never became reachable".into());
     loop {

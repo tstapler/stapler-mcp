@@ -41,7 +41,9 @@ impl EnvPort for TestEnv {
 /// connection gets the same canned JSON body) so this test doesn't need a
 /// mock-server crate for one fixed response.
 async fn spawn_mock_brave_server(body: &'static str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock server");
     let addr = listener.local_addr().expect("mock server addr");
     tokio::spawn(async move {
         loop {
@@ -96,9 +98,11 @@ async fn daemon_architecture_and_tools_round_trip() {
     let exe = env!("CARGO_BIN_EXE_stapler-mcp").to_string();
 
     // 1. Pre-daemon ping fails.
-    assert!(client::ping(&socket, &sock_path, Duration::from_millis(500))
-        .await
-        .is_err());
+    assert!(
+        client::ping(&socket, &sock_path, Duration::from_millis(500))
+            .await
+            .is_err()
+    );
 
     // 2. ensure_daemon auto-spawns and becomes reachable within a bounded timeout.
     //    Generous timeout: this daemon also launches a real headless browser.
@@ -106,9 +110,11 @@ async fn daemon_architecture_and_tools_round_trip() {
         startup_timeout: Some(Duration::from_secs(30)),
         exe_hint: Some(exe.clone()),
     };
-    client::ensure_daemon(&socket, &spawner, &sleeper, &clock, &sock_path, &log_path, opts)
-        .await
-        .expect("daemon should auto-start");
+    client::ensure_daemon(
+        &socket, &spawner, &sleeper, &clock, &sock_path, &log_path, opts,
+    )
+    .await
+    .expect("daemon should auto-start");
 
     // 3. Real ping round trip.
     client::ping(&socket, &sock_path, Duration::from_secs(2))
@@ -123,11 +129,16 @@ async fn daemon_architecture_and_tools_round_trip() {
         startup_timeout: Some(Duration::from_secs(5)),
         exe_hint: Some(exe.clone()),
     };
-    client::ensure_daemon(&socket, &spawner, &sleeper, &clock, &sock_path, &log_path, opts2)
-        .await
-        .expect("second ensure_daemon should succeed against the same daemon");
+    client::ensure_daemon(
+        &socket, &spawner, &sleeper, &clock, &sock_path, &log_path, opts2,
+    )
+    .await
+    .expect("second ensure_daemon should succeed against the same daemon");
     let pid_after = std::fs::read_to_string(&lock_path).expect("lockfile should still exist");
-    assert_eq!(pid_before, pid_after, "no second daemon should have been spawned");
+    assert_eq!(
+        pid_before, pid_after,
+        "no second daemon should have been spawned"
+    );
 
     // 5. `brave_web_search` against the mock server: header/query plumbing
     //    and response reduction all work over the real socket.
@@ -161,9 +172,15 @@ async fn daemon_architecture_and_tools_round_trip() {
     assert_eq!(fetch_result["finalUrl"], "https://example.com/");
 
     // 7. `shutdown` cleanly stops the daemon.
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         client::ping(&socket, &sock_path, Duration::from_millis(500))

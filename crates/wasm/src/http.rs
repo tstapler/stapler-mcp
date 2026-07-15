@@ -15,9 +15,17 @@ extern "C" {
 pub struct WasmHttp;
 
 impl HttpClient for WasmHttp {
-    async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse, PortError> {
-        let headers_map: HashMap<&str, &str> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let headers_json = serde_json::to_string(&headers_map).map_err(|e| PortError::Other(e.to_string()))?;
+    async fn get(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, PortError> {
+        let headers_map: HashMap<&str, &str> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let headers_json =
+            serde_json::to_string(&headers_map).map_err(|e| PortError::Other(e.to_string()))?;
 
         let result = JsFuture::from(js_http_get(url, &headers_json))
             .await

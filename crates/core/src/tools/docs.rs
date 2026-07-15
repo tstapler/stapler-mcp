@@ -270,6 +270,12 @@ pub struct SourceLockGuard<'a> {
     id: SourceId,
 }
 
+impl Default for SourceLocks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SourceLocks {
     pub fn new() -> Self {
         SourceLocks {
@@ -338,7 +344,11 @@ struct FetchedPage {
 fn sha256_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Maps common HTTP status codes to their reason phrase for `seed_fetch_error`'s
@@ -413,7 +423,10 @@ fn embedding_input_for(page_title: &str, chunk: &Chunk) -> String {
 /// yielding to the scheduler between sub-batches (not after the last one) so
 /// a long `index_docs` call doesn't block every other in-flight daemon tool
 /// call for its entire duration (Story 4.1.3's design note).
-async fn embed_in_sub_batches<E: Embedder>(embedder: &E, inputs: &[String]) -> Result<Vec<Vec<f32>>, String> {
+async fn embed_in_sub_batches<E: Embedder>(
+    embedder: &E,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
     let mut embeddings = Vec::with_capacity(inputs.len());
     let batches: Vec<&[String]> = inputs.chunks(SUB_BATCH_SIZE).collect();
     let batch_count = batches.len();
@@ -455,7 +468,10 @@ where
     // Resolve source_name/SourceId and acquire the lock before any I/O
     // (Task 4.1.1a) — an in-flight operation on the same source must be
     // rejected without ever touching the network or the filesystem.
-    let source_name = input.source.clone().unwrap_or_else(|| slugify_from_url(&seed));
+    let source_name = input
+        .source
+        .clone()
+        .unwrap_or_else(|| slugify_from_url(&seed));
     let id = SourceId::from_name(&source_name);
     if id.as_str().is_empty() {
         return Err(format!(
@@ -561,15 +577,17 @@ where
     let chunk_records: Vec<ChunkRecord> = chunk_entries
         .into_iter()
         .zip(embeddings)
-        .map(|((chunk, url, content_hash, page_title), embedding)| ChunkRecord {
-            chunk_text: chunk.text,
-            embedding,
-            source_url: url,
-            chunk_index: chunk.chunk_index,
-            content_hash,
-            heading: chunk.heading,
-            page_title,
-        })
+        .map(
+            |((chunk, url, content_hash, page_title), embedding)| ChunkRecord {
+                chunk_text: chunk.text,
+                embedding,
+                source_url: url,
+                chunk_index: chunk.chunk_index,
+                content_hash,
+                heading: chunk.heading,
+                page_title,
+            },
+        )
         .collect();
 
     // Load old SourceMeta for removed-page diffing (Task 4.1.3b).
@@ -610,9 +628,12 @@ where
         chunk_count: chunks_indexed,
         embedding_model: EMBEDDING_MODEL_ID.to_string(),
     };
-    fs.write_file(&meta_path(docs_index_dir, &id), &serde_json::to_vec(&meta).map_err(|e| e.to_string())?)
-        .await
-        .map_err(|e| e.to_string())?;
+    fs.write_file(
+        &meta_path(docs_index_dir, &id),
+        &serde_json::to_vec(&meta).map_err(|e| e.to_string())?,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let manifest_path = sources_manifest_path(docs_index_dir);
     let mut manifest: Vec<SourceSummary> = fs
@@ -631,9 +652,12 @@ where
         chunk_count: chunks_indexed,
         embedding_model: EMBEDDING_MODEL_ID.to_string(),
     });
-    fs.write_file(&manifest_path, &serde_json::to_vec(&manifest).map_err(|e| e.to_string())?)
-        .await
-        .map_err(|e| e.to_string())?;
+    fs.write_file(
+        &manifest_path,
+        &serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     eprintln!(
         "index_docs: source '{source_name}' — {pages_indexed} pages indexed, {} pages removed, \
@@ -754,7 +778,7 @@ where
     }
 
     let query_embeddings = embedder
-        .embed(&[input.query.clone()])
+        .embed(std::slice::from_ref(&input.query))
         .await
         .map_err(|e| e.to_string())?;
     let query_vec = query_embeddings
@@ -955,7 +979,7 @@ mod tests {
         let orthogonal = [0.0f32, 1.0];
         let opposite = [-1.0f32, 0.0];
 
-        let mut scored = vec![
+        let mut scored = [
             ("near", cosine_similarity(&q, &near)),
             ("orthogonal", cosine_similarity(&q, &orthogonal)),
             ("opposite", cosine_similarity(&q, &opposite)),
@@ -1119,7 +1143,11 @@ mod tests {
     }
 
     impl HttpClient for FakeHttpClient {
-        async fn get(&self, url: &str, _headers: &[(String, String)]) -> Result<HttpResponse, PortError> {
+        async fn get(
+            &self,
+            url: &str,
+            _headers: &[(String, String)],
+        ) -> Result<HttpResponse, PortError> {
             self.calls.borrow_mut().push(url.to_string());
             match self.routes.get(url) {
                 Some(route) => Ok(HttpResponse {
@@ -1175,7 +1203,11 @@ mod tests {
     struct PanicHttpClient;
 
     impl HttpClient for PanicHttpClient {
-        async fn get(&self, url: &str, _headers: &[(String, String)]) -> Result<HttpResponse, PortError> {
+        async fn get(
+            &self,
+            url: &str,
+            _headers: &[(String, String)],
+        ) -> Result<HttpResponse, PortError> {
             panic!("http.get should not have been called, but was called with {url}");
         }
     }
@@ -1221,7 +1253,9 @@ mod tests {
     impl FileStore for InMemoryFileStore {
         async fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), PortError> {
             self.write_calls.borrow_mut().push(path.to_string());
-            self.files.borrow_mut().insert(path.to_string(), bytes.to_vec());
+            self.files
+                .borrow_mut()
+                .insert(path.to_string(), bytes.to_vec());
             Ok(())
         }
 
@@ -1248,10 +1282,6 @@ mod tests {
             FakeEmbedder {
                 batch_sizes: RefCell::new(Vec::new()),
             }
-        }
-
-        fn batch_sizes(&self) -> Vec<usize> {
-            self.batch_sizes.borrow().clone()
         }
     }
 
@@ -1288,7 +1318,11 @@ mod tests {
             Ok(texts
                 .iter()
                 .map(|t| {
-                    let n: f32 = t.rsplit('-').next().and_then(|s| s.parse().ok()).unwrap_or(-1.0);
+                    let n: f32 = t
+                        .rsplit('-')
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(-1.0);
                     vec![n]
                 })
                 .collect())
@@ -1349,7 +1383,9 @@ mod tests {
     async fn should_reject_index_source_without_any_file_io_when_source_already_locked() {
         let locks = SourceLocks::new();
         let held_id = SourceId::from_name("tokio-tutorial");
-        let _held = locks.try_acquire(&held_id).expect("first acquire should succeed");
+        let _held = locks
+            .try_acquire(&held_id)
+            .expect("first acquire should succeed");
 
         let http = PanicHttpClient;
         let fs = InMemoryFileStore::new();
@@ -1359,7 +1395,16 @@ mod tests {
         let mut input = base_input("https://tokio.rs/tokio/tutorial");
         input.source = Some("tokio-tutorial".to_string());
 
-        let result = index_source(&http, &fs, &embedder, &clock, &locks, "/fake/docs-index", input).await;
+        let result = index_source(
+            &http,
+            &fs,
+            &embedder,
+            &clock,
+            &locks,
+            "/fake/docs-index",
+            input,
+        )
+        .await;
 
         match result {
             Err(e) => assert_eq!(
@@ -1382,7 +1427,16 @@ mod tests {
         let mut input = base_input("https://tokio.rs/tokio/tutorial");
         input.source = Some("...".to_string());
 
-        let result = index_source(&http, &fs, &embedder, &clock, &locks, "/fake/docs-index", input).await;
+        let result = index_source(
+            &http,
+            &fs,
+            &embedder,
+            &clock,
+            &locks,
+            "/fake/docs-index",
+            input,
+        )
+        .await;
 
         match result {
             Err(e) => assert!(
@@ -1415,7 +1469,10 @@ mod tests {
         .await;
 
         match result {
-            Err(e) => assert_eq!(e, format!("failed to index {url}: 404 Not Found. Check the URL is still correct.")),
+            Err(e) => assert_eq!(
+                e,
+                format!("failed to index {url}: 404 Not Found. Check the URL is still correct.")
+            ),
             Ok(_) => panic!("expected an Err for a 404 seed URL"),
         }
         assert_eq!(fs.write_call_count(), 0);
@@ -1432,7 +1489,8 @@ mod tests {
              <a href=\"https://example.com/docs/page\">Page</a>\
              <a href=\"https://example.com/docs/page/\">Page Slash</a></body></html>"
         );
-        let dup_html = format!("<html><head><title>Page</title></head><body><p>{FILLER}</p></body></html>");
+        let dup_html =
+            format!("<html><head><title>Page</title></head><body><p>{FILLER}</p></body></html>");
 
         let http = FakeHttpClient::new(vec![
             route("https://example.com/docs", &seed_html),
@@ -1447,9 +1505,17 @@ mod tests {
         let mut input = base_input("https://example.com/docs");
         input.max_pages = Some(10);
 
-        let output = index_source(&http, &fs, &embedder, &clock, &locks, "/fake/docs-index", input)
-            .await
-            .expect("index_source should succeed");
+        let output = index_source(
+            &http,
+            &fs,
+            &embedder,
+            &clock,
+            &locks,
+            "/fake/docs-index",
+            input,
+        )
+        .await
+        .expect("index_source should succeed");
 
         // Seed + first-visited duplicate only — the second duplicate URL's
         // identical content is skipped.
@@ -1469,7 +1535,13 @@ mod tests {
             })
             .collect();
 
-        let hit_cap = append_chunks_with_cap(&mut entries, page_chunks, "https://example.com/big", "hash1", "Big Page");
+        let hit_cap = append_chunks_with_cap(
+            &mut entries,
+            page_chunks,
+            "https://example.com/big",
+            "hash1",
+            "Big Page",
+        );
 
         assert!(hit_cap);
         assert_eq!(entries.len(), MAX_CHUNKS_PER_SOURCE);
@@ -1487,7 +1559,13 @@ mod tests {
                 chunk_index: i as u32,
             })
             .collect();
-        let hit_cap_1 = append_chunks_with_cap(&mut entries, first_page_chunks, "https://example.com/p1", "hash1", "Page 1");
+        let hit_cap_1 = append_chunks_with_cap(
+            &mut entries,
+            first_page_chunks,
+            "https://example.com/p1",
+            "hash1",
+            "Page 1",
+        );
         assert!(!hit_cap_1);
         assert_eq!(entries.len(), first_page_size);
 
@@ -1498,7 +1576,13 @@ mod tests {
                 chunk_index: i as u32,
             })
             .collect();
-        let hit_cap_2 = append_chunks_with_cap(&mut entries, second_page_chunks, "https://example.com/p2", "hash2", "Page 2");
+        let hit_cap_2 = append_chunks_with_cap(
+            &mut entries,
+            second_page_chunks,
+            "https://example.com/p2",
+            "hash2",
+            "Page 2",
+        );
 
         assert!(hit_cap_2);
         assert_eq!(entries.len(), MAX_CHUNKS_PER_SOURCE);
@@ -1514,7 +1598,10 @@ mod tests {
 
         let input = embedding_input_for("Tokio Tutorial", &chunk);
 
-        assert_eq!(input, "Tokio Tutorial — Spawning\n\nUse tokio::spawn to run...");
+        assert_eq!(
+            input,
+            "Tokio Tutorial — Spawning\n\nUse tokio::spawn to run..."
+        );
         // The chunk's own stored text is untouched by header construction.
         assert_eq!(chunk.text, "Use tokio::spawn to run...");
     }
@@ -1529,7 +1616,10 @@ mod tests {
 
         let input = embedding_input_for("Tokio Tutorial", &chunk);
 
-        assert_eq!(input, "Tokio Tutorial — Tokio Tutorial\n\nIntro text before any heading.");
+        assert_eq!(
+            input,
+            "Tokio Tutorial — Tokio Tutorial\n\nIntro text before any heading."
+        );
     }
 
     // --- Story 4.1.3 ---
@@ -1539,15 +1629,21 @@ mod tests {
         let embedder = IdentityEmbedder::new();
         let inputs: Vec<String> = (0..340).map(|i| format!("chunk-{i}")).collect();
 
-        let result = embed_in_sub_batches(&embedder, &inputs).await.expect("embed should succeed");
+        let result = embed_in_sub_batches(&embedder, &inputs)
+            .await
+            .expect("embed should succeed");
 
         assert_eq!(embedder.batch_sizes(), vec![100, 100, 100, 40]);
         let expected: Vec<Vec<f32>> = (0..340).map(|i| vec![i as f32]).collect();
-        assert_eq!(result, expected, "chunk order must survive sub-batch boundaries");
+        assert_eq!(
+            result, expected,
+            "chunk order must survive sub-batch boundaries"
+        );
     }
 
     #[tokio::test]
-    async fn should_report_removed_pages_when_reindex_no_longer_discovers_a_previously_indexed_page() {
+    async fn should_report_removed_pages_when_reindex_no_longer_discovers_a_previously_indexed_page(
+    ) {
         let docs_index_dir = "/fake/docs-index";
         let id = SourceId::from_name("tokio-tutorial");
 
@@ -1565,9 +1661,14 @@ mod tests {
             embedding_model: EMBEDDING_MODEL_ID.to_string(),
         };
         let fs = InMemoryFileStore::new();
-        fs.seed(&meta_path(docs_index_dir, &id), serde_json::to_vec(&old_meta).unwrap());
+        fs.seed(
+            &meta_path(docs_index_dir, &id),
+            serde_json::to_vec(&old_meta).unwrap(),
+        );
 
-        let seed_html = format!("<html><head><title>Tutorial</title></head><body><p>{FILLER}</p></body></html>");
+        let seed_html = format!(
+            "<html><head><title>Tutorial</title></head><body><p>{FILLER}</p></body></html>"
+        );
         let http = FakeHttpClient::new(vec![route("https://tokio.rs/tokio/tutorial", &seed_html)]);
         let embedder = FakeEmbedder::new();
         let clock = FakeClock(1_700_000_000_000);
@@ -1593,9 +1694,14 @@ mod tests {
 
         let fs = InMemoryFileStore::new();
         let old_lines: Vec<String> = (0..200).map(|i| format!("{{\"old_line\":{i}}}")).collect();
-        fs.seed(&chunks_path(docs_index_dir, &id), old_lines.join("\n").into_bytes());
+        fs.seed(
+            &chunks_path(docs_index_dir, &id),
+            old_lines.join("\n").into_bytes(),
+        );
 
-        let seed_html = format!("<html><head><title>Tutorial</title></head><body><p>{FILLER}</p></body></html>");
+        let seed_html = format!(
+            "<html><head><title>Tutorial</title></head><body><p>{FILLER}</p></body></html>"
+        );
         let http = FakeHttpClient::new(vec![route("https://tokio.rs/tokio/tutorial", &seed_html)]);
         let embedder = FakeEmbedder::new();
         let clock = FakeClock(1_700_000_000_000);
@@ -1608,12 +1714,21 @@ mod tests {
             .await
             .expect("index_source should succeed");
 
-        let contents = fs.get(&chunks_path(docs_index_dir, &id)).expect("chunks.jsonl should exist");
+        let contents = fs
+            .get(&chunks_path(docs_index_dir, &id))
+            .expect("chunks.jsonl should exist");
         let contents = String::from_utf8(contents).unwrap();
-        let line_count = if contents.is_empty() { 0 } else { contents.lines().count() };
+        let line_count = if contents.is_empty() {
+            0
+        } else {
+            contents.lines().count()
+        };
 
         assert_eq!(line_count, output.chunks_indexed as usize);
-        assert!(!contents.contains("old_line"), "old chunks.jsonl content must not survive a re-index");
+        assert!(
+            !contents.contains("old_line"),
+            "old chunks.jsonl content must not survive a re-index"
+        );
     }
 
     #[tokio::test]
@@ -1621,7 +1736,9 @@ mod tests {
         let docs_index_dir = "/fake/docs-index";
         let requested = "https://example.com/old-page";
         let final_url = "https://example.com/new-page";
-        let html = format!("<html><head><title>New Page</title></head><body><p>{FILLER}</p></body></html>");
+        let html = format!(
+            "<html><head><title>New Page</title></head><body><p>{FILLER}</p></body></html>"
+        );
 
         let http = FakeHttpClient::new(vec![redirected_route(requested, final_url, &html)]);
         let fs = InMemoryFileStore::new();
@@ -1663,7 +1780,13 @@ mod tests {
 
     // --- Epic 4.2: search_docs ---
 
-    fn seeded_summary(source_id: &str, source_name: &str, seed_url: &str, page_count: u32, chunk_count: u32) -> SourceSummary {
+    fn seeded_summary(
+        source_id: &str,
+        source_name: &str,
+        seed_url: &str,
+        page_count: u32,
+        chunk_count: u32,
+    ) -> SourceSummary {
         SourceSummary {
             source_id: source_id.to_string(),
             source_name: source_name.to_string(),
@@ -1680,10 +1803,19 @@ mod tests {
         let docs_index_dir = "/fake/docs-index";
         let fs = InMemoryFileStore::new();
         let manifest = vec![
-            seeded_summary("tokio-tutorial", "tokio-tutorial", "https://tokio.rs/tokio/tutorial", 1, 3),
+            seeded_summary(
+                "tokio-tutorial",
+                "tokio-tutorial",
+                "https://tokio.rs/tokio/tutorial",
+                1,
+                3,
+            ),
             seeded_summary("serde-guide", "serde-guide", "https://serde.rs/", 1, 3),
         ];
-        fs.seed(&sources_manifest_path(docs_index_dir), serde_json::to_vec(&manifest).unwrap());
+        fs.seed(
+            &sources_manifest_path(docs_index_dir),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
 
         let embedder = PanicEmbedder;
         let input = SearchDocsInput {
@@ -1705,7 +1837,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_return_model_mismatch_error_without_scoring_when_stored_embedding_model_differs_from_current() {
+    async fn should_return_model_mismatch_error_without_scoring_when_stored_embedding_model_differs_from_current(
+    ) {
         let docs_index_dir = "/fake/docs-index";
         let id = SourceId::from_name("tokio-tutorial");
         let fs = InMemoryFileStore::new();
@@ -1720,10 +1853,16 @@ mod tests {
             chunk_count: 1,
             embedding_model: "some-older-model-v1".to_string(),
         };
-        fs.seed(&meta_path(docs_index_dir, &id), serde_json::to_vec(&meta).unwrap());
+        fs.seed(
+            &meta_path(docs_index_dir, &id),
+            serde_json::to_vec(&meta).unwrap(),
+        );
         // Deliberately garbage — proves the mismatch guard returns before
         // chunks.jsonl is ever read/parsed.
-        fs.seed(&chunks_path(docs_index_dir, &id), b"not valid jsonl at all".to_vec());
+        fs.seed(
+            &chunks_path(docs_index_dir, &id),
+            b"not valid jsonl at all".to_vec(),
+        );
 
         let embedder = PanicEmbedder;
         let input = SearchDocsInput {
@@ -1746,7 +1885,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_return_results_sorted_descending_by_score_capped_at_limit_when_search_docs_called() {
+    async fn should_return_results_sorted_descending_by_score_capped_at_limit_when_search_docs_called(
+    ) {
         let docs_index_dir = "/fake/docs-index";
         let id = SourceId::from_name("tokio-tutorial");
         let fs = InMemoryFileStore::new();
@@ -1761,7 +1901,10 @@ mod tests {
             chunk_count: 4,
             embedding_model: EMBEDDING_MODEL_ID.to_string(),
         };
-        fs.seed(&meta_path(docs_index_dir, &id), serde_json::to_vec(&meta).unwrap());
+        fs.seed(
+            &meta_path(docs_index_dir, &id),
+            serde_json::to_vec(&meta).unwrap(),
+        );
 
         fn record(text: &str, embedding: Vec<f32>) -> ChunkRecord {
             ChunkRecord {
@@ -1778,13 +1921,17 @@ mod tests {
         // Reuses the near/orthogonal/opposite vectors from Story 3.3.1's
         // cosine_similarity test, plus a second "near" candidate, so the
         // expected top-2 ranking is unambiguous.
-        let records = vec![
+        let records = [
             record("near", vec![0.9, 0.1]),
             record("orthogonal", vec![0.0, 1.0]),
             record("opposite", vec![-1.0, 0.0]),
             record("near2", vec![0.8, 0.2]),
         ];
-        let jsonl = records.iter().map(|r| serde_json::to_string(r).unwrap()).collect::<Vec<_>>().join("\n");
+        let jsonl = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
         fs.seed(&chunks_path(docs_index_dir, &id), jsonl.into_bytes());
 
         let embedder = FixedVectorEmbedder::new(vec![1.0, 0.0]);
@@ -1820,7 +1967,10 @@ mod tests {
             chunk_count: 11,
             embedding_model: EMBEDDING_MODEL_ID.to_string(),
         };
-        fs.seed(&meta_path(docs_index_dir, &id), serde_json::to_vec(&meta).unwrap());
+        fs.seed(
+            &meta_path(docs_index_dir, &id),
+            serde_json::to_vec(&meta).unwrap(),
+        );
 
         let valid_records: Vec<ChunkRecord> = (0..10)
             .map(|i| ChunkRecord {
@@ -1833,11 +1983,17 @@ mod tests {
                 page_title: "Tokio Tutorial".to_string(),
             })
             .collect();
-        let mut lines: Vec<String> = valid_records.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
+        let mut lines: Vec<String> = valid_records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
         // Hand-crafted, truncated JSON — never produced by the normal
         // ChunkRecord-serialization path.
         lines.push("{\"chunk_text\": \"incomplete...".to_string());
-        fs.seed(&chunks_path(docs_index_dir, &id), lines.join("\n").into_bytes());
+        fs.seed(
+            &chunks_path(docs_index_dir, &id),
+            lines.join("\n").into_bytes(),
+        );
 
         let embedder = FixedVectorEmbedder::new(vec![1.0, 0.0]);
         let input = SearchDocsInput {
@@ -1871,22 +2027,39 @@ mod tests {
         let docs_index_dir = "/fake/docs-index";
         let fs = InMemoryFileStore::new();
         let manifest = vec![
-            seeded_summary("tokio-tutorial", "tokio-tutorial", "https://tokio.rs/tokio/tutorial", 3, 42),
+            seeded_summary(
+                "tokio-tutorial",
+                "tokio-tutorial",
+                "https://tokio.rs/tokio/tutorial",
+                3,
+                42,
+            ),
             seeded_summary("serde-guide", "serde-guide", "https://serde.rs/", 5, 77),
         ];
-        fs.seed(&sources_manifest_path(docs_index_dir), serde_json::to_vec(&manifest).unwrap());
+        fs.seed(
+            &sources_manifest_path(docs_index_dir),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
 
         let output = list_indexed_sources(&fs, docs_index_dir, ListIndexedSourcesInput {})
             .await
             .expect("list_indexed_sources should succeed");
 
         assert_eq!(output.sources.len(), 2);
-        let tokio = output.sources.iter().find(|s| s.source_name == "tokio-tutorial").expect("tokio-tutorial present");
+        let tokio = output
+            .sources
+            .iter()
+            .find(|s| s.source_name == "tokio-tutorial")
+            .expect("tokio-tutorial present");
         assert_eq!(tokio.page_count, 3);
         assert_eq!(tokio.chunk_count, 42);
         assert_eq!(tokio.indexed_at_millis, 1_700_000_000_000);
         assert_eq!(tokio.embedding_model, EMBEDDING_MODEL_ID);
-        let serde_source = output.sources.iter().find(|s| s.source_name == "serde-guide").expect("serde-guide present");
+        let serde_source = output
+            .sources
+            .iter()
+            .find(|s| s.source_name == "serde-guide")
+            .expect("serde-guide present");
         assert_eq!(serde_source.page_count, 5);
         assert_eq!(serde_source.chunk_count, 77);
     }
@@ -1908,14 +2081,26 @@ mod tests {
             chunk_count: 3,
             embedding_model: EMBEDDING_MODEL_ID.to_string(),
         };
-        fs.seed(&meta_path(docs_index_dir, &id), serde_json::to_vec(&meta).unwrap());
+        fs.seed(
+            &meta_path(docs_index_dir, &id),
+            serde_json::to_vec(&meta).unwrap(),
+        );
         fs.seed(&chunks_path(docs_index_dir, &id), b"{}".to_vec());
 
         let manifest = vec![
-            seeded_summary(id.as_str(), "tokio-tutorial", "https://tokio.rs/tokio/tutorial", 1, 3),
+            seeded_summary(
+                id.as_str(),
+                "tokio-tutorial",
+                "https://tokio.rs/tokio/tutorial",
+                1,
+                3,
+            ),
             seeded_summary(other_id.as_str(), "serde-guide", "https://serde.rs/", 1, 2),
         ];
-        fs.seed(&sources_manifest_path(docs_index_dir), serde_json::to_vec(&manifest).unwrap());
+        fs.seed(
+            &sources_manifest_path(docs_index_dir),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
 
         let locks = SourceLocks::new();
         let input = RemoveIndexedSourceInput {
@@ -1931,7 +2116,9 @@ mod tests {
         assert!(fs.get(&meta_path(docs_index_dir, &id)).is_none());
         assert!(fs.get(&chunks_path(docs_index_dir, &id)).is_none());
 
-        let manifest_bytes = fs.get(&sources_manifest_path(docs_index_dir)).expect("sources.json should still exist");
+        let manifest_bytes = fs
+            .get(&sources_manifest_path(docs_index_dir))
+            .expect("sources.json should still exist");
         let manifest: Vec<SourceSummary> = serde_json::from_slice(&manifest_bytes).unwrap();
         assert_eq!(manifest.len(), 1);
         assert_eq!(manifest[0].source_id, other_id.as_str());
@@ -1941,8 +2128,17 @@ mod tests {
     async fn should_return_error_listing_indexed_sources_when_removing_unknown_source_name() {
         let docs_index_dir = "/fake/docs-index";
         let fs = InMemoryFileStore::new();
-        let manifest = vec![seeded_summary("tokio-tutorial", "tokio-tutorial", "https://tokio.rs/tokio/tutorial", 1, 3)];
-        fs.seed(&sources_manifest_path(docs_index_dir), serde_json::to_vec(&manifest).unwrap());
+        let manifest = vec![seeded_summary(
+            "tokio-tutorial",
+            "tokio-tutorial",
+            "https://tokio.rs/tokio/tutorial",
+            1,
+            3,
+        )];
+        fs.seed(
+            &sources_manifest_path(docs_index_dir),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
 
         let locks = SourceLocks::new();
         let input = RemoveIndexedSourceInput {
@@ -1965,7 +2161,9 @@ mod tests {
     async fn should_reject_remove_indexed_source_without_any_file_io_when_source_already_locked() {
         let locks = SourceLocks::new();
         let held_id = SourceId::from_name("tokio-tutorial");
-        let _held = locks.try_acquire(&held_id).expect("first acquire should succeed");
+        let _held = locks
+            .try_acquire(&held_id)
+            .expect("first acquire should succeed");
 
         let fs = InMemoryFileStore::new();
         let input = RemoveIndexedSourceInput {
@@ -1975,7 +2173,10 @@ mod tests {
         let result = remove_indexed_source(&fs, &locks, "/fake/docs-index", input).await;
 
         match result {
-            Err(e) => assert_eq!(e, "source 'tokio-tutorial' is already being indexed or removed; try again shortly"),
+            Err(e) => assert_eq!(
+                e,
+                "source 'tokio-tutorial' is already being indexed or removed; try again shortly"
+            ),
             Ok(_) => panic!("expected an Err when the source is already locked"),
         }
         assert_eq!(fs.read_call_count(), 0);
@@ -1983,7 +2184,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_reject_remove_indexed_source_without_any_file_io_when_source_slugifies_to_empty() {
+    async fn should_reject_remove_indexed_source_without_any_file_io_when_source_slugifies_to_empty(
+    ) {
         let locks = SourceLocks::new();
         let fs = InMemoryFileStore::new();
         let input = RemoveIndexedSourceInput {

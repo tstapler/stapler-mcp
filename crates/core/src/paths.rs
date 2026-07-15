@@ -86,7 +86,9 @@ mod tests {
 
     #[test]
     fn should_build_docs_index_dir_under_default_home() {
-        let env = MockEnv { home_override: None };
+        let env = MockEnv {
+            home_override: None,
+        };
 
         let result = docs_index_dir(&env);
 

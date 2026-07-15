@@ -19,7 +19,11 @@ impl Default for NativeHttp {
 }
 
 impl HttpClient for NativeHttp {
-    async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse, PortError> {
+    async fn get(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, PortError> {
         let mut req = self.client.get(url);
         for (k, v) in headers {
             req = req.header(k, v);
@@ -32,7 +36,11 @@ impl HttpClient for NativeHttp {
             .await
             .map_err(|e| PortError::Io(e.to_string()))?
             .to_vec();
-        Ok(HttpResponse { status, body, final_url })
+        Ok(HttpResponse {
+            status,
+            body,
+            final_url,
+        })
     }
 }
 
@@ -47,7 +55,9 @@ mod tests {
     /// small body for `/new-page`. Enough to exercise `reqwest`'s real
     /// redirect-following, unlike a pure-logic unit test.
     async fn spawn_redirecting_mock() -> (String, tokio::sync::oneshot::Sender<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
         let addr = listener.local_addr().expect("mock server addr");
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 

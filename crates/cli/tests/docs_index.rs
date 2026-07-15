@@ -69,7 +69,9 @@ async fn spawn_mock_site() -> (String, tokio::sync::oneshot::Sender<()>) {
         ),
     ]);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock site");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock site");
     let addr = listener.local_addr().expect("mock site addr");
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -172,11 +174,22 @@ async fn docs_index_round_trip() {
     .await
     .expect("index_docs should succeed");
 
-    assert_eq!(index_result["sourceName"], "mock-docs", "got: {index_result:?}");
+    assert_eq!(
+        index_result["sourceName"], "mock-docs",
+        "got: {index_result:?}"
+    );
     let pages_indexed = index_result["pagesIndexed"].as_u64().expect("pagesIndexed");
-    assert_eq!(pages_indexed, 2, "expected seed + page2 to be indexed, got: {index_result:?}");
-    let chunks_indexed = index_result["chunksIndexed"].as_u64().expect("chunksIndexed");
-    assert!(chunks_indexed >= 1, "expected at least one chunk indexed, got: {index_result:?}");
+    assert_eq!(
+        pages_indexed, 2,
+        "expected seed + page2 to be indexed, got: {index_result:?}"
+    );
+    let chunks_indexed = index_result["chunksIndexed"]
+        .as_u64()
+        .expect("chunksIndexed");
+    assert!(
+        chunks_indexed >= 1,
+        "expected at least one chunk indexed, got: {index_result:?}"
+    );
 
     // 2. search_docs: a query aimed squarely at the async/Tokio page should
     //    come back with at least one result.
@@ -194,7 +207,10 @@ async fn docs_index_round_trip() {
     .expect("search_docs should succeed");
 
     let results = search_result["results"].as_array().expect("results array");
-    assert!(!results.is_empty(), "expected at least 1 search result, got: {search_result:?}");
+    assert!(
+        !results.is_empty(),
+        "expected at least 1 search result, got: {search_result:?}"
+    );
 
     // 3. list_indexed_sources: the newly indexed source shows up.
     let list_result = client::call(
@@ -224,7 +240,10 @@ async fn docs_index_round_trip() {
     .await
     .expect("remove_indexed_source should succeed");
     assert_eq!(remove_result["removed"], true, "got: {remove_result:?}");
-    assert_eq!(remove_result["sourceName"], "mock-docs", "got: {remove_result:?}");
+    assert_eq!(
+        remove_result["sourceName"], "mock-docs",
+        "got: {remove_result:?}"
+    );
 
     // ...and a subsequent search_docs call against it now errors as an
     // unknown source.
@@ -249,7 +268,13 @@ async fn docs_index_round_trip() {
 
     let _ = shutdown_site.send(());
 
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }

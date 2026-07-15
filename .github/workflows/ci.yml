@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+      # Real network/model-download tests (docs_index_round_trip, the
+      # NativeEmbedder model-load tests) are #[ignore]d by design and
+      # correctly skipped here — see their doc comments.
+      - run: cargo test --workspace
+
+  # crates/core and crates/wasm compile for wasm32-unknown-unknown (the
+  # npm-distributed thin client target); crates/native and crates/cli are
+  # native-only (Unix sockets, headless Chrome) and excluded from this
+  # target, matching the workspace's default-members split.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p stapler-mcp-core -p stapler-mcp-wasm --target wasm32-unknown-unknown

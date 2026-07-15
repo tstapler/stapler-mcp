@@ -8,8 +8,8 @@ use stapler_mcp_core::daemon::{json_handler, Daemon};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
-    BraveSearchInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput, ListIndexedSourcesInput,
-    ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
+    BraveSearchInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
+    ListIndexedSourcesInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 use stapler_mcp_core::tools::{docs, fetch, search, webcrawl};
 use stapler_mcp_native::{

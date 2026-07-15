@@ -14,8 +14,8 @@ use url::Url;
 
 use crate::ports::{HttpClient, HttpResponse};
 use crate::schema::{
-    DownloadWebsiteInput, DownloadWebsiteOutput, DownloadedPage, ReadWebsiteInput, ReadWebsiteOutput,
-    ReadWebsitePage,
+    DownloadWebsiteInput, DownloadWebsiteOutput, DownloadedPage, ReadWebsiteInput,
+    ReadWebsiteOutput, ReadWebsitePage,
 };
 
 const DEFAULT_MAX_DEPTH: u32 = 1;
@@ -25,15 +25,23 @@ const MAX_DEPTH_CEILING: u32 = 5;
 const USER_AGENT: &str = "stapler-mcp/0.1 (+https://github.com/tstapler/stapler-mcp)";
 
 pub(crate) fn resolve_limits(max_depth: Option<u32>, max_pages: Option<u32>) -> (u32, u32) {
-    let depth = max_depth.unwrap_or(DEFAULT_MAX_DEPTH).min(MAX_DEPTH_CEILING);
-    let pages = max_pages.unwrap_or(DEFAULT_MAX_PAGES).clamp(1, MAX_PAGES_CEILING);
+    let depth = max_depth
+        .unwrap_or(DEFAULT_MAX_DEPTH)
+        .min(MAX_DEPTH_CEILING);
+    let pages = max_pages
+        .unwrap_or(DEFAULT_MAX_PAGES)
+        .clamp(1, MAX_PAGES_CEILING);
     (depth, pages)
 }
 
 pub(crate) fn cache_key_for(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Extracts same-scheme `<a href>` links, resolved against `base`. Crawling
@@ -49,11 +57,17 @@ fn extract_links(html: &str, base: &Url) -> Vec<Url> {
         .collect()
 }
 
-pub(crate) fn extract_title_and_markdown(html: &str, url: &str) -> Result<(String, String), String> {
+pub(crate) fn extract_title_and_markdown(
+    html: &str,
+    url: &str,
+) -> Result<(String, String), String> {
     let mut readability =
         Readability::new(html, Some(url), None).map_err(|e| format!("readability: {e}"))?;
-    let article = readability.parse().map_err(|e| format!("readability: {e}"))?;
-    let markdown = htmd::convert(article.content.as_ref()).map_err(|e| format!("html-to-markdown: {e}"))?;
+    let article = readability
+        .parse()
+        .map_err(|e| format!("readability: {e}"))?;
+    let markdown =
+        htmd::convert(article.content.as_ref()).map_err(|e| format!("html-to-markdown: {e}"))?;
     Ok((article.title, markdown))
 }
 
@@ -202,7 +216,10 @@ where
     let mut pages = Vec::new();
 
     while let Some((url, depth)) = crawler.next_url(pages.len()) {
-        let cache_path = format!("{cache_dir}/read-website/{}.json", cache_key_for(url.as_str()));
+        let cache_path = format!(
+            "{cache_dir}/read-website/{}.json",
+            cache_key_for(url.as_str())
+        );
 
         if let Ok(Some(bytes)) = fs.read_file(&cache_path).await {
             if let Ok(cached) = serde_json::from_slice::<CachedPage>(&bytes) {
@@ -290,7 +307,9 @@ where
             continue;
         };
         let path = save_path_for(&input.save_dir, &url);
-        fs.write_file(&path, html.as_bytes()).await.map_err(|e| e.to_string())?;
+        fs.write_file(&path, html.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         pages.push(DownloadedPage {
             url: url.to_string(),
             path,

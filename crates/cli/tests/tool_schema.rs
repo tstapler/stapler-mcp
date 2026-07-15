@@ -34,8 +34,8 @@ use stapler_mcp_core::schema::{
 mod thin_client;
 
 #[tokio::test]
-async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_input_schema_when_tools_list_called()
-{
+async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_input_schema_when_tools_list_called(
+) {
     let tools = thin_client::ThinClient::registered_tools();
     let tool_names: HashSet<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert_eq!(

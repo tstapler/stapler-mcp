@@ -2,6 +2,13 @@
 //! itself never calls `std::net`/`fs`/`process`/`env`/`time::Instant` directly.
 //! A native adapter (tokio + fs4 + reqwest + chromiumoxide) and a wasm-bindgen
 //! adapter (delegating to a Node.js host) each implement the same surface.
+//!
+//! Every port trait below uses native `async fn` in traits deliberately, not
+//! `#[async_trait]`: every caller is generic over the concrete port type
+//! (`fn index_source<H: HttpClient, ...>`, never `Box<dyn HttpClient>`), so
+//! the lack of `dyn`-compatibility this lint warns about doesn't apply here.
+
+#![allow(async_fn_in_trait)]
 
 use std::time::Duration;
 
@@ -97,7 +104,8 @@ pub struct HttpResponse {
 }
 
 pub trait HttpClient {
-    async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse, PortError>;
+    async fn get(&self, url: &str, headers: &[(String, String)])
+        -> Result<HttpResponse, PortError>;
 }
 
 pub struct PageExtract {
@@ -112,7 +120,11 @@ pub trait BrowserDriver {
     /// in one hop) rather than exposing CDP-message-level primitives — this is
     /// what keeps the wasm↔JS boundary to one crossing per tool call once a
     /// wasm-bindgen adapter exists.
-    async fn navigate_and_extract(&self, url: &str, timeout: Duration) -> Result<PageExtract, PortError>;
+    async fn navigate_and_extract(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<PageExtract, PortError>;
 }
 
 pub trait FileStore {

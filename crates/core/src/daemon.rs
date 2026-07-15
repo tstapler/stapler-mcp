@@ -77,7 +77,11 @@ impl Daemon {
     /// the caller only reaches here after winning the exclusive lock) and
     /// serves one request/response per connection until a `shutdown` call
     /// sets the flag.
-    pub async fn run<S: SocketFactory>(&self, socket: &S, sock_path: &str) -> Result<(), PortError> {
+    pub async fn run<S: SocketFactory>(
+        &self,
+        socket: &S,
+        sock_path: &str,
+    ) -> Result<(), PortError> {
         socket.remove_stale(sock_path).await?;
         let mut listener = socket.bind(sock_path).await?;
         loop {

@@ -33,7 +33,9 @@ impl ProcessLock for WasmLock {
 
     async fn acquire_exclusive(&self, path: &str) -> Result<Self::Guard, LockError> {
         if js_acquire_lock(path) {
-            Ok(WasmLockGuard { path: path.to_string() })
+            Ok(WasmLockGuard {
+                path: path.to_string(),
+            })
         } else {
             Err(LockError::AlreadyRunning)
         }

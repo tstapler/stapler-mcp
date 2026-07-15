@@ -13,16 +13,21 @@ use serde::Serialize;
 use stapler_mcp_core::client::{self, EnsureOptions};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::schema::{
-    BraveSearchInput, BraveSearchOutput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
-    FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput, ListIndexedSourcesOutput,
-    ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
-    SearchDocsOutput,
+    BraveSearchInput, BraveSearchOutput, DownloadWebsiteInput, DownloadWebsiteOutput,
+    FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
+    ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput,
+    RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
 };
-use stapler_mcp_native::{NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner};
+use stapler_mcp_native::{
+    NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
+};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-async fn call_daemon<In: Serialize, Out: DeserializeOwned>(tool: &str, input: In) -> Result<Out, String> {
+async fn call_daemon<In: Serialize, Out: DeserializeOwned>(
+    tool: &str,
+    input: In,
+) -> Result<Out, String> {
     let env = NativeEnv;
     let socket = NativeSocketFactory;
     let spawner = NativeSpawner;
@@ -57,6 +62,7 @@ pub struct ThinClient {
     // `call_tool` impl, which rustc's dead-code analysis doesn't see through —
     // verified working end-to-end (tools/list and tools/call both dispatch
     // correctly), so the "never read" warning here is a known false positive.
+    #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
@@ -80,7 +86,10 @@ impl ThinClient {
         name = "fetch_page",
         description = "Render a URL in a headless browser and return its title and extracted text (optionally saving the rendered HTML to a local file). Backed by the shared stapler-mcp daemon's browser pool."
     )]
-    async fn fetch_page(&self, params: Parameters<FetchPageInput>) -> Result<Json<FetchPageOutput>, String> {
+    async fn fetch_page(
+        &self,
+        params: Parameters<FetchPageInput>,
+    ) -> Result<Json<FetchPageOutput>, String> {
         call_daemon("fetch_page", params.0).await.map(Json)
     }
 
@@ -99,7 +108,10 @@ impl ThinClient {
         name = "read_website",
         description = "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon."
     )]
-    async fn read_website(&self, params: Parameters<ReadWebsiteInput>) -> Result<Json<ReadWebsiteOutput>, String> {
+    async fn read_website(
+        &self,
+        params: Parameters<ReadWebsiteInput>,
+    ) -> Result<Json<ReadWebsiteOutput>, String> {
         call_daemon("read_website", params.0).await.map(Json)
     }
 
@@ -118,7 +130,10 @@ impl ThinClient {
         name = "stapler_index_docs",
         description = "Crawl a URL (reusing the same host-restricted, robots.txt-respecting crawler as read_website, up to maxDepth/maxPages) and build a local semantic search index over it under the given source name (or a name derived from the URL). Re-running stapler_index_docs on an already-indexed source fully re-indexes it in place."
     )]
-    async fn index_docs(&self, params: Parameters<IndexDocsInput>) -> Result<Json<IndexDocsOutput>, String> {
+    async fn index_docs(
+        &self,
+        params: Parameters<IndexDocsInput>,
+    ) -> Result<Json<IndexDocsOutput>, String> {
         call_daemon("stapler_index_docs", params.0).await.map(Json)
     }
 
@@ -126,7 +141,10 @@ impl ThinClient {
         name = "stapler_search_docs",
         description = "Semantically search a previously stapler_index_docs'd source by name, returning the top-scoring text chunks ranked by relevance to query."
     )]
-    async fn search_docs(&self, params: Parameters<SearchDocsInput>) -> Result<Json<SearchDocsOutput>, String> {
+    async fn search_docs(
+        &self,
+        params: Parameters<SearchDocsInput>,
+    ) -> Result<Json<SearchDocsOutput>, String> {
         call_daemon("stapler_search_docs", params.0).await.map(Json)
     }
 
@@ -138,7 +156,9 @@ impl ThinClient {
         &self,
         params: Parameters<ListIndexedSourcesInput>,
     ) -> Result<Json<ListIndexedSourcesOutput>, String> {
-        call_daemon("stapler_list_indexed_sources", params.0).await.map(Json)
+        call_daemon("stapler_list_indexed_sources", params.0)
+            .await
+            .map(Json)
     }
 
     #[tool(
@@ -149,7 +169,9 @@ impl ThinClient {
         &self,
         params: Parameters<RemoveIndexedSourceInput>,
     ) -> Result<Json<RemoveIndexedSourceOutput>, String> {
-        call_daemon("stapler_remove_indexed_source", params.0).await.map(Json)
+        call_daemon("stapler_remove_indexed_source", params.0)
+            .await
+            .map(Json)
     }
 }
 
@@ -160,7 +182,13 @@ impl ThinClient {
     /// `tests/tool_schema.rs` to verify Story 5.2.1's `tools/list`
     /// acceptance criterion (all docs-index tools present with non-empty
     /// descriptions and schemas matching their `*Input` structs).
+    ///
+    /// Only called from that separate integration-test binary (which pulls
+    /// this file in via `#[path]`, since `crates/cli` has no `[lib]`
+    /// target) — invisible to dead-code analysis of *this* compilation
+    /// unit, hence the explicit allow.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn registered_tools() -> Vec<rmcp::model::Tool> {
         Self::tool_router().list_all()
     }
@@ -172,7 +200,8 @@ impl ServerHandler for ThinClient {
         // `Implementation::from_build_env()` (the `ServerInfo::new` default)
         // expands `env!("CARGO_CRATE_NAME")` inside rmcp's own source, so it
         // reports rmcp's package metadata, not ours — must set this explicitly.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("stapler-mcp", env!("CARGO_PKG_VERSION")))
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new("stapler-mcp", env!("CARGO_PKG_VERSION")),
+        )
     }
 }
