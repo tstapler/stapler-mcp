@@ -1,88 +1,144 @@
-# Deferred work: P1 and P2 tools
+# Build log and deferred work
 
-This project is scoped to proving the daemon/thin-client architecture and
-shipping the two trivial P0 tools (`fetch_page`, `brave_web_search`), not
-porting every third-party MCP server this user runs today. This file is
-the design sketch for what's left, so a future session can pick each item
-up without re-deriving the plan.
+This project was rewritten from Go to Rust so the same core logic could ship
+two ways (native CLI + zero-native-binary `npx` package) without duplicating
+the daemon architecture or tool logic. This file tracks what's done and
+sketches what's left, so a future session can pick up without re-deriving
+the plan. The full architecture plan (workspace layout, port traits, crate
+choices) came out of a dedicated planning pass and is summarized in
+`README.md`; this file is the phase-by-phase log plus deferred-work sketches.
 
-## P1: `mcp-read-website-fast` equivalent — `read_website`
+## Done
 
-Original: fetch → Readability-style content extraction → Markdown, with a
-SHA-256-keyed disk cache and depth-limited crawl, respecting `robots.txt`.
+- **Phase 1a** — Rust workspace scaffold (`crates/{core,native,cli}`),
+  target-agnostic ports/traits, daemon dispatch, `EnsureDaemon`
+  backoff/spawn state machine, native adapter (Unix socket,
+  `std::fs::File::try_lock` — no `fs4`/`flock` crate needed, std covers it
+  since Rust ~1.89 — detached process spawn). Verified via
+  `crates/cli/tests/daemon_ping.rs`, mirroring the old Go integration test's
+  five properties.
+- **Phase 1b** — ported `fetch_page` (`chromiumoxide` instead of `chromedp`)
+  and `brave_web_search` (`reqwest`) onto the daemon; wired the thin-client
+  stdio side via `rmcp` (official Rust MCP SDK). Two real bugs found by
+  actually running it, not just compiling: `Implementation::from_build_env()`
+  expands `env!("CARGO_CRATE_NAME")` inside rmcp's *own* source, so it
+  silently reported `rmcp`/`2.2.0` as the server identity — fixed by setting
+  `Implementation` explicitly; Brave's base URL was hardcoded, made
+  overridable via `BRAVE_API_BASE_URL` so tests can point at a mock server.
+- **Phase 2** — `crates/wasm` (wasm-bindgen adapter, `wasm32-unknown-unknown`)
+  + `npm/` (Node host). Every port has a JS-glue-backed implementation
+  (`crates/wasm/src/glue/*.js`, copied into the wasm-bindgen build output as
+  local snippets — this is how `#[wasm_bindgen(module = "/src/glue/x.js")]`
+  externs actually get resolved under `--target nodejs`, discovered by
+  probing before committing to the full build-out). Verified via
+  `npm/test/e2e.test.js` (Node's built-in `node:test`) and manual
+  cross-implementation interop in both directions (native daemon ↔ Node
+  client, Node daemon ↔ native client — both work, confirming thin clients
+  only ever need `ping` to succeed, never caring which implementation is on
+  the other end).
+  - Lock: no external npm dependency — `fs.mkdirSync` (atomic create) +
+    liveness check via `process.kill(pid, 0)` on contention, instead of a
+    `proper-lockfile` dependency (better than the timeout-based staleness
+    check that package would have given: a real liveness check, no
+    dependency).
+  - Browser: `playwright-core` with `channel: "chrome"` (system Chrome, no
+    download needed) rather than driving CDP directly from Rust for this
+    target — matches upstream `playwright-mcp`'s own choice of library.
+  - Schema: one `schemars` derivation on the shared core types
+    (`crates/core/src/schema.rs`), exported as `list_tools_json()` and
+    served verbatim by the Node side — never hand-authored twice.
+  - **Real bug found by testing, not just compiling**: neither the JS
+    `net.Server` (socket listener) nor the launched Chrome subprocess was
+    ever closed on `shutdown`, so the Node daemon process — and, it turned
+    out, the *native* daemon too (same gap, `chromiumoxide::Browser` was
+    never `.close()`d either) — hung around forever after a clean shutdown.
+    Fixed on both sides: `WasmListener`/`jsCloseListener` on `Drop`;
+    `browser.close()` called explicitly after `daemon.run()` returns on both
+    adapters (native needs `drop(daemon)` first so the `Rc<NativeBrowser>`
+    clones held by handler closures release, making `Rc::get_mut` succeed).
 
-Design sketch for a daemon-side `internal/tools/readweb` package:
+- **Phase 3** — `crates/core/src/tools/webcrawl.rs`: merges the sketched
+  `read_website` (Readability/Markdown extraction, SHA-256-keyed disk cache)
+  and the third-party `website-downloader` (raw HTML to disk) into one
+  shared BFS crawler (`Crawler`) with two output modes, exposed as
+  `read_website`/`download_website`. Reused the existing `HttpClient`/
+  `FileStore` ports — no new port trait beyond adding `FileStore::read_file`
+  (needed for cache lookups; `write_file`-only wasn't enough once caching
+  needed to skip re-fetching, not just re-parsing). Crate choices from the
+  original plan all held up, including on `wasm32` (verified before wiring
+  anything, given "medium confidence" flagged there): `dom_smoothie`
+  (Readability-style extraction), `dom_query` (already a transitive
+  dependency of `dom_smoothie` — reused directly for `<a href>` link
+  extraction instead of adding `scraper` as a second HTML-parsing crate),
+  `htmd` (HTML→Markdown), `texting_robots` (`robots.txt`), `sha2` (cache
+  keys), `url` (link resolution). Verified via `crates/cli/tests/webcrawl.rs`
+  and `npm/test/e2e.test.js` (same synthetic multi-page site + `robots.txt`
+  in both), plus a manual interop check (Node client → native daemon,
+  `read_website`).
+  - Cache design: reworked mid-implementation so a cache hit skips the
+    network fetch entirely, not just the Readability/Markdown re-parse —
+    the first draft cached only the extracted result and still re-fetched
+    every call, which undersold the whole point of caching. Trade-off this
+    creates (documented in code): a cache hit doesn't rediscover that page's
+    outgoing links, so crawl depth only expands from freshly-fetched pages.
+    Tested directly: shut the mock server down between two calls, second
+    call still succeeds (from cache) but returns exactly the one cached
+    page, not the full crawl.
+  - `save_path_for` (raw-HTML save path derived from a remote page's URL)
+    explicitly strips `.`/`..` path segments — a real path-traversal
+    boundary, not hypothetical, since the path comes from a possibly
+    untrusted remote site.
 
-- Reuse the daemon's shared `fetch.Fetcher` (chromedp) for JS-rendered
-  pages, or a plain `net/http` GET for the common static-HTML case —
-  decide based on a quick heuristic (e.g. try HTTP first, fall back to
-  chromedp if the response looks like an SPA shell) to avoid paying
-  browser-render cost on every call.
-- Extraction: `go-shiori/go-readability` (Go port of Mozilla's Readability)
-  is the most direct analog; feed its output through
-  `github.com/JohannesKaufmann/html-to-markdown` for the Markdown step.
-- Cache: content-addressed by `sha256(url)` (or `sha256(url + fetched-at
-  day)` if freshness matters) under `~/.stapler-mcp/cache/read-website/`.
-  This is exactly the kind of state that belongs daemon-side — a per-session
-  cache would defeat the point.
-- `robots.txt`: fetch and parse once per host per daemon lifetime, cache
-  the parsed result in memory (a `sync.Map[host]*robotstxt.RobotsData`
-  using `github.com/temoto/robotstxt`), check before crawling.
-- Depth-limited crawl: BFS from the seed URL, respecting `robots.txt` and a
-  `maxDepth`/`maxPages` input field; reuse the same extraction path per page.
+## Deferred
 
-## P1: `playwright-mcp` equivalent — browser automation tools
+### `playwright-mcp` equivalent — browser automation tools
 
-Original: full browser automation via accessibility-tree snapshots
-(navigate, click, type, snapshot).
+Full browser automation via accessibility-tree snapshots (navigate, click,
+type, snapshot). The `BrowserDriver` port already established for
+`fetch_page` needs extending with persistent-tab/session semantics — unlike
+`fetch_page` (one-shot, fresh tab per call), automation needs a `session_id`
+threaded across `navigate` → `click` → `type` → `snapshot` calls, plus an
+idle-timeout reaper for abandoned sessions.
 
-`internal/tools/fetch.Fetcher` already establishes the shared chromedp
-allocator this needs — the daemon should own exactly one browser process
-serving both `fetch_page` and this tool set, not a second one.
+Real, asymmetric cost to flag: on the Node side, `playwright-core` gives
+accessible-role/name locators for free; on the native side, `chromiumoxide`
+only exposes the raw CDP `Accessibility` domain, so the native adapter has
+to implement its own AX-tree walk + role/name resolution to match what Node
+gets for free. Budget for this explicitly, don't assume parity between the
+two adapters here.
 
-Design sketch:
+### `docs-mcp-server` equivalent — explicitly deferred, not attempted
 
-- Add persistent-tab semantics: unlike `fetch_page` (one-shot, new tab per
-  call), automation tools need a session concept — a `session_id` the
-  client passes across `navigate` → `click` → `type` → `snapshot` calls, so
-  the daemon can hold the `chromedp.Context` open between calls instead of
-  tearing it down. Needs a `map[string]context.CancelFunc` + idle-timeout
-  reaper (goroutine that closes tabs unused for e.g. 10 minutes) so
-  abandoned sessions don't leak browser tabs forever.
-- Accessibility-tree snapshot: chromedp exposes the CDP `Accessibility`
-  domain directly (`github.com/chromedp/cdproto/accessibility`) — no need
-  for a separate library, just walk `accessibility.GetFullAXTree`.
-- Tools to add: `browser_navigate`, `browser_click` (by accessible
-  name/role, not CSS selector — matches upstream playwright-mcp's design
-  and is more LLM-friendly than raw selectors), `browser_type`,
-  `browser_snapshot`.
-- New IPC concern: these calls are inherently stateful/sequential per
-  session, unlike the current one-shot request/response tools — worth
-  revisiting whether the wire protocol needs a `session_id` field on
-  `ipc.Request` at that point, or whether per-session tool names
-  (`browser_click:session-abc`) is simpler. Decide when actually building
-  this, not now.
+Original (`@arabold/docs-mcp-server`): 90+ format parsers, vector embeddings
+across multiple providers, semantic search, a web UI, a SQLite index. This
+is a full product, not a trivial wrapper. If ever revisited: this is the one
+tool where "daemon owns the state" is most obviously correct (a SQLite index
+and embedding cache must not be duplicated per-subagent), but the surface
+area is large enough to warrant its own planning pass rather than a NOTES.md
+sketch.
 
-## P2: `docs-mcp-server` equivalent — explicitly deferred, not attempted
+### npm packaging/publishing polish (Phase 5)
 
-Original (`@arabold/docs-mcp-server`): 90+ format parsers, vector
-embeddings across multiple providers, semantic search, a web UI, a SQLite
-index. This is a full product, not a trivial wrapper — reimplementing it
-is out of scope for this task and likely out of scope for a while.
-
-If ever revisited: this is the one tool where "daemon owns the state" is
-most obviously correct (a SQLite index and embedding cache are exactly the
-kind of thing that must not be duplicated per-subagent), but the surface
-area (format parsers, embedding provider abstraction, semantic search
-ranking) is large enough to warrant its own planning pass
-(`/plan:mdd-start`) rather than a NOTES.md sketch.
+- Wire `wasm-pack build --target nodejs` (or the plain `cargo build
+  --target wasm32-unknown-unknown` + `wasm-bindgen` CLI fallback actually
+  used so far) into CI, so `npm/pkg/` is a release artifact, never hand-built
+  by an end user.
+- Opportunistic native-binary fast path: before spawning the Node-hosted
+  daemon, check whether a `cargo install`ed native `stapler-mcp` binary is
+  already on `PATH`, and prefer spawning that instead (real `flock`, real
+  `chromiumoxide`, multi-core) — safe because a binary the user built
+  themselves was never downloaded/quarantined, so it doesn't reintroduce the
+  Gatekeeper problem the whole wasm/Node distribution exists to avoid.
+- Publish to npm; real cross-implementation interop is already proven, this
+  phase is packaging/CI/docs, not new architecture.
 
 ## Non-goals (for now)
 
-- No Windows support — Unix domain sockets + `flock` are POSIX-only. Fine
-  for this user's Linux/macOS machines; would need a named-pipe transport
-  to support Windows.
-- No TLS/auth on the Unix socket — filesystem permissions on
-  `~/.stapler-mcp/` (0700) are the only access control. Acceptable for a
-  single-user, single-machine daemon; would need revisiting if this ever
-  became multi-user or networked.
+- No Windows support — the native adapter's Unix domain sockets are
+  POSIX-only. Fine for this user's Linux/macOS machines; would need a
+  named-pipe transport to support Windows. (The Node adapter's `net` module
+  is cross-platform, but hasn't been tested on Windows either.)
+- No TLS/auth on the socket — filesystem permissions on `~/.stapler-mcp/`
+  (0700) are the only access control. Acceptable for a single-user,
+  single-machine daemon; would need revisiting if this ever became
+  multi-user or networked.

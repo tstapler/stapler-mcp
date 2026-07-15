@@ -1,0 +1,23 @@
+{
+  "name": "stapler-mcp",
+  "version": "0.1.0",
+  "description": "Thin-client/daemon MCP server (fetch_page, brave_web_search) — Rust core compiled to WASM, no native binary required.",
+  "private": true,
+  "bin": {
+    "stapler-mcp": "bin/stapler-mcp.js"
+  },
+  "files": [
+    "bin",
+    "pkg"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "playwright-core": "^1.61.1"
+  }
+}

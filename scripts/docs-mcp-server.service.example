@@ -1,0 +1,29 @@
+# Template for ~/.config/systemd/user/docs-mcp-server.service — a persistent
+# shared instance of the (out-of-scope-for-Rust-port, see NOTES.md)
+# docs-mcp-server, replacing the old per-session stdio spawn.
+#
+# Setup:
+#   1. mkdir -p ~/.config/docs-mcp-server
+#      printf 'OPENAI_API_KEY=...\n' > ~/.config/docs-mcp-server/env  # whatever embedding provider env vars you use
+#      chmod 600 ~/.config/docs-mcp-server/env
+#   2. Copy this file to ~/.config/systemd/user/docs-mcp-server.service
+#   3. systemctl --user daemon-reload && systemctl --user start docs-mcp-server.service
+#      (deliberately not `enable` — this is an on-demand shared instance, not
+#      a boot-persistent service; scripts/ensure-docs-mcp-server.sh starts it
+#      idempotently whenever it's needed)
+#   4. Point ~/.claude.json's "docs" mcpServers entry at the SSE endpoint:
+#      "docs": { "type": "sse", "url": "http://localhost:6280/sse" }
+
+[Unit]
+Description=docs-mcp-server (persistent MCP doc index, HTTP/SSE)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/docs-mcp-server/env
+ExecStart=npx --yes @arabold/docs-mcp-server@latest --protocol http --host 127.0.0.1 --port 6280
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

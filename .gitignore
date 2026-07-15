@@ -1,4 +1,10 @@
-/stapler-mcp
+/target/
 /dist/
 *.log
 .DS_Store
+
+# npm/pkg is wasm-bindgen's generated output (Rust core -> wasm32 + JS glue),
+# built in CI, not hand-edited or committed — like /target, it's a build
+# artifact, not source.
+npm/pkg/
+npm/node_modules/

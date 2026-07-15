@@ -1,0 +1,12 @@
+[package]
+name = "stapler-mcp-native"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+stapler-mcp-core = { path = "../core" }
+tokio = { version = "1", features = ["rt", "net", "time", "process", "io-util", "fs", "macros"] }
+libc = "0.2"
+futures = "0.3"
+reqwest = { version = "0.13", features = ["rustls"], default-features = false }
+chromiumoxide = "0.9"
