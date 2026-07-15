@@ -24,13 +24,13 @@ const MAX_PAGES_CEILING: u32 = 50;
 const MAX_DEPTH_CEILING: u32 = 5;
 const USER_AGENT: &str = "stapler-mcp/0.1 (+https://github.com/tstapler/stapler-mcp)";
 
-fn resolve_limits(max_depth: Option<u32>, max_pages: Option<u32>) -> (u32, u32) {
+pub(crate) fn resolve_limits(max_depth: Option<u32>, max_pages: Option<u32>) -> (u32, u32) {
     let depth = max_depth.unwrap_or(DEFAULT_MAX_DEPTH).min(MAX_DEPTH_CEILING);
     let pages = max_pages.unwrap_or(DEFAULT_MAX_PAGES).clamp(1, MAX_PAGES_CEILING);
     (depth, pages)
 }
 
-fn cache_key_for(url: &str) -> String {
+pub(crate) fn cache_key_for(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
@@ -49,7 +49,7 @@ fn extract_links(html: &str, base: &Url) -> Vec<Url> {
         .collect()
 }
 
-fn extract_title_and_markdown(html: &str, url: &str) -> Result<(String, String), String> {
+pub(crate) fn extract_title_and_markdown(html: &str, url: &str) -> Result<(String, String), String> {
     let mut readability =
         Readability::new(html, Some(url), None).map_err(|e| format!("readability: {e}"))?;
     let article = readability.parse().map_err(|e| format!("readability: {e}"))?;
@@ -68,15 +68,20 @@ async fn fetch_robots<H: HttpClient>(http: &H, seed: &Url) -> Option<texting_rob
     texting_robots::Robot::new(USER_AGENT, &resp.body).ok()
 }
 
-async fn fetch_ok<H: HttpClient>(http: &H, url: &str) -> Option<HttpResponse> {
+/// `Err(Some(status))` for a non-200 response, `Err(None)` for a transport-level
+/// failure (the request never got a response at all). Kept distinct (rather than
+/// collapsing both into a single `None`, as the pre-`docs-index` version did) so
+/// callers that need to report *why* a fetch failed (`index_source`'s seed-URL
+/// error, Story 4.1.1) can do so; callers that don't care still just match `Err(_)`.
+async fn fetch_ok<H: HttpClient>(http: &H, url: &str) -> Result<HttpResponse, Option<u16>> {
     let resp = http
         .get(url, &[("User-Agent".to_string(), USER_AGENT.to_string())])
         .await
-        .ok()?;
+        .map_err(|_| None)?;
     if resp.status == 200 {
-        Some(resp)
+        Ok(resp)
     } else {
-        None
+        Err(Some(resp.status))
     }
 }
 
@@ -87,7 +92,7 @@ fn same_host(a: &Url, b: &Url) -> bool {
 /// A BFS crawl frontier shared by both tools: yields `(url, depth, html)` for
 /// every page successfully fetched (skipping disallowed/failed pages rather
 /// than aborting), stopping at `max_pages` fetched or `max_depth` hops.
-struct Crawler<'a, H: HttpClient> {
+pub(crate) struct Crawler<'a, H: HttpClient> {
     http: &'a H,
     robot: Option<texting_robots::Robot>,
     seed: Url,
@@ -98,7 +103,7 @@ struct Crawler<'a, H: HttpClient> {
 }
 
 impl<'a, H: HttpClient> Crawler<'a, H> {
-    async fn new(http: &'a H, seed: Url, max_depth: u32, max_pages: u32) -> Self {
+    pub(crate) async fn new(http: &'a H, seed: Url, max_depth: u32, max_pages: u32) -> Self {
         let robot = fetch_robots(http, &seed).await;
         let mut visited = HashSet::new();
         visited.insert(seed.to_string());
@@ -125,7 +130,7 @@ impl<'a, H: HttpClient> Crawler<'a, H> {
     /// Pops the next allowed URL from the frontier (silently skipping any
     /// `robots.txt`-disallowed ones), or `None` once `max_pages` already
     /// fetched is reached or the frontier is exhausted.
-    fn next_url(&mut self, fetched: usize) -> Option<(Url, u32)> {
+    pub(crate) fn next_url(&mut self, fetched: usize) -> Option<(Url, u32)> {
         if fetched >= self.max_pages as usize {
             return None;
         }
@@ -138,13 +143,23 @@ impl<'a, H: HttpClient> Crawler<'a, H> {
     }
 
     /// Fetches `url` and, if `depth` allows further expansion, enqueues its
-    /// same-host links. Returns `None` on fetch failure (skipped, not fatal
-    /// to the whole crawl) — separated from `next_url` so a cache hit (see
-    /// `read_website`) can skip the network fetch entirely, at the cost of
-    /// not discovering that page's links (an accepted, documented trade-off:
-    /// crawl discovery only follows links from freshly-fetched pages).
-    async fn fetch_and_expand(&mut self, url: &Url, depth: u32) -> Option<String> {
+    /// same-host links. Returns `Err` on fetch failure (skipped, not fatal
+    /// to the whole crawl by most callers — see `fetch_ok`'s doc comment for
+    /// what the `Err` payload carries) — separated from `next_url` so a
+    /// cache hit (see `read_website`) can skip the network fetch entirely,
+    /// at the cost of not discovering that page's links (an accepted,
+    /// documented trade-off: crawl discovery only follows links from
+    /// freshly-fetched pages). On success, returns `(html, final_url)` —
+    /// `final_url` is the post-redirect URL actually served (see
+    /// `HttpResponse::final_url`), threaded through for `docs-index`'s
+    /// `ChunkRecord.source_url`/`SourceMeta.page_urls` (Epic 6.1).
+    pub(crate) async fn fetch_and_expand(
+        &mut self,
+        url: &Url,
+        depth: u32,
+    ) -> Result<(String, String), Option<u16>> {
         let resp = fetch_ok(self.http, url.as_str()).await?;
+        let final_url = resp.final_url.clone();
         let html = String::from_utf8_lossy(&resp.body).into_owned();
 
         if depth < self.max_depth {
@@ -157,7 +172,7 @@ impl<'a, H: HttpClient> Crawler<'a, H> {
             }
         }
 
-        Some(html)
+        Ok((html, final_url))
     }
 }
 
@@ -203,7 +218,7 @@ where
             }
         }
 
-        let Some(html) = crawler.fetch_and_expand(&url, depth).await else {
+        let Ok((html, _final_url)) = crawler.fetch_and_expand(&url, depth).await else {
             continue;
         };
         let (title, markdown) = extract_title_and_markdown(&html, url.as_str())?;
@@ -271,7 +286,7 @@ where
     let mut pages = Vec::new();
 
     while let Some((url, depth)) = crawler.next_url(pages.len()) {
-        let Some(html) = crawler.fetch_and_expand(&url, depth).await else {
+        let Ok((html, _final_url)) = crawler.fetch_and_expand(&url, depth).await else {
             continue;
         };
         let path = save_path_for(&input.save_dir, &url);

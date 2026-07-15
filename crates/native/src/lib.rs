@@ -2,6 +2,7 @@
 //! OS primitives (tokio Unix sockets, `fs4` flock, detached process spawn).
 
 mod browser;
+mod embed;
 mod env;
 mod fs;
 mod http;
@@ -11,6 +12,7 @@ mod socket;
 mod spawn;
 
 pub use browser::NativeBrowser;
+pub use embed::NativeEmbedder;
 pub use env::NativeEnv;
 pub use fs::NativeFs;
 pub use http::NativeHttp;

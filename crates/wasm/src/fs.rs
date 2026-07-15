@@ -12,6 +12,8 @@ extern "C" {
     fn js_write_file(path: &str, bytes: &[u8]) -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsReadFile)]
     fn js_read_file(path: &str) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsDeleteFile)]
+    fn js_delete_file(path: &str) -> js_sys::Promise;
 }
 
 pub struct WasmFs;
@@ -33,5 +35,12 @@ impl FileStore for WasmFs {
         } else {
             Ok(Some(js_sys::Uint8Array::new(&v).to_vec()))
         }
+    }
+
+    async fn delete_file(&self, path: &str) -> Result<(), PortError> {
+        JsFuture::from(js_delete_file(path))
+            .await
+            .map_err(|e| PortError::Io(js_err_to_string(&e)))?;
+        Ok(())
     }
 }

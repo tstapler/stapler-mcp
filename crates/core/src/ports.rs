@@ -92,6 +92,8 @@ pub trait SleepPort {
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The URL actually served, after following any redirects.
+    pub final_url: String,
 }
 
 pub trait HttpClient {
@@ -118,4 +120,17 @@ pub trait FileStore {
     async fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), PortError>;
     /// `Ok(None)` means the file doesn't exist (a cache miss), not an error.
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, PortError>;
+    /// Idempotent — deleting a path that doesn't exist is `Ok(())`, not an error.
+    async fn delete_file(&self, path: &str) -> Result<(), PortError>;
+}
+
+/// Runs local embedding inference (loading an ONNX model, tokenizing, tensor
+/// math). Intentionally native-only for v1: no wasm implementation exists,
+/// because `fastembed`'s `ort` dependency has no path to
+/// `wasm32-unknown-unknown` (maintainer-abandoned wasm support) — see
+/// docs-index's ADR-0002. `tools::docs`, the only caller, is compiled out of
+/// the wasm32 target entirely, so this asymmetry with every other port trait
+/// (which all have at least a partial wasm adapter) is deliberate, not a gap.
+pub trait Embedder {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, PortError>;
 }

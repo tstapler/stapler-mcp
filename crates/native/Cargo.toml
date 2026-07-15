@@ -10,3 +10,4 @@ libc = "0.2"
 futures = "0.3"
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 chromiumoxide = "0.9"
+fastembed = "=5.17.2"

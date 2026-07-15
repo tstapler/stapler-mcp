@@ -14,7 +14,9 @@ use stapler_mcp_core::client::{self, EnsureOptions};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
-    FetchPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
+    FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput, ListIndexedSourcesOutput,
+    ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
+    SearchDocsOutput,
 };
 use stapler_mcp_native::{NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner};
 
@@ -110,6 +112,57 @@ impl ThinClient {
         params: Parameters<DownloadWebsiteInput>,
     ) -> Result<Json<DownloadWebsiteOutput>, String> {
         call_daemon("download_website", params.0).await.map(Json)
+    }
+
+    #[tool(
+        name = "stapler_index_docs",
+        description = "Crawl a URL (reusing the same host-restricted, robots.txt-respecting crawler as read_website, up to maxDepth/maxPages) and build a local semantic search index over it under the given source name (or a name derived from the URL). Re-running stapler_index_docs on an already-indexed source fully re-indexes it in place."
+    )]
+    async fn index_docs(&self, params: Parameters<IndexDocsInput>) -> Result<Json<IndexDocsOutput>, String> {
+        call_daemon("stapler_index_docs", params.0).await.map(Json)
+    }
+
+    #[tool(
+        name = "stapler_search_docs",
+        description = "Semantically search a previously stapler_index_docs'd source by name, returning the top-scoring text chunks ranked by relevance to query."
+    )]
+    async fn search_docs(&self, params: Parameters<SearchDocsInput>) -> Result<Json<SearchDocsOutput>, String> {
+        call_daemon("stapler_search_docs", params.0).await.map(Json)
+    }
+
+    #[tool(
+        name = "stapler_list_indexed_sources",
+        description = "List every doc source currently indexed via stapler_index_docs, with page/chunk counts and when each was last indexed."
+    )]
+    async fn list_indexed_sources(
+        &self,
+        params: Parameters<ListIndexedSourcesInput>,
+    ) -> Result<Json<ListIndexedSourcesOutput>, String> {
+        call_daemon("stapler_list_indexed_sources", params.0).await.map(Json)
+    }
+
+    #[tool(
+        name = "stapler_remove_indexed_source",
+        description = "Permanently delete a previously indexed doc source and all its stored chunks. Use only if explicitly instructed — there is no undo."
+    )]
+    async fn remove_indexed_source(
+        &self,
+        params: Parameters<RemoveIndexedSourceInput>,
+    ) -> Result<Json<RemoveIndexedSourceOutput>, String> {
+        call_daemon("stapler_remove_indexed_source", params.0).await.map(Json)
+    }
+}
+
+impl ThinClient {
+    /// Test-only accessor exposing this router's registered tool metadata
+    /// (name, description, `inputSchema`) — the same data `tools/list`
+    /// serves — without needing a live stdio MCP client. Used by
+    /// `tests/tool_schema.rs` to verify Story 5.2.1's `tools/list`
+    /// acceptance criterion (all docs-index tools present with non-empty
+    /// descriptions and schemas matching their `*Input` structs).
+    #[cfg(test)]
+    pub fn registered_tools() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
     }
 }
 
