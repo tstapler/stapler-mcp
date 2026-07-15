@@ -21,6 +21,18 @@ module.exports.jsReadFile = function (filePath) {
     });
 };
 
+module.exports.jsDeleteFile = function (filePath) {
+    return new Promise((resolve, reject) => {
+        fs.unlink(filePath, (err) => {
+            if (err && err.code !== "ENOENT") {
+                reject(err);
+                return;
+            }
+            resolve();
+        });
+    });
+};
+
 module.exports.jsWriteFile = function (filePath, bytes) {
     return new Promise((resolve, reject) => {
         fs.mkdir(path.dirname(filePath), { recursive: true }, (err) => {

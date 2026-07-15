@@ -1,7 +1,8 @@
 # Requirements: docs-index
 
-**Status**: Draft | **Phase**: 1 — Ideation complete
+**Status**: Validated | **Phase**: 4 — Validation complete, ready for implementation
 **Created**: 2026-07-14
+**Updated**: 2026-07-14 (Phase 4 Product Triad Review — scope/success-criteria traceability sync)
 
 ## Problem Statement
 
@@ -36,6 +37,27 @@ daemon — full functional replacement for how `docs-mcp-server` is used
 today, deliberately narrower in format support (HTML/Markdown only, not the
 other 88 formats). No separate Node process needed for this at all.
 
+Two conditions beyond raw functionality gate "done," both identified during
+planning (Phase 3/4) and tracked as explicit tasks in `implementation/plan.md`
+rather than left implicit here:
+
+- **Result quality, not just non-empty results**: a manual relevance spot
+  check (indexing a real code-heavy doc source and judging whether top
+  search results are actually relevant to realistic queries, not merely
+  correctly-typed and correctly-sorted) must pass before the feature is
+  considered done — see `implementation/plan.md` Epic 6.3, Story 6.3.1.
+  Mechanical test-passing is necessary but not sufficient; a technically
+  correct search tool that returns poor-quality results for Tyler's actual
+  use case (code/API-heavy content) does not meet this success criterion.
+- **Actual `docs-mcp-server` decommission, not just capability parity**:
+  "no separate Node process needed for this at all" means the `"docs"`
+  entry in `~/.claude.json` is removed (or the resulting tool-name collision
+  with `docs-mcp-server`'s own `search_docs` is otherwise explicitly
+  resolved) once `docs-index` is verified working — see
+  `implementation/plan.md` Epic 6.3, Story 6.3.2. Shipping the code without
+  this step leaves the stated goal ("no separate Node process") unmet even
+  though the new tools work.
+
 ## Scope
 
 ### Must Have (MoSCoW)
@@ -47,6 +69,21 @@ other 88 formats). No separate Node process needed for this at all.
   `docs-mcp-server`'s LangChain→AWS Bedrock/Vertex/OpenAI setup).
 - A semantic-search MCP tool: given a query and an indexed source, return
   ranked relevant chunks/pages.
+
+**Actual delivered scope (Phase 2/3 planning expanded this beyond the three
+items above, recorded here to close a traceability gap flagged repeatedly
+across architecture review, adversarial review, and the Product Triad
+Review — see `implementation/plan.md`'s own top-of-file note for the full
+rationale)**: the plan ships this as **four** MCP tools, not one —
+`index_docs`, `search_docs`, `list_indexed_sources`, and
+`remove_indexed_source` — plus two small, justified extensions to
+already-shipped shared infrastructure: `FileStore::delete_file` (needed by
+`remove_indexed_source`) and `HttpClient`'s `HttpResponse.final_url` field
+(needed so a chunk's `sourceUrl` metadata survives redirects). `list
+_indexed_sources`/`remove_indexed_source` exist because Phase 2's research
+concluded a "handful of sources" store needs visibility/cleanup to stay
+usable — not itself part of "a semantic-search MCP tool" narrowly read, but
+a direct, small consequence of building one that persists state at all.
 
 ### Out of Scope
 

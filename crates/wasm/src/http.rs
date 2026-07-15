@@ -15,9 +15,17 @@ extern "C" {
 pub struct WasmHttp;
 
 impl HttpClient for WasmHttp {
-    async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse, PortError> {
-        let headers_map: HashMap<&str, &str> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let headers_json = serde_json::to_string(&headers_map).map_err(|e| PortError::Other(e.to_string()))?;
+    async fn get(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, PortError> {
+        let headers_map: HashMap<&str, &str> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let headers_json =
+            serde_json::to_string(&headers_map).map_err(|e| PortError::Other(e.to_string()))?;
 
         let result = JsFuture::from(js_http_get(url, &headers_json))
             .await
@@ -31,6 +39,12 @@ impl HttpClient for WasmHttp {
             .map_err(|_| PortError::Other("missing body in HTTP response".to_string()))?;
         let body = js_sys::Uint8Array::new(&body_val).to_vec();
 
-        Ok(HttpResponse { status, body })
+        // TODO(docs-index-wasm): capture the real post-redirect URL via response.url
+        // on the JS side if/when a wasm Embedder exists.
+        Ok(HttpResponse {
+            status,
+            body,
+            final_url: url.to_string(),
+        })
     }
 }

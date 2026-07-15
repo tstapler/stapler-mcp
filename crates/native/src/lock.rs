@@ -15,7 +15,7 @@ impl LockGuard for NativeLockGuard {
         // Best-effort, purely for operator debugging of a stuck daemon.
         let _ = self.file.set_len(0);
         let _ = self.file.seek(SeekFrom::Start(0));
-        let _ = write!(self.file, "{pid}\n");
+        let _ = writeln!(self.file, "{pid}");
     }
 }
 
@@ -27,8 +27,12 @@ impl ProcessLock for NativeLock {
         tokio::task::spawn_blocking(move || {
             use std::fs::TryLockError;
 
+            // Never truncate on open: `write_pid` below does its own explicit
+            // `set_len(0)` immediately before writing, so a pre-existing
+            // lock file's contents must survive the open call itself.
             let file = OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .mode(0o600)

@@ -33,7 +33,8 @@ impl EnvPort for TestEnv {
     }
 }
 
-const FILLER: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor \
+const FILLER: &str =
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor \
 incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation \
 ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in \
 voluptate velit esse cillum dolore eu fugiat nulla pariatur.";
@@ -71,7 +72,9 @@ async fn spawn_mock_site() -> (String, tokio::sync::oneshot::Sender<()>) {
         ),
     ]);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock site");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock site");
     let addr = listener.local_addr().expect("mock site addr");
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -186,11 +189,18 @@ async fn webcrawl_respects_robots_and_caches() {
     .await
     .expect("download_website should succeed");
     let downloaded = download_result["pages"].as_array().expect("pages array");
-    assert_eq!(downloaded.len(), 3, "expected index+page2+page3, got: {downloaded:?}");
+    assert_eq!(
+        downloaded.len(),
+        3,
+        "expected index+page2+page3, got: {downloaded:?}"
+    );
     for page in downloaded {
         let path = page["path"].as_str().expect("path");
         let contents = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert!(contents.contains("<html>"), "saved file should contain raw HTML: {path}");
+        assert!(
+            contents.contains("<html>"),
+            "saved file should contain raw HTML: {path}"
+        );
     }
 
     // 3. Shut the mock site down, then call `read_website` again for just the
@@ -220,7 +230,13 @@ async fn webcrawl_respects_robots_and_caches() {
     );
     assert_eq!(cached_pages[0]["title"], "Index");
 
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }

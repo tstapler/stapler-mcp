@@ -41,7 +41,11 @@ impl NativeBrowser {
 }
 
 impl BrowserDriver for NativeBrowser {
-    async fn navigate_and_extract(&self, url: &str, timeout: Duration) -> Result<PageExtract, PortError> {
+    async fn navigate_and_extract(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<PageExtract, PortError> {
         let fut = async {
             let page = self
                 .browser

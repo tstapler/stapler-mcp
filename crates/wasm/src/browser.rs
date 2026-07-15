@@ -26,7 +26,11 @@ impl WasmBrowser {
 }
 
 impl BrowserDriver for WasmBrowser {
-    async fn navigate_and_extract(&self, url: &str, timeout: Duration) -> Result<PageExtract, PortError> {
+    async fn navigate_and_extract(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<PageExtract, PortError> {
         let result = JsFuture::from(js_navigate_and_extract(url, timeout.as_millis() as f64))
             .await
             .map_err(|e| PortError::Other(js_err_to_string(&e)))?;

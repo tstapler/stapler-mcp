@@ -7,9 +7,15 @@ use rmcp::{transport::stdio, ServiceExt};
 use stapler_mcp_core::daemon::{json_handler, Daemon};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
-use stapler_mcp_core::schema::{BraveSearchInput, DownloadWebsiteInput, FetchPageInput, ReadWebsiteInput};
-use stapler_mcp_core::tools::{fetch, search, webcrawl};
-use stapler_mcp_native::{NativeBrowser, NativeEnv, NativeFs, NativeHttp, NativeLock, NativeSocketFactory};
+use stapler_mcp_core::schema::{
+    BraveSearchInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
+    ListIndexedSourcesInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
+};
+use stapler_mcp_core::tools::{docs, fetch, search, webcrawl};
+use stapler_mcp_native::{
+    NativeBrowser, NativeClock, NativeEmbedder, NativeEnv, NativeFs, NativeHttp, NativeLock,
+    NativeSocketFactory,
+};
 
 fn main() {
     let is_daemon = std::env::args().any(|a| a == "--daemon");
@@ -81,6 +87,10 @@ async fn run_daemon() {
             std::process::exit(1);
         }
     };
+    let embedder = Rc::new(NativeEmbedder::new(paths::embedding_cache_dir(&env)));
+    let clock = Rc::new(NativeClock);
+    let source_locks = Rc::new(docs::SourceLocks::new());
+    let docs_index_dir = paths::docs_index_dir(&env);
 
     let daemon = Daemon::new();
 
@@ -137,6 +147,83 @@ async fn run_daemon() {
                 let http = http.clone();
                 let fs = fs.clone();
                 async move { webcrawl::download_website(&*http, &*fs, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_index_docs",
+        json_handler({
+            let http = http.clone();
+            let fs = fs.clone();
+            let embedder = embedder.clone();
+            let clock = clock.clone();
+            let source_locks = source_locks.clone();
+            let docs_index_dir = docs_index_dir.clone();
+            move |input: IndexDocsInput| {
+                let http = http.clone();
+                let fs = fs.clone();
+                let embedder = embedder.clone();
+                let clock = clock.clone();
+                let source_locks = source_locks.clone();
+                let docs_index_dir = docs_index_dir.clone();
+                async move {
+                    docs::index_source(
+                        &*http,
+                        &*fs,
+                        &*embedder,
+                        &*clock,
+                        &source_locks,
+                        &docs_index_dir,
+                        input,
+                    )
+                    .await
+                }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_search_docs",
+        json_handler({
+            let fs = fs.clone();
+            let embedder = embedder.clone();
+            let docs_index_dir = docs_index_dir.clone();
+            move |input: SearchDocsInput| {
+                let fs = fs.clone();
+                let embedder = embedder.clone();
+                let docs_index_dir = docs_index_dir.clone();
+                async move { docs::search_docs(&*fs, &*embedder, &docs_index_dir, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_list_indexed_sources",
+        json_handler({
+            let fs = fs.clone();
+            let docs_index_dir = docs_index_dir.clone();
+            move |input: ListIndexedSourcesInput| {
+                let fs = fs.clone();
+                let docs_index_dir = docs_index_dir.clone();
+                async move { docs::list_indexed_sources(&*fs, &docs_index_dir, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_remove_indexed_source",
+        json_handler({
+            let fs = fs.clone();
+            let source_locks = source_locks.clone();
+            let docs_index_dir = docs_index_dir.clone();
+            move |input: RemoveIndexedSourceInput| {
+                let fs = fs.clone();
+                let source_locks = source_locks.clone();
+                let docs_index_dir = docs_index_dir.clone();
+                async move {
+                    docs::remove_indexed_source(&*fs, &source_locks, &docs_index_dir, input).await
+                }
             }
         }),
     );

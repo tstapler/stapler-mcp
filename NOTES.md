@@ -89,6 +89,52 @@ choices) came out of a dedicated planning pass and is summarized in
     boundary, not hypothetical, since the path comes from a possibly
     untrusted remote site.
 
+- **Phase 4** — `crates/core/src/tools/docs.rs`: native-only (`#[cfg(not(target_arch
+  = "wasm32"))]`) semantic search over crawled doc sources, replacing the
+  Node-based `docs-mcp-server`. Reuses `webcrawl.rs`'s `Crawler` (bumped to
+  `pub(crate)`) rather than a second crawl loop. Local embeddings via
+  `fastembed`/`all-MiniLM-L6-v2` (`crates/native/src/embed.rs`, `Embedder`
+  port trait, native-only for v1 per ADR-0001/ADR-0002) + brute-force cosine
+  similarity — no vector DB. Four tools registered on the daemon and exposed
+  over the thin client, **prefixed `stapler_` to avoid the exact tool-name
+  collision** `docs-mcp-server` already had registered (`search_docs`) in
+  `~/.claude.json`: `stapler_index_docs`, `stapler_search_docs`,
+  `stapler_list_indexed_sources`, `stapler_remove_indexed_source`.
+  - Storage: JSONL chunk records + JSON meta sidecar per source under
+    `~/.stapler-mcp/docs-index/<source-id>/`, plus a `sources.json` manifest
+    for enumeration. `MAX_CHUNKS_PER_SOURCE` is set from a real measured
+    `fastembed` throughput benchmark (not guessed), sub-batched embedding
+    with `tokio::task::yield_now().await` between batches so a long
+    `index_docs` call doesn't stall the single-threaded daemon for its
+    entire duration.
+  - `SourceLocks` (in-memory per-source guard) prevents a concurrent
+    `index_docs`/`remove_indexed_source` pair on the same source from
+    interleaving their writes — found necessary in adversarial review as a
+    normal-operation risk (two related tool calls fired close together by
+    an LLM caller), not just a daemon-crash edge case.
+  - `NativeFs::write_file` was made atomic (temp-file + rename, per-call-
+    unique temp filename) as part of this work — a general fix that also
+    benefits `read_website`'s existing page cache, not just docs-index.
+  - **Security fix found in verification, not planning**: a caller-supplied
+    `source` name that slugifies to an empty string (e.g. `"..."`) collided
+    with every other empty-slug source on the same two on-disk files,
+    letting one garbage-input call silently clobber another's data. Fixed
+    with a guard rejecting empty-slug source names in `index_source`/
+    `remove_indexed_source`, plus regression tests.
+  - Manual relevance spot-check (real, not simulated) run against
+    `https://tokio.rs/tokio/tutorial` (19 pages, 524 chunks): 4 of 5
+    realistic queries had genuinely on-topic top results (spawning,
+    sharing state between tasks, and channels all scored highly and were
+    directly relevant); the "Mutex vs RwLock" query only surfaced
+    Mutex-related content — not an embedding-model failure, the tutorial
+    simply doesn't cover `RwLock`, so the model correctly found the closest
+    available match. Verdict: **relevance spot-checked, acceptable** for
+    `all-MiniLM-L6-v2` on real Rust/Tokio documentation.
+  - Pre-existing SSRF-class risk (the crawler has no loopback/private-IP
+    blocklist on the seed URL) is inherited unchanged from `read_website`/
+    `download_website` — not introduced or worsened by this feature, and
+    out of scope to fix here.
+
 ## Deferred
 
 ### `playwright-mcp` equivalent — browser automation tools
@@ -107,15 +153,19 @@ to implement its own AX-tree walk + role/name resolution to match what Node
 gets for free. Budget for this explicitly, don't assume parity between the
 two adapters here.
 
-### `docs-mcp-server` equivalent — explicitly deferred, not attempted
+### `docs-mcp-server` equivalent — done (Phase 4), narrower scope by design
 
-Original (`@arabold/docs-mcp-server`): 90+ format parsers, vector embeddings
-across multiple providers, semantic search, a web UI, a SQLite index. This
-is a full product, not a trivial wrapper. If ever revisited: this is the one
-tool where "daemon owns the state" is most obviously correct (a SQLite index
-and embedding cache must not be duplicated per-subagent), but the surface
-area is large enough to warrant its own planning pass rather than a NOTES.md
-sketch.
+The native, single-doc-format v1 shipped as Phase 4 (`docs.rs`,
+`stapler_index_docs`/`stapler_search_docs`/`stapler_list_indexed_sources`/
+`stapler_remove_indexed_source`) — see the "Done" section above. It does not
+match the original `@arabold/docs-mcp-server`'s full scope (90+ format
+parsers, multi-provider embeddings, a web UI): it's Markdown/HTML-via-crawl
+only, one pinned local embedding model, no UI. `docs-mcp-server` itself is
+still connected as of this writing (`~/.claude.json`'s `"docs"` entry) —
+disconnecting it, and deciding whether the wider format/provider surface is
+ever worth adding, are open follow-ups, not blocked on anything technical
+(the tool-name collision that made coexistence awkward is resolved via the
+`stapler_` prefix above).
 
 ### npm packaging/publishing polish (Phase 5)
 
