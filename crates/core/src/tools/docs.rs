@@ -762,6 +762,15 @@ pub(crate) async fn unknown_source_error<F: FileStore>(
 /// `chunks.jsonl` are skipped with a logged warning rather than failing the
 /// whole search, matching `webcrawl.rs::fetch_and_expand`'s existing
 /// skip-one-bad-item precedent.
+//
+// Measured (issue #5 / pre-mortem failure mode #5), via
+// `bench_search_docs_latency` at `MAX_CHUNKS_PER_SOURCE` (780 chunks) scale,
+// on this dev machine, 2026-08-06: ~7ms/call in a `--release` build, ~127ms/
+// call in an unoptimized debug build. Comfortably sub-second either way —
+// not currently a live problem — so the in-memory embeddings cache proposed
+// as a fast-follow in the issue is not needed yet. Re-measure if
+// MAX_CHUNKS_PER_SOURCE grows or this stops feeling comfortably fast in
+// practice.
 pub async fn search_docs<F, E>(
     fs: &F,
     embedder: &E,
@@ -2135,6 +2144,91 @@ mod tests {
             .expect("search_docs should succeed despite one malformed line");
 
         assert_eq!(output.results.len(), 10);
+    }
+
+    /// Benchmarks `search_docs`'s read+parse+score path at
+    /// `MAX_CHUNKS_PER_SOURCE` scale (issue #5 / pre-mortem failure mode #5)
+    /// — the same read-line-by-line-and-parse-then-cosine-score-every-record
+    /// path a hot, fully-indexed source hits on every single call. Uses
+    /// `InMemoryFileStore` (no real disk I/O) so the timing isolates JSON
+    /// parsing + `cosine_similarity` cost, not filesystem latency — the part
+    /// that scales with source size and the part `search_docs` cannot avoid
+    /// paying synchronously today.
+    ///
+    /// Ignored by default, matching `bench_embed_throughput`'s precedent —
+    /// run explicitly with:
+    ///   cargo test -p stapler-mcp-core -- --ignored bench_search_docs_latency
+    #[tokio::test]
+    #[ignore]
+    async fn bench_search_docs_latency() {
+        let docs_index_dir = "/fake/docs-index";
+        let id = SourceId::from_name("tokio-tutorial");
+        let fs = InMemoryFileStore::new();
+
+        let meta = SourceMeta {
+            source_id: id.as_str().to_string(),
+            source_name: "tokio-tutorial".to_string(),
+            seed_url: "https://tokio.rs/tokio/tutorial".to_string(),
+            page_urls: vec!["https://tokio.rs/tokio/tutorial".to_string()],
+            indexed_at_millis: 1_700_000_000_000,
+            page_count: 50,
+            chunk_count: MAX_CHUNKS_PER_SOURCE as u32,
+            embedding_model: EMBEDDING_MODEL_ID.to_string(),
+        };
+        fs.seed(
+            &meta_path(docs_index_dir, &id),
+            serde_json::to_vec(&meta).unwrap(),
+        );
+
+        // Real all-MiniLM-L6-v2 vectors are 384-dim; a fixed-but-varied
+        // per-record vector (not all-identical) keeps cosine_similarity's
+        // dot-product/norm math from being trivially short-circuited while
+        // staying deterministic and model-download-free.
+        let records: Vec<ChunkRecord> = (0..MAX_CHUNKS_PER_SOURCE)
+            .map(|i| ChunkRecord {
+                chunk_text: format!(
+                    "Chunk {i}: a paragraph of realistic documentation prose about async \
+                     runtimes, task scheduling, and `tokio::spawn`, representative of a \
+                     heading-aware markdown split from real crate documentation."
+                ),
+                embedding: (0..384)
+                    .map(|d| ((i * 384 + d) % 997) as f32 / 997.0)
+                    .collect(),
+                source_url: "https://tokio.rs/tokio/tutorial".to_string(),
+                chunk_index: i as u32,
+                content_hash: format!("hash-{i}"),
+                heading: Some("Spawning".to_string()),
+                page_title: "Tokio Tutorial".to_string(),
+            })
+            .collect();
+        let jsonl = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs.seed(&chunks_path(docs_index_dir, &id), jsonl.into_bytes());
+
+        let embedder = FixedVectorEmbedder::new((0..384).map(|d| d as f32 / 384.0).collect());
+        let input = SearchDocsInput {
+            source: "tokio-tutorial".to_string(),
+            query: "how do I spawn a task".to_string(),
+            limit: Some(5),
+        };
+
+        const RUNS: u32 = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..RUNS {
+            search_docs(&fs, &embedder, docs_index_dir, input.clone())
+                .await
+                .expect("search_docs should succeed");
+        }
+        let elapsed = start.elapsed();
+        let per_call = elapsed / RUNS;
+
+        eprintln!(
+            "bench_search_docs_latency: {MAX_CHUNKS_PER_SOURCE} chunks, {RUNS} runs, \
+             {elapsed:?} total => {per_call:?}/call"
+        );
     }
 
     // --- Epic 4.3: list_indexed_sources / remove_indexed_source ---

@@ -28,6 +28,9 @@
   than requiring a plan-level change now.
 - #4 (no disk-usage visibility) — not addressed in this pass; genuine risk, left open. Cheap
   fast-follow (`bytesOnDisk` field on `list_indexed_sources`), not blocking v1.
-- #5 (search-path benchmark gap) — not addressed in this pass; genuine risk, left open. Worth
-  revisiting once Task 2.1.2c's embed-throughput benchmark task exists as a pattern to copy for
-  the search path.
+- #5 (search-path benchmark gap) — **Addressed** (GitHub issue #5): added
+  `bench_search_docs_latency`, copying Task 2.1.2c's `bench_embed_throughput` pattern, measuring
+  `search_docs`'s read+parse+score path at `MAX_CHUNKS_PER_SOURCE` (780 chunks) scale. Measured
+  ~7ms/call in `--release`, ~127ms/call in unoptimized debug, on dev hardware 2026-08-06 —
+  comfortably sub-second, not currently a live problem. The proposed in-memory embeddings cache
+  fast-follow is deferred until this stops being true.
