@@ -71,6 +71,14 @@ fn heading_marks(markdown: &str) -> Vec<(usize, String)> {
 /// line seen so far in document order — falling back to `page_title` for
 /// any text that appears before the first heading. Never panics on empty
 /// input; returns `vec![]` for `""`.
+///
+/// `MarkdownSplitter` does not keep fenced code blocks intact: a block
+/// larger than the budget gets sliced arbitrarily, scattering its lines
+/// across chunks that carry no ` ``` ` marker at all. Raw splitter chunks
+/// are merged here whenever a chunk ends inside an unterminated fence (an
+/// odd number of ` ``` ` markers seen since the block opened), so a fence's
+/// opening and closing lines always land in the same `Chunk` — even if that
+/// means the merged chunk exceeds the 800-character budget.
 pub(crate) fn chunk_markdown(markdown: &str, page_title: &str) -> Vec<Chunk> {
     if markdown.is_empty() {
         return vec![];
@@ -82,23 +90,56 @@ pub(crate) fn chunk_markdown(markdown: &str, page_title: &str) -> Vec<Chunk> {
     let mut mark_idx = 0usize;
     let mut current_heading: Option<String> = None;
     let mut chunks = Vec::new();
+    let mut chunk_index = 0u32;
 
-    for (chunk_index, (start, text)) in splitter.chunk_indices(markdown).enumerate() {
-        let chunk_end = start + text.len();
+    let mut pending_start: Option<usize> = None;
+    let mut pending_end = 0usize;
+    let mut fence_open = false;
+
+    for (start, text) in splitter.chunk_indices(markdown) {
+        if pending_start.is_none() {
+            pending_start = Some(start);
+        }
+        pending_end = start + text.len();
+        if text.matches("```").count() % 2 == 1 {
+            fence_open = !fence_open;
+        }
+        if fence_open {
+            continue;
+        }
+
+        let chunk_start = pending_start.take().unwrap();
+        let chunk_text = &markdown[chunk_start..pending_end];
         // Advance past every heading that appears at or before this
         // chunk's end (either earlier in the doc, or within this chunk's
         // own text) — chunks are yielded in document order, so a single
         // forward pass over `marks` suffices.
-        while mark_idx < marks.len() && marks[mark_idx].0 < chunk_end {
+        while mark_idx < marks.len() && marks[mark_idx].0 < pending_end {
             current_heading = Some(marks[mark_idx].1.clone());
             mark_idx += 1;
         }
         chunks.push(Chunk {
-            text: text.to_string(),
+            text: chunk_text.to_string(),
             heading: current_heading
                 .clone()
                 .or_else(|| Some(page_title.to_string())),
-            chunk_index: chunk_index as u32,
+            chunk_index,
+        });
+        chunk_index += 1;
+    }
+
+    // An unterminated fence at end-of-document (malformed markdown) still
+    // needs to be flushed rather than silently dropped.
+    if let Some(chunk_start) = pending_start {
+        let chunk_text = &markdown[chunk_start..pending_end];
+        while mark_idx < marks.len() && marks[mark_idx].0 < pending_end {
+            current_heading = Some(marks[mark_idx].1.clone());
+            mark_idx += 1;
+        }
+        chunks.push(Chunk {
+            text: chunk_text.to_string(),
+            heading: current_heading.or_else(|| Some(page_title.to_string())),
+            chunk_index,
         });
     }
 
@@ -964,6 +1005,72 @@ mod tests {
     #[test]
     fn should_return_empty_vec_when_markdown_is_empty() {
         assert_eq!(chunk_markdown("", "Empty Page"), Vec::<Chunk>::new());
+    }
+
+    /// Every chunk must have a balanced (even) number of ` ``` ` fence
+    /// markers — an odd count means a chunk starts or ends mid-fence, which
+    /// is exactly the bug this guard prevents.
+    fn assert_no_chunk_splits_a_fence(chunks: &[Chunk]) {
+        for (i, chunk) in chunks.iter().enumerate() {
+            let fence_count = chunk.text.matches("```").count();
+            assert_eq!(
+                fence_count % 2,
+                0,
+                "chunk {i} has an unbalanced fence count ({fence_count}): {:?}",
+                chunk.text
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_fenced_code_block_in_one_chunk_when_block_exceeds_max_chunk_size() {
+        // A single code block far larger than the 800-char max chunk size,
+        // straddling many raw splitter chunk boundaries.
+        let mut code_lines = String::new();
+        for i in 0..60 {
+            code_lines.push_str(&format!("let line_{i} = {i}; // padding to force overflow\n"));
+        }
+        let markdown = format!(
+            "# Title\n\nSome intro text before the code block.\n\n\
+             ```rust\n{code_lines}```\n\nSome text after.\n"
+        );
+
+        let chunks = chunk_markdown(&markdown, "Title");
+
+        assert_no_chunk_splits_a_fence(&chunks);
+        let code_chunk = chunks
+            .iter()
+            .find(|c| c.text.contains("```rust"))
+            .expect("expected a chunk containing the opening fence");
+        assert!(
+            code_chunk.text.contains("line_0") && code_chunk.text.contains("line_59"),
+            "expected the whole code block in one chunk, got: {:?}",
+            code_chunk.text
+        );
+        assert!(
+            code_chunk.text.trim_end().ends_with("```"),
+            "expected the merged chunk to also contain the closing fence, got: {:?}",
+            code_chunk.text
+        );
+    }
+
+    #[test]
+    fn should_keep_fenced_code_block_in_one_chunk_when_block_sits_near_chunk_boundary() {
+        // A code block small enough to fit the budget on its own, but
+        // positioned so the splitter's natural boundary could land inside it.
+        let filler = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(4);
+        let markdown = format!(
+            "# Title\n\n{filler}\n\n```json\n{{\n  \"key\": \"value\",\n  \"other\": 42\n}}\n```\n\n{filler}\n"
+        );
+
+        let chunks = chunk_markdown(&markdown, "Title");
+
+        assert_no_chunk_splits_a_fence(&chunks);
+        let full_block = "```json\n{\n  \"key\": \"value\",\n  \"other\": 42\n}\n```";
+        assert!(
+            chunks.iter().any(|c| c.text.contains(full_block)),
+            "expected the whole JSON code block (with both fences) in one chunk, got: {chunks:?}"
+        );
     }
 
     // --- Epic 3.3: cosine_similarity ---
