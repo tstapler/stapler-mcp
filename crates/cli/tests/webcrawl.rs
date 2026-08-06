@@ -120,6 +120,12 @@ async fn webcrawl_respects_robots_and_caches() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().to_string_lossy().to_string();
     std::env::set_var("STAPLER_MCP_HOME", &home);
+    // The mock site below binds a real 127.0.0.1 listener; opt the daemon
+    // subprocess out of the SSRF guard so it can reach it. This env var is
+    // read by the daemon binary itself (`NativeEnv`/`std::env::var`), not by
+    // `TestEnv`, since the daemon runs as a separate spawned process that
+    // inherits this test process's real environment.
+    std::env::set_var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS", "1");
     let env = TestEnv { home };
     std::fs::create_dir_all(paths::base_dir(&env)).unwrap();
 

@@ -103,6 +103,72 @@ fn same_host(a: &Url, b: &Url) -> bool {
     a.host_str().is_some() && a.host_str() == b.host_str()
 }
 
+/// Controls whether the crawler refuses to fetch loopback/private/link-local
+/// addresses (an SSRF guard). Deliberately **not** exposed on any MCP tool
+/// schema (`ReadWebsiteInput`/`DownloadWebsiteInput`/`IndexDocsInput`): the
+/// caller of these tools is an LLM agent that may itself be steered by
+/// previously-fetched content, so the choice of whether to allow private
+/// targets must be made by the trusted binary at its own call sites, not by
+/// anything a tool-call argument can influence. `AllowPrivateNetworks` exists
+/// purely so this crate's own tests can crawl a `127.0.0.1` mock server.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetworkPolicy {
+    Enforce,
+    AllowPrivateNetworks,
+}
+
+impl NetworkPolicy {
+    /// `value` is expected to come from the `STAPLER_MCP_ALLOW_PRIVATE_NETWORKS`
+    /// env var, read by the binary's own entry point — never from tool input.
+    pub fn from_env(value: Option<String>) -> Self {
+        match value.as_deref() {
+            Some("1") => NetworkPolicy::AllowPrivateNetworks,
+            _ => NetworkPolicy::Enforce,
+        }
+    }
+}
+
+fn is_blocked_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+}
+
+fn is_blocked_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    let seg0 = ip.segments()[0];
+    let is_unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
+    let is_link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+    if is_unique_local || is_link_local {
+        return true;
+    }
+    ip.to_ipv4_mapped().map(is_blocked_ipv4).unwrap_or(false)
+}
+
+/// Best-effort literal check: `crates/core` has no DNS-resolution port (see
+/// `ports.rs`), so this only catches an IP-literal or well-known loopback
+/// hostname written directly in the URL. It does not catch a public hostname
+/// that resolves to a private address at request time (DNS rebinding), nor a
+/// redirect an `HttpClient` adapter follows internally — both would need a
+/// check inside the adapter's own connect path to close.
+fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
+    if policy == NetworkPolicy::AllowPrivateNetworks {
+        return None;
+    }
+    match url.host()? {
+        url::Host::Ipv4(ip) if is_blocked_ipv4(ip) => {
+            Some(format!("{ip} is a loopback/private/link-local address"))
+        }
+        url::Host::Ipv6(ip) if is_blocked_ipv6(ip) => {
+            Some(format!("{ip} is a loopback/private/link-local address"))
+        }
+        url::Host::Domain(d) if d.eq_ignore_ascii_case("localhost") || d.to_ascii_lowercase().ends_with(".localhost") => {
+            Some(format!("{d} is a loopback hostname"))
+        }
+        _ => None,
+    }
+}
+
 /// A BFS crawl frontier shared by both tools: yields `(url, depth, html)` for
 /// every page successfully fetched (skipping disallowed/failed pages rather
 /// than aborting), stopping at `max_pages` fetched or `max_depth` hops.
@@ -112,26 +178,37 @@ pub(crate) struct Crawler<'a, H: HttpClient> {
     seed: Url,
     max_depth: u32,
     max_pages: u32,
+    policy: NetworkPolicy,
     visited: HashSet<String>,
     queue: VecDeque<(Url, u32)>,
 }
 
 impl<'a, H: HttpClient> Crawler<'a, H> {
-    pub(crate) async fn new(http: &'a H, seed: Url, max_depth: u32, max_pages: u32) -> Self {
+    pub(crate) async fn new(
+        http: &'a H,
+        seed: Url,
+        max_depth: u32,
+        max_pages: u32,
+        policy: NetworkPolicy,
+    ) -> Result<Self, String> {
+        if let Some(reason) = blocked_host_reason(&seed, policy) {
+            return Err(format!("refusing to crawl {seed}: {reason}"));
+        }
         let robot = fetch_robots(http, &seed).await;
         let mut visited = HashSet::new();
         visited.insert(seed.to_string());
         let mut queue = VecDeque::new();
         queue.push_back((seed.clone(), 0u32));
-        Crawler {
+        Ok(Crawler {
             http,
             robot,
             seed,
             max_depth,
             max_pages,
+            policy,
             visited,
             queue,
-        }
+        })
     }
 
     fn allowed(&self, url: &Url) -> bool {
@@ -179,7 +256,10 @@ impl<'a, H: HttpClient> Crawler<'a, H> {
         if depth < self.max_depth {
             for link in extract_links(&html, url) {
                 let link_str = link.to_string();
-                if same_host(&link, &self.seed) && !self.visited.contains(&link_str) {
+                if same_host(&link, &self.seed)
+                    && !self.visited.contains(&link_str)
+                    && blocked_host_reason(&link, self.policy).is_none()
+                {
                     self.visited.insert(link_str);
                     self.queue.push_back((link, depth + 1));
                 }
@@ -201,6 +281,7 @@ pub async fn read_website<H, F>(
     fs: &F,
     cache_dir: &str,
     input: ReadWebsiteInput,
+    policy: NetworkPolicy,
 ) -> Result<ReadWebsiteOutput, String>
 where
     H: HttpClient,
@@ -212,7 +293,7 @@ where
     let seed = Url::parse(&input.url).map_err(|e| format!("invalid url: {e}"))?;
     let (max_depth, max_pages) = resolve_limits(input.max_depth, input.max_pages);
 
-    let mut crawler = Crawler::new(http, seed, max_depth, max_pages).await;
+    let mut crawler = Crawler::new(http, seed, max_depth, max_pages, policy).await?;
     let mut pages = Vec::new();
 
     while let Some((url, depth)) = crawler.next_url(pages.len()) {
@@ -285,6 +366,7 @@ pub async fn download_website<H, F>(
     http: &H,
     fs: &F,
     input: DownloadWebsiteInput,
+    policy: NetworkPolicy,
 ) -> Result<DownloadWebsiteOutput, String>
 where
     H: HttpClient,
@@ -299,7 +381,7 @@ where
     let seed = Url::parse(&input.url).map_err(|e| format!("invalid url: {e}"))?;
     let (max_depth, max_pages) = resolve_limits(input.max_depth, input.max_pages);
 
-    let mut crawler = Crawler::new(http, seed, max_depth, max_pages).await;
+    let mut crawler = Crawler::new(http, seed, max_depth, max_pages, policy).await?;
     let mut pages = Vec::new();
 
     while let Some((url, depth)) = crawler.next_url(pages.len()) {
@@ -317,4 +399,61 @@ where
     }
 
     Ok(DownloadWebsiteOutput { pages })
+}
+
+#[cfg(test)]
+mod ssrf_guard_tests {
+    use super::*;
+
+    fn blocked(url: &str) -> bool {
+        blocked_host_reason(&Url::parse(url).unwrap(), NetworkPolicy::Enforce).is_some()
+    }
+
+    #[test]
+    fn should_block_loopback_ipv4_literal_when_enforcing() {
+        assert!(blocked("http://127.0.0.1/"));
+    }
+
+    #[test]
+    fn should_block_link_local_metadata_ipv4_when_enforcing() {
+        assert!(blocked("http://169.254.169.254/latest/meta-data/"));
+    }
+
+    #[test]
+    fn should_block_private_ipv4_ranges_when_enforcing() {
+        assert!(blocked("http://10.0.0.1/"));
+        assert!(blocked("http://172.16.0.1/"));
+        assert!(blocked("http://192.168.1.1/"));
+    }
+
+    #[test]
+    fn should_block_localhost_hostname_case_insensitively_when_enforcing() {
+        assert!(blocked("http://localhost/"));
+        assert!(blocked("http://LOCALHOST/"));
+        assert!(blocked("http://foo.localhost/"));
+    }
+
+    #[test]
+    fn should_block_loopback_and_unique_local_ipv6_when_enforcing() {
+        assert!(blocked("http://[::1]/"));
+        assert!(blocked("http://[fc00::1]/"));
+        assert!(blocked("http://[fe80::1]/"));
+    }
+
+    #[test]
+    fn should_block_ipv4_mapped_ipv6_of_a_blocked_address_when_enforcing() {
+        assert!(blocked("http://[::ffff:127.0.0.1]/"));
+    }
+
+    #[test]
+    fn should_allow_public_url_when_enforcing() {
+        assert!(!blocked("https://example.com/"));
+        assert!(!blocked("https://8.8.8.8/"));
+    }
+
+    #[test]
+    fn should_allow_every_url_when_policy_allows_private_networks() {
+        let seed = Url::parse("http://127.0.0.1/").unwrap();
+        assert!(blocked_host_reason(&seed, NetworkPolicy::AllowPrivateNetworks).is_none());
+    }
 }

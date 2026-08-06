@@ -127,6 +127,10 @@ async fn docs_index_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().to_string_lossy().to_string();
     std::env::set_var("STAPLER_MCP_HOME", &home);
+    // The mock site below binds a real 127.0.0.1 listener; opt the daemon
+    // subprocess out of the SSRF guard so it can reach it. See the same
+    // comment in `crates/cli/tests/webcrawl.rs`.
+    std::env::set_var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS", "1");
     let env = TestEnv { home };
     std::fs::create_dir_all(paths::base_dir(&env)).unwrap();
 

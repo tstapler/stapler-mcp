@@ -78,6 +78,10 @@ pub async fn run_daemon() -> Result<(), JsValue> {
     );
 
     let cache_dir = paths::cache_dir(&env);
+    // Only ever set by this crate's own tests — see `NetworkPolicy`'s doc
+    // comment in `crates/core`.
+    let network_policy =
+        webcrawl::NetworkPolicy::from_env(env.var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"));
     daemon.register(
         "read_website",
         json_handler({
@@ -87,7 +91,10 @@ pub async fn run_daemon() -> Result<(), JsValue> {
                 let http = http.clone();
                 let fsstore = fsstore.clone();
                 let cache_dir = cache_dir.clone();
-                async move { webcrawl::read_website(&*http, &*fsstore, &cache_dir, input).await }
+                async move {
+                    webcrawl::read_website(&*http, &*fsstore, &cache_dir, input, network_policy)
+                        .await
+                }
             }
         }),
     );
@@ -100,7 +107,9 @@ pub async fn run_daemon() -> Result<(), JsValue> {
             move |input: DownloadWebsiteInput| {
                 let http = http.clone();
                 let fsstore = fsstore.clone();
-                async move { webcrawl::download_website(&*http, &*fsstore, input).await }
+                async move {
+                    webcrawl::download_website(&*http, &*fsstore, input, network_policy).await
+                }
             }
         }),
     );

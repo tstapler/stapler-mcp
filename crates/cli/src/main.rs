@@ -124,6 +124,14 @@ async fn run_daemon() {
     );
 
     let cache_dir = paths::cache_dir(&env);
+    // Only ever set by this crate's own integration tests, to let the
+    // crawler reach a `127.0.0.1` mock server — see `NetworkPolicy`'s doc
+    // comment. Read once via `EnvPort` rather than `std::env` directly so
+    // it's still exercised through the same seam as everything else in
+    // `crates/core`.
+    let network_policy = webcrawl::NetworkPolicy::from_env(
+        stapler_mcp_core::ports::EnvPort::var(&env, "STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"),
+    );
     daemon.register(
         "read_website",
         json_handler({
@@ -133,7 +141,9 @@ async fn run_daemon() {
                 let http = http.clone();
                 let fs = fs.clone();
                 let cache_dir = cache_dir.clone();
-                async move { webcrawl::read_website(&*http, &*fs, &cache_dir, input).await }
+                async move {
+                    webcrawl::read_website(&*http, &*fs, &cache_dir, input, network_policy).await
+                }
             }
         }),
     );
@@ -146,7 +156,7 @@ async fn run_daemon() {
             move |input: DownloadWebsiteInput| {
                 let http = http.clone();
                 let fs = fs.clone();
-                async move { webcrawl::download_website(&*http, &*fs, input).await }
+                async move { webcrawl::download_website(&*http, &*fs, input, network_policy).await }
             }
         }),
     );
@@ -176,6 +186,7 @@ async fn run_daemon() {
                         &source_locks,
                         &docs_index_dir,
                         input,
+                        network_policy,
                     )
                     .await
                 }

@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use text_splitter::MarkdownSplitter;
 use url::Url;
 
-use super::webcrawl::{extract_title_and_markdown, resolve_limits, Crawler};
+use super::webcrawl::{extract_title_and_markdown, resolve_limits, Crawler, NetworkPolicy};
 use crate::ports::{ClockPort, Embedder, FileStore, HttpClient};
 use crate::schema::{
     DocsSearchResult, IndexDocsInput, IndexDocsOutput, IndexedSourceSummary,
@@ -444,6 +444,7 @@ async fn embed_in_sub_batches<E: Embedder>(
 /// `index_docs` (see plan.md Epic 4.1). Guarded per-`SourceId` by `locks` so
 /// a concurrent `index_docs`/`remove_indexed_source` call on the same source
 /// can't interleave on-disk writes (Story 3.4.3/4.1.1).
+#[allow(clippy::too_many_arguments)]
 pub async fn index_source<H, F, E, C>(
     http: &H,
     fs: &F,
@@ -452,6 +453,7 @@ pub async fn index_source<H, F, E, C>(
     locks: &SourceLocks,
     docs_index_dir: &str,
     input: IndexDocsInput,
+    policy: NetworkPolicy,
 ) -> Result<IndexDocsOutput, String>
 where
     H: HttpClient,
@@ -486,7 +488,7 @@ where
     };
 
     let (max_depth, max_pages) = resolve_limits(input.max_depth, input.max_pages);
-    let mut crawler = Crawler::new(http, seed.clone(), max_depth, max_pages).await;
+    let mut crawler = Crawler::new(http, seed.clone(), max_depth, max_pages, policy).await?;
 
     // Fetch the seed explicitly first (Task 4.1.1a): a seed-URL failure gets
     // a precise, URL+status-naming error, before entering the main crawl
@@ -1403,6 +1405,7 @@ mod tests {
             &locks,
             "/fake/docs-index",
             input,
+            NetworkPolicy::Enforce,
         )
         .await;
 
@@ -1435,6 +1438,7 @@ mod tests {
             &locks,
             "/fake/docs-index",
             input,
+            NetworkPolicy::Enforce,
         )
         .await;
 
@@ -1465,6 +1469,7 @@ mod tests {
             &locks,
             "/fake/docs-index",
             base_input(url),
+            NetworkPolicy::Enforce,
         )
         .await;
 
@@ -1513,6 +1518,7 @@ mod tests {
             &locks,
             "/fake/docs-index",
             input,
+            NetworkPolicy::Enforce,
         )
         .await
         .expect("index_source should succeed");
@@ -1677,7 +1683,7 @@ mod tests {
         let mut input = base_input("https://tokio.rs/tokio/tutorial");
         input.source = Some("tokio-tutorial".to_string());
 
-        let output = index_source(&http, &fs, &embedder, &clock, &locks, docs_index_dir, input)
+        let output = index_source(&http, &fs, &embedder, &clock, &locks, docs_index_dir, input, NetworkPolicy::Enforce)
             .await
             .expect("index_source should succeed");
 
@@ -1710,7 +1716,7 @@ mod tests {
         let mut input = base_input("https://tokio.rs/tokio/tutorial");
         input.source = Some("tokio-tutorial".to_string());
 
-        let output = index_source(&http, &fs, &embedder, &clock, &locks, docs_index_dir, input)
+        let output = index_source(&http, &fs, &embedder, &clock, &locks, docs_index_dir, input, NetworkPolicy::Enforce)
             .await
             .expect("index_source should succeed");
 
@@ -1754,6 +1760,7 @@ mod tests {
             &locks,
             docs_index_dir,
             base_input(requested),
+            NetworkPolicy::Enforce,
         )
         .await
         .expect("index_source should succeed");
