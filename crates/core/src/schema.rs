@@ -220,6 +220,9 @@ pub struct IndexedSourceSummary {
     pub indexed_at_millis: u64,
     /// The embedding model used to embed this source's chunks.
     pub embedding_model: String,
+    /// Combined size, in bytes, of this source's `chunks.jsonl` and
+    /// `meta.json` files on disk.
+    pub bytes_on_disk: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -359,6 +362,7 @@ mod tests {
                     chunk_count: 340,
                     indexed_at_millis: 1_700_000_000_000,
                     embedding_model: "all-MiniLM-L6-v2".into(),
+                    bytes_on_disk: 4_096,
                 },
                 IndexedSourceSummary {
                     source_name: "serde-guide".into(),
@@ -368,6 +372,7 @@ mod tests {
                     chunk_count: 150,
                     indexed_at_millis: 1_700_000_100_000,
                     embedding_model: "all-MiniLM-L6-v2".into(),
+                    bytes_on_disk: 1_024,
                 },
             ],
         };

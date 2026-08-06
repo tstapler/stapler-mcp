@@ -877,9 +877,12 @@ pub async fn list_indexed_sources<F: FileStore>(
     let manifest: Vec<SourceSummary> =
         serde_json::from_slice(&manifest_bytes).map_err(|e| e.to_string())?;
 
-    let sources = manifest
-        .into_iter()
-        .map(|s| IndexedSourceSummary {
+    let mut sources = Vec::with_capacity(manifest.len());
+    for s in manifest {
+        let id = SourceId(s.source_id.clone());
+        let bytes_on_disk = file_size(fs, &chunks_path(docs_index_dir, &id)).await?
+            + file_size(fs, &meta_path(docs_index_dir, &id)).await?;
+        sources.push(IndexedSourceSummary {
             source_name: s.source_name,
             source_id: s.source_id,
             seed_url: s.seed_url,
@@ -887,10 +890,21 @@ pub async fn list_indexed_sources<F: FileStore>(
             chunk_count: s.chunk_count,
             indexed_at_millis: s.indexed_at_millis,
             embedding_model: s.embedding_model,
-        })
-        .collect();
+            bytes_on_disk,
+        });
+    }
 
     Ok(ListIndexedSourcesOutput { sources })
+}
+
+/// `0` for a missing file, matching `FileStore::read_file`'s "`None` is a
+/// cache miss, not an error" convention.
+async fn file_size<F: FileStore>(fs: &F, path: &str) -> Result<u64, String> {
+    Ok(fs
+        .read_file(path)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_or(0, |bytes| bytes.len() as u64))
 }
 
 /// Deletes a source's `chunks.jsonl`/`meta.json` and removes its entry from
@@ -2140,6 +2154,8 @@ mod tests {
     async fn should_return_all_entries_with_correct_counts_when_sources_manifest_populated() {
         let docs_index_dir = "/fake/docs-index";
         let fs = InMemoryFileStore::new();
+        let tokio_id = SourceId::from_name("tokio-tutorial");
+        let serde_id = SourceId::from_name("serde-guide");
         let manifest = vec![
             seeded_summary(
                 "tokio-tutorial",
@@ -2154,6 +2170,12 @@ mod tests {
             &sources_manifest_path(docs_index_dir),
             serde_json::to_vec(&manifest).unwrap(),
         );
+        // Known byte lengths so bytes_on_disk can be asserted exactly:
+        // tokio-tutorial gets both files, serde-guide gets only chunks.jsonl
+        // (proving a missing meta.json contributes 0, not an error).
+        fs.seed(&chunks_path(docs_index_dir, &tokio_id), vec![b'a'; 100]);
+        fs.seed(&meta_path(docs_index_dir, &tokio_id), vec![b'b'; 20]);
+        fs.seed(&chunks_path(docs_index_dir, &serde_id), vec![b'c'; 50]);
 
         let output = list_indexed_sources(&fs, docs_index_dir, ListIndexedSourcesInput {})
             .await
@@ -2169,6 +2191,7 @@ mod tests {
         assert_eq!(tokio.chunk_count, 42);
         assert_eq!(tokio.indexed_at_millis, 1_700_000_000_000);
         assert_eq!(tokio.embedding_model, EMBEDDING_MODEL_ID);
+        assert_eq!(tokio.bytes_on_disk, 120);
         let serde_source = output
             .sources
             .iter()
@@ -2176,6 +2199,7 @@ mod tests {
             .expect("serde-guide present");
         assert_eq!(serde_source.page_count, 5);
         assert_eq!(serde_source.chunk_count, 77);
+        assert_eq!(serde_source.bytes_on_disk, 50);
     }
 
     #[tokio::test]
