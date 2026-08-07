@@ -102,7 +102,7 @@ struct JsNavigateResult {
 /// `requireSession`/`checkBlocked`/ref-resolution failures always include)
 /// becomes `PortError::NotFound`, so the tool layer's session/ref recovery
 /// messaging applies uniformly regardless of which adapter is behind it. A
-/// "crashed" marker (from `browser.js`'s `crashedMessage`/`checkCrashed`,
+/// "crashed" marker (from `browser.js`'s `crashedMessage`/`evictIfCrashed`,
 /// wired up to Playwright's `page.on('crash', ...)`) becomes
 /// `PortError::SessionCrashed`, mirroring native's `Target.targetCrashed`
 /// handling — checked before the broader "not found" markers since native's
@@ -250,7 +250,7 @@ mod tests {
     }
 
     /// BLOCKER 1 fix: a JS-thrown error carrying a "crashed" marker (as
-    /// `browser.js`'s `crashedMessage`/`checkCrashed` always includes once
+    /// `browser.js`'s `crashedMessage`/`evictIfCrashed` always includes once
     /// the `page.on('crash', ...)` listener fires) must map to
     /// `PortError::SessionCrashed`, not `PortError::NotFound` — the tool
     /// layer needs to tell "start a new session" apart from "this exact id

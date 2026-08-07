@@ -196,15 +196,22 @@ function requireSession(sessionId) {
     return session;
 }
 
-function checkCrashed(session) {
-    if (session.crashed) {
-        throw new Error(session.crashed);
-    }
-}
-
 function checkBlocked(session) {
     if (session.blocked) {
         throw new Error(session.blocked);
+    }
+}
+
+// Shared crash-check-then-evict step, mirroring native's `touch_or_evict`
+// (`crates/native/src/browser.rs`): on crash, the session is deleted from
+// `sessions` immediately rather than waiting for the idle reaper to notice
+// it. Deliberately does *not* touch `blocked` or `lastUsed` — callers differ
+// on both (see `requireLiveSession` vs. `jsBrowserNavigate`'s session-reuse
+// branch below), so those stay the caller's responsibility.
+function evictIfCrashed(session, sessionId) {
+    if (session.crashed) {
+        sessions.delete(sessionId);
+        throw new Error(session.crashed);
     }
 }
 
@@ -212,16 +219,10 @@ function checkBlocked(session) {
 // crashed/blocked must be checked *before* `lastUsed` is bumped — bumping
 // first would keep a crashed session's idle clock refreshed on every failed
 // call, so it would never age past `SESSION_IDLE_TIMEOUT_MS` and never get
-// reaped, defeating the crash-detection fix's purpose. On crash, the session
-// is also evicted from `sessions` immediately (mirroring native's
-// `touch_or_evict`, `crates/native/src/browser.rs`) rather than waiting for
-// the idle reaper to notice it.
+// reaped, defeating the crash-detection fix's purpose.
 function requireLiveSession(sessionId) {
     const session = requireSession(sessionId);
-    if (session.crashed) {
-        sessions.delete(sessionId);
-        throw new Error(session.crashed);
-    }
+    evictIfCrashed(session, sessionId);
     checkBlocked(session);
     session.lastUsed = Date.now();
     return session;
@@ -280,8 +281,11 @@ module.exports.jsBrowserNavigate = async function (url, sessionId, timeoutMs) {
         session = requireSession(id);
         // Unlike a blocked session, a crashed one is not recoverable via
         // re-navigating the same session id — the underlying renderer is
-        // gone, so the caller must start a fresh session instead.
-        checkCrashed(session);
+        // gone, so the caller must start a fresh session instead. Evict it
+        // immediately (mirroring native's `touch_or_evict`) rather than
+        // leaving it in `sessions` for up to `SESSION_IDLE_TIMEOUT_MS` for
+        // the idle reaper to eventually notice.
+        evictIfCrashed(session, id);
         // A session that once bounced through a blocked host is recoverable
         // via a later legitimate re-navigate rather than permanently stuck
         // (Task 4.2.2's clear-on-re-navigate fix).

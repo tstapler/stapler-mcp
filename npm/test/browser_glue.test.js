@@ -293,6 +293,13 @@ test("jsCloseBrowser_should_clear_reaper_interval_and_sessions_when_reaper_was_r
         assert.strictEqual(clearIntervalCalls, 1, "jsCloseBrowser should clear the reaper's setInterval");
         assert.strictEqual(browserGlue.sessions.size, 0);
     } finally {
+        // Unconditional cleanup so a failed assertion above (e.g. the
+        // `sessions.size` check) doesn't leak the session/reaper/browserPromise
+        // singletons into whichever test runs next in this process.
+        // `jsCloseBrowser` is idempotent (`if (reaperTimer)`, `if
+        // (browserPromise)`), so calling it again after the happy-path call
+        // above is a safe no-op.
+        await browserGlue.jsCloseBrowser().catch(() => {});
         chromium.launch = originalLaunch;
         global.clearInterval = originalClearInterval;
     }
