@@ -98,34 +98,53 @@ function ensureReaper() {
 // private/loopback/link-local logic — JS glue can't call that Rust `pub fn`
 // directly, so the check is duplicated here. Best-effort literal check only
 // (no DNS resolution), same limitation as the native version.
+function isBlockedIpv4(a, b) {
+    if (a === 127) return true; // loopback
+    if (a === 10) return true; // private
+    if (a === 172 && b >= 16 && b <= 31) return true; // private
+    if (a === 192 && b === 168) return true; // private
+    if (a === 169 && b === 254) return true; // link-local
+    if (a === 0) return true; // unspecified / "this network"
+    return false;
+}
+
 function isBlockedHost(hostname) {
     if (process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS === "1") {
         return false;
     }
-    const host = hostname.toLowerCase();
+    // Strip brackets/zone id so "[::1]" and "fe80::1%eth0" match the same
+    // way as their unbracketed forms below.
+    const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").split("%")[0];
     if (host === "localhost" || host.endsWith(".localhost")) {
         return true;
     }
     const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
     if (v4) {
-        const a = Number(v4[1]);
-        const b = Number(v4[2]);
-        if (a === 127) return true; // loopback
-        if (a === 10) return true; // private
-        if (a === 172 && b >= 16 && b <= 31) return true; // private
-        if (a === 192 && b === 168) return true; // private
-        if (a === 169 && b === 254) return true; // link-local
-        if (a === 0) return true; // unspecified
-        return false;
+        return isBlockedIpv4(Number(v4[1]), Number(v4[2]));
     }
-    if (host === "::1" || host === "[::1]" || host === "::" || host === "[::]") {
+    if (host === "::1" || host === "::") {
         return true; // loopback / unspecified
     }
-    if (host.startsWith("fe80:") || host.startsWith("[fe80:")) {
+    if (host.startsWith("fe80:")) {
         return true; // link-local
     }
-    if (host.startsWith("fc") || host.startsWith("fd") || host.startsWith("[fc") || host.startsWith("[fd")) {
-        return true; // unique-local
+    if (host.startsWith("fc") || host.startsWith("fd")) {
+        return true; // unique-local, fc00::/7
+    }
+    // IPv4-mapped IPv6 — mirrors native's `Ipv6Addr::to_ipv4_mapped()`
+    // unwrapping in `blocked_host_reason`. Node's URL parser always
+    // normalizes these to compressed hex-hextet form (e.g. "::ffff:a9fe:a9fe"
+    // for 169.254.169.254), never dotted-quad, so match that shape.
+    const v4MappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (v4MappedHex) {
+        const hi = Number.parseInt(v4MappedHex[1], 16);
+        return isBlockedIpv4((hi >> 8) & 0xff, hi & 0xff);
+    }
+    // Dotted-quad form (::ffff:a.b.c.d or ::a.b.c.d) for callers that
+    // construct the hostname string directly rather than via `URL`.
+    const v4MappedDotted = host.match(/^::(?:ffff:)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (v4MappedDotted) {
+        return isBlockedIpv4(Number(v4MappedDotted[1]), Number(v4MappedDotted[2]));
     }
     return false;
 }

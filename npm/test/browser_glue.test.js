@@ -106,6 +106,43 @@ test("jsBrowserType_should_reject_with_actionable_ref_error_when_locator_fill_re
 });
 
 // ---------------------------------------------------------------------------
+// isBlockedHost must reach parity with native's `blocked_host_reason`
+// (crates/core/src/tools/webcrawl.rs) on IPv4-mapped IPv6 forms — a prior
+// version only matched dotted-quad IPv6 (e.g. "::ffff:127.0.0.1"), but
+// Node's URL parser normalizes these to compressed hex-hextet form
+// (e.g. "::ffff:7f00:1"), so that form must be blocked too.
+
+test("isBlockedHost_should_block_ipv4_mapped_ipv6_hosts_in_hex_hextet_form", () => {
+    const prevEnv = process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS;
+    delete process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS;
+    try {
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[::ffff:127.0.0.1]/").hostname),
+            true,
+        );
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[::ffff:169.254.169.254]/").hostname),
+            true,
+        );
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[::ffff:10.0.0.1]/").hostname),
+            true,
+        );
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[::ffff:8.8.8.8]/").hostname),
+            false,
+        );
+        assert.strictEqual(browserGlue.isBlockedHost("::ffff:127.0.0.1"), true);
+    } finally {
+        if (prevEnv === undefined) {
+            delete process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS;
+        } else {
+            process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS = prevEnv;
+        }
+    }
+});
+
+// ---------------------------------------------------------------------------
 // Task 4.2.2 (FrameNavigatedGuard): a top-level in-session navigation to a
 // blocked (private/loopback) host must set `session.blocked` to the exact
 // Error-5 recoverable-block wording, byte-identical to native's Task 3.4.2 so
