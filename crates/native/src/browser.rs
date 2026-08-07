@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use chromiumoxide::cdp::browser_protocol::accessibility::GetPartialAxTreeParams;
+use chromiumoxide::cdp::browser_protocol::accessibility::{EnableParams, GetPartialAxTreeParams};
 use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, DescribeNodeParams, ResolveNodeParams};
-use chromiumoxide::cdp::browser_protocol::page::EventFrameNavigated;
+use chromiumoxide::cdp::browser_protocol::page::{EventFrameNavigated, EventFrameRequestedNavigation};
 use chromiumoxide::cdp::browser_protocol::target::EventTargetCrashed;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::{Browser, BrowserConfig, Page};
@@ -243,7 +243,23 @@ pub struct NativeBrowser {
 
 impl NativeBrowser {
     pub async fn launch() -> Result<Self, PortError> {
+        // chromiumoxide's own default, when `user_data_dir` is left unset, is
+        // a single fixed shared path (`$TMPDIR/chromiumoxide-runner`) rather
+        // than a fresh directory per launch. Every daemon process on a
+        // machine would then point Chrome at the same profile directory —
+        // the second one to start finds it locked (Chrome's own
+        // `SingletonLock`) and fails to launch. Each daemon process gets its
+        // own directory instead, scoped by pid + timestamp so concurrent
+        // daemons (e.g. back-to-back integration tests) never collide.
+        let user_data_dir = std::env::temp_dir().join(format!(
+            "stapler-mcp-chromium-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&user_data_dir).map_err(|e| PortError::Other(e.to_string()))?;
+
         let config = BrowserConfig::builder()
+            .user_data_dir(&user_data_dir)
             .build()
             .map_err(|e| PortError::Other(e.to_string()))?;
         let (browser, mut handler) = Browser::launch(config)
@@ -402,13 +418,25 @@ async fn verify_node_live(
 /// A freshly-navigated page's AX tree can briefly be empty (document still
 /// parsing when `page.wait_for_navigation()` resolves) — retries once, after
 /// a short backoff, if the first capture's root has no children.
-async fn wait_and_capture(page: &Page, next_ref_id: &Cell<u64>) -> Result<ax::AxCapture, PortError> {
-    let first = ax::capture_snapshot(page, next_ref_id).await?;
+///
+/// `previous_refs` is forwarded to `ax::capture_snapshot` so a node that
+/// survives this capture unchanged (e.g. everything except whatever a
+/// `click`/`type_text` just mutated) keeps the ref string a caller may
+/// already be holding, rather than every recapture reassigning fresh ref
+/// strings to the whole tree. Callers doing a real navigation (new page or
+/// `page.goto`) must pass an empty map — the old page's refs don't apply to
+/// the new document.
+async fn wait_and_capture(
+    page: &Page,
+    next_ref_id: &Cell<u64>,
+    previous_refs: &HashMap<String, ax::ResolvedRef>,
+) -> Result<ax::AxCapture, PortError> {
+    let first = ax::capture_snapshot(page, next_ref_id, previous_refs).await?;
     if !first.snapshot.root.children.is_empty() {
         return Ok(first);
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
-    ax::capture_snapshot(page, next_ref_id).await
+    ax::capture_snapshot(page, next_ref_id, previous_refs).await
 }
 
 /// Resolves `backend_node_id` to a live `RemoteObject`/`objectId` (`DOM
@@ -497,17 +525,53 @@ fn frame_navigated_blocked_message(
     ))
 }
 
-/// Registers this session's `Page.frameNavigated` (SSRF re-check, Task 3.4.2)
-/// and `Target.targetCrashed` (Story 2.5's deferred crash listener,
-/// implemented here in Story 3.2) event listeners. Called exactly once, at
-/// new-session creation — never re-registered on a session-reuse `navigate`
-/// call, to avoid duplicate event streams accumulating on the same `Page`.
+/// Registers this session's `Page.frameNavigated`/`Page.frameRequestedNavigation`
+/// (SSRF re-check, Task 3.4.2) and `Target.targetCrashed` (Story 2.5's
+/// deferred crash listener, implemented here in Story 3.2) event listeners.
+/// Called exactly once, at new-session creation — never re-registered on a
+/// session-reuse `navigate` call, to avoid duplicate event streams
+/// accumulating on the same `Page`.
 async fn spawn_session_listeners(
     page: &Page,
     session_id: String,
     blocked: Rc<RefCell<Option<String>>>,
     crashed: Rc<Cell<bool>>,
 ) {
+    // `frameRequestedNavigation` fires for the *intended* destination URL the
+    // instant the browser decides to navigate there — unlike
+    // `frameNavigated`, which only fires once a navigation actually commits.
+    // A link-local/private SSRF target is typically unreachable, so the
+    // connection attempt fails outright and the frame instead commits
+    // Chromium's own `chrome-error://chromewebdata/` page; a check that only
+    // ever inspected `frameNavigated`'s committed URL would see that harmless
+    // internal URL and never notice the blocked host was ever requested.
+    // Checking the *requested* URL here closes that gap regardless of
+    // whether the target is reachable.
+    let main_frame_id = page.mainframe().await.ok().flatten();
+    if let Ok(mut requested_events) = page.event_listener::<EventFrameRequestedNavigation>().await
+    {
+        let session_id_for_requests = session_id.clone();
+        let blocked_for_requests = blocked.clone();
+        let main_frame_id = main_frame_id.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(event) = requested_events.next().await {
+                if main_frame_id.as_ref() != Some(&event.frame_id) {
+                    continue;
+                }
+                let policy = NetworkPolicy::from_env(
+                    std::env::var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS").ok(),
+                );
+                if let Some(msg) = frame_navigated_blocked_message(
+                    &session_id_for_requests,
+                    &event.url,
+                    policy,
+                ) {
+                    *blocked_for_requests.borrow_mut() = Some(msg);
+                }
+            }
+        });
+    }
+
     if let Ok(mut frame_events) = page.event_listener::<EventFrameNavigated>().await {
         tokio::task::spawn_local(async move {
             while let Some(event) = frame_events.next().await {
@@ -615,6 +679,16 @@ impl BrowserDriver for NativeBrowser {
                         .new_page(url)
                         .await
                         .map_err(|e| PortError::Other(e.to_string()))?;
+
+                    // Turn on the `Accessibility` domain for this target, per
+                    // CDP/Puppeteer convention, so `AXNodeId`s stay stable
+                    // across the session's `getFullAXTree`/`getPartialAXTree`
+                    // calls. A one-time, page-lifetime op, done once here
+                    // rather than per capture.
+                    page.execute(EnableParams::default())
+                        .await
+                        .map_err(|e| PortError::Other(e.to_string()))?;
+
                     page.wait_for_navigation()
                         .await
                         .map_err(|e| PortError::Other(e.to_string()))?;
@@ -630,7 +704,11 @@ impl BrowserDriver for NativeBrowser {
                     spawn_session_listeners(&page, id.clone(), blocked.clone(), crashed.clone())
                         .await;
 
-                    let capture = wait_and_capture(&page, &next_ref_id).await?;
+                    // Fresh session: `latest_refs` is still empty, so there's
+                    // nothing to borrow across the `.await` — pass an empty
+                    // map directly rather than holding a `RefCell` borrow
+                    // live over an await point (clippy::await_holding_refcell_ref).
+                    let capture = wait_and_capture(&page, &next_ref_id, &HashMap::new()).await?;
                     let snapshot = install_snapshot(
                         &latest_refs,
                         &known_refs,
@@ -692,7 +770,13 @@ impl BrowserDriver for NativeBrowser {
 
                     nav_generation.set(nav_generation.get() + 1);
 
-                    let capture = wait_and_capture(&page, &next_ref_id).await?;
+                    // Real navigation to a new URL: an old ref's
+                    // `BackendNodeId` has no relationship to this new
+                    // document's nodes (CDP doesn't guarantee ids aren't
+                    // reused across navigations), so identity must not carry
+                    // over — pass an empty map rather than the (about to be
+                    // discarded) old-page `latest_refs`.
+                    let capture = wait_and_capture(&page, &next_ref_id, &HashMap::new()).await?;
                     let snapshot = install_snapshot(
                         &latest_refs,
                         &known_refs,
@@ -783,7 +867,12 @@ impl BrowserDriver for NativeBrowser {
                 return Err(PortError::NotFound(reason));
             }
 
-            let capture = ax::capture_snapshot(&page, &next_ref_id).await?;
+            // Clone out of the `RefCell` first — holding a live borrow across
+            // the `.await` below would trip clippy::await_holding_refcell_ref
+            // (and risks a panic if another task borrows `latest_refs` while
+            // this future is suspended).
+            let previous_refs = latest_refs.borrow().clone();
+            let capture = ax::capture_snapshot(&page, &next_ref_id, &previous_refs).await?;
             let snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -878,7 +967,11 @@ impl NativeBrowser {
                 return Err(PortError::NotFound(reason));
             }
 
-            let capture = wait_and_capture(&page, &next_ref_id).await?;
+            // Same reasoning as `snapshot()` above: clone out of the
+            // `RefCell` before the `.await` rather than holding a borrow
+            // across it.
+            let previous_refs = latest_refs.borrow().clone();
+            let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
             let mut snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
