@@ -18,10 +18,12 @@ use stapler_mcp_core::daemon::{json_handler, Daemon};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{EnvPort, LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
-    BraveSearchInput, BraveSearchOutput, DownloadWebsiteInput, DownloadWebsiteOutput,
-    FetchPageInput, FetchPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
+    BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
+    BrowserNavigateInput, BrowserNavigateOutput, BrowserSnapshotInput, BrowserTypeInput,
+    DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput, FetchPageOutput,
+    ReadWebsiteInput, ReadWebsiteOutput,
 };
-use stapler_mcp_core::tools::{fetch, search, webcrawl};
+use stapler_mcp_core::tools::{browser as browser_tools, fetch, search, webcrawl};
 
 #[wasm_bindgen]
 pub async fn run_daemon() -> Result<(), JsValue> {
@@ -110,6 +112,52 @@ pub async fn run_daemon() -> Result<(), JsValue> {
                 async move {
                     webcrawl::download_website(&*http, &*fsstore, input, network_policy).await
                 }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_navigate",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserNavigateInput| {
+                let browser = browser.clone();
+                async move {
+                    browser_tools::browser_navigate(&*browser, input, network_policy).await
+                }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_click",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserClickInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_click(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_type",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserTypeInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_type(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_snapshot",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserSnapshotInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_snapshot(&*browser, input).await }
             }
         }),
     );
@@ -211,6 +259,73 @@ pub fn list_tools_json() -> Result<String, JsValue> {
             output_schema: serde_json::to_value(schemars::schema_for!(DownloadWebsiteOutput))
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
         },
+        ToolDescriptor {
+            name: "stapler_browser_navigate",
+            description: "Navigate a persistent browser session (starting a new one if sessionId is omitted) and return an accessibility-tree snapshot of the resulting page.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserNavigateInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserNavigateOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_click",
+            description: "Click an element (identified by a ref from a previous snapshot) in an existing browser session and return the resulting accessibility-tree snapshot.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserClickInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_type",
+            description: "Type text into an element (identified by a ref from a previous snapshot) in an existing browser session and return the resulting accessibility-tree snapshot.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserTypeInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_snapshot",
+            description: "Capture a fresh accessibility-tree snapshot of an existing browser session's current page without mutating it.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserSnapshotInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
     ];
     serde_json::to_string(&tools).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(test)]
+mod list_tools_tests {
+    use super::list_tools_json;
+
+    #[test]
+    fn list_tools_json_should_contain_four_browser_tool_descriptors_when_called() {
+        let json = list_tools_json().expect("list_tools_json should succeed");
+        let tools: serde_json::Value =
+            serde_json::from_str(&json).expect("list_tools_json output should be valid JSON");
+        let names: Vec<&str> = tools
+            .as_array()
+            .expect("tools should be a JSON array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name should be a string"))
+            .collect();
+
+        let browser_tool_names = [
+            "stapler_browser_navigate",
+            "stapler_browser_click",
+            "stapler_browser_type",
+            "stapler_browser_snapshot",
+        ];
+        let matched: Vec<&&str> = browser_tool_names
+            .iter()
+            .filter(|name| names.contains(*name))
+            .collect();
+
+        assert_eq!(
+            matched.len(),
+            4,
+            "expected exactly 4 browser tool descriptors, found {matched:?} in {names:?}"
+        );
+    }
 }

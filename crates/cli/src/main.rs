@@ -8,10 +8,11 @@ use stapler_mcp_core::daemon::{json_handler, Daemon};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
-    BraveSearchInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
+    BraveSearchInput, BrowserClickInput, BrowserNavigateInput, BrowserSnapshotInput,
+    BrowserTypeInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
     ListIndexedSourcesInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
-use stapler_mcp_core::tools::{docs, fetch, search, webcrawl};
+use stapler_mcp_core::tools::{browser, docs, fetch, search, webcrawl};
 use stapler_mcp_native::{
     NativeBrowser, NativeClock, NativeEmbedder, NativeEnv, NativeFs, NativeHttp, NativeLock,
     NativeSocketFactory,
@@ -162,6 +163,50 @@ async fn run_daemon() {
     );
 
     daemon.register(
+        "stapler_browser_navigate",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserNavigateInput| {
+                let browser = browser.clone();
+                async move { browser::browser_navigate(&*browser, input, network_policy).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_click",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserClickInput| {
+                let browser = browser.clone();
+                async move { browser::browser_click(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_type",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserTypeInput| {
+                let browser = browser.clone();
+                async move { browser::browser_type(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_snapshot",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserSnapshotInput| {
+                let browser = browser.clone();
+                async move { browser::browser_snapshot(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
         "stapler_index_docs",
         json_handler({
             let http = http.clone();
@@ -249,6 +294,21 @@ async fn run_daemon() {
     // forever after a clean `shutdown`, whatever `daemon.run` returned.
     drop(daemon);
     if let Some(inner) = Rc::get_mut(&mut browser) {
+        // Abort the session-idle reaper before closing the browser: a
+        // still-running reaper mid-scan could otherwise race
+        // `NativeBrowser::close()`. `handle.await`ing an aborted task
+        // returns `Err` with `is_cancelled() == true`; any other `Err` means
+        // the reaper panicked rather than being cleanly cancelled, which is
+        // worth logging since it would otherwise go unnoticed (Story 2.4).
+        let reaper_handle = inner.reaper.borrow_mut().take();
+        if let Some(handle) = reaper_handle {
+            handle.abort();
+            if let Err(e) = handle.await {
+                if !e.is_cancelled() {
+                    eprintln!("stapler-mcp: session idle reaper task panicked: {e}");
+                }
+            }
+        }
         inner.close().await;
     }
 

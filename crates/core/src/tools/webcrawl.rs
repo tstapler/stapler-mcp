@@ -151,7 +151,7 @@ fn is_blocked_ipv6(ip: std::net::Ipv6Addr) -> bool {
 /// that resolves to a private address at request time (DNS rebinding), nor a
 /// redirect an `HttpClient` adapter follows internally — both would need a
 /// check inside the adapter's own connect path to close.
-fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
+pub fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
     if policy == NetworkPolicy::AllowPrivateNetworks {
         return None;
     }
