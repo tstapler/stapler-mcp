@@ -255,21 +255,47 @@ test("jsBrowserNavigate_should_reject_reused_session_with_crashed_message_when_s
 // `setInterval` and drop every session, not just close the browser process.
 
 test("jsCloseBrowser_should_clear_reaper_interval_and_sessions_when_reaper_was_running", async () => {
-    const id = "sess-close-1";
-    browserGlue.sessions.set(id, {
-        page: { close: async () => {} },
-        lastUsed: Date.now(),
-        blocked: undefined,
-        crashed: undefined,
-    });
-    // `ensureReaper` isn't exported, but any prior test that created a fresh
-    // session (e.g. via `jsBrowserNavigate` with no sessionId) will already
-    // have started it as a module-level singleton; asserting on `sessions`
-    // being cleared is the behavior this fix is actually about.
+    // `ensureReaper` (and the `reaperTimer`/`browserPromise` singletons it
+    // depends on) aren't exported, so the only way to actually start the
+    // reaper is to drive it through the real `jsBrowserNavigate` "new
+    // session" path — the one call site that invokes `ensureReaper()`. That
+    // path calls the real `playwright-core` `chromium.launch`/`newPage`, so
+    // those are stubbed out here with a fake browser/page rather than
+    // spinning up a real Chromium instance.
+    const { chromium } = require("playwright-core");
+    const originalLaunch = chromium.launch;
+    const originalClearInterval = global.clearInterval;
+    const fakePage = {
+        on: () => {},
+        goto: async () => {},
+        url: () => "https://example.com/",
+        ariaSnapshot: async () => "",
+    };
+    const fakeBrowser = {
+        newPage: async () => fakePage,
+        close: async () => {},
+    };
+    chromium.launch = async () => fakeBrowser;
+    let clearIntervalCalls = 0;
+    global.clearInterval = (handle) => {
+        clearIntervalCalls += 1;
+        return originalClearInterval(handle);
+    };
 
-    await browserGlue.jsCloseBrowser();
+    try {
+        await browserGlue.jsBrowserNavigate("https://example.com/", "", 5000);
+        // The reaper only starts on the "new session" path above; confirm it
+        // actually ran before trusting the `clearInterval` assertion below.
+        assert.strictEqual(browserGlue.sessions.size, 1);
 
-    assert.strictEqual(browserGlue.sessions.size, 0);
+        await browserGlue.jsCloseBrowser();
+
+        assert.strictEqual(clearIntervalCalls, 1, "jsCloseBrowser should clear the reaper's setInterval");
+        assert.strictEqual(browserGlue.sessions.size, 0);
+    } finally {
+        chromium.launch = originalLaunch;
+        global.clearInterval = originalClearInterval;
+    }
 });
 
 test("reapIdleSessions_should_not_throw_when_pages_close_rejects", () => {

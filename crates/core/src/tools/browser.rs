@@ -190,6 +190,7 @@ pub async fn browser_snapshot<B: BrowserDriver>(
                 "no active browser session named '{}'; call stapler_browser_navigate to start a new session",
                 input.session_id
             ),
+            PortError::SessionCrashed(msg) => msg,
             other => format!("snapshot {}: {other}", input.session_id),
         })?;
 
@@ -715,6 +716,29 @@ mod tests {
 
         assert_eq!(err, "sessionId must not be empty");
         assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_snapshot_should_pass_session_crashed_message_through_verbatim() {
+        let driver = FakeBrowserDriver::new().with_snapshot(Err(PortError::SessionCrashed(
+            "browser session \"sess-9\" crashed — call stapler_browser_navigate (without sessionId) to start a fresh session"
+                .to_string(),
+        )));
+
+        let err = browser_snapshot(
+            &driver,
+            BrowserSnapshotInput {
+                session_id: "sess-9".to_string(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("session-crashed should surface as an error");
+
+        assert_eq!(
+            err,
+            "browser session \"sess-9\" crashed — call stapler_browser_navigate (without sessionId) to start a fresh session"
+        );
     }
 
     // -- UX acceptance tests --------------------------------------------------

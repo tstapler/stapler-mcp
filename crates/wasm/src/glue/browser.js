@@ -208,6 +208,25 @@ function checkBlocked(session) {
     }
 }
 
+// Shared entry-check for `jsBrowserClick`/`jsBrowserType`/`jsBrowserSnapshot`:
+// crashed/blocked must be checked *before* `lastUsed` is bumped — bumping
+// first would keep a crashed session's idle clock refreshed on every failed
+// call, so it would never age past `SESSION_IDLE_TIMEOUT_MS` and never get
+// reaped, defeating the crash-detection fix's purpose. On crash, the session
+// is also evicted from `sessions` immediately (mirroring native's
+// `touch_or_evict`, `crates/native/src/browser.rs`) rather than waiting for
+// the idle reaper to notice it.
+function requireLiveSession(sessionId) {
+    const session = requireSession(sessionId);
+    if (session.crashed) {
+        sessions.delete(sessionId);
+        throw new Error(session.crashed);
+    }
+    checkBlocked(session);
+    session.lastUsed = Date.now();
+    return session;
+}
+
 // Parses Playwright's own ref-annotated `page.ariaSnapshot()` output (e.g.
 // `- button "Submit" [ref=e1]`, nested children indented by 2 spaces) into
 // the plain-object node shape `AxSnapshot.root`/`AxNode` (`{ role, name, ref,
@@ -284,10 +303,7 @@ module.exports.jsBrowserNavigate = async function (url, sessionId, timeoutMs) {
 };
 
 module.exports.jsBrowserClick = async function (sessionId, refId, timeoutMs) {
-    const session = requireSession(sessionId);
-    session.lastUsed = Date.now();
-    checkCrashed(session);
-    checkBlocked(session);
+    const session = requireLiveSession(sessionId);
     const urlBefore = session.page.url();
     const locator = session.page.locator(`aria-ref=${refId}`);
     try {
@@ -305,10 +321,7 @@ module.exports.jsBrowserClick = async function (sessionId, refId, timeoutMs) {
 };
 
 module.exports.jsBrowserType = async function (sessionId, refId, text, timeoutMs) {
-    const session = requireSession(sessionId);
-    session.lastUsed = Date.now();
-    checkCrashed(session);
-    checkBlocked(session);
+    const session = requireLiveSession(sessionId);
     const urlBefore = session.page.url();
     const locator = session.page.locator(`aria-ref=${refId}`);
     try {
@@ -326,10 +339,7 @@ module.exports.jsBrowserType = async function (sessionId, refId, text, timeoutMs
 };
 
 module.exports.jsBrowserSnapshot = async function (sessionId, timeoutMs) {
-    const session = requireSession(sessionId);
-    session.lastUsed = Date.now();
-    checkCrashed(session);
-    checkBlocked(session);
+    const session = requireLiveSession(sessionId);
     void timeoutMs; // snapshot itself has nothing to time out on; kept for a uniform signature
     return captureSnapshot(session.page);
 };
