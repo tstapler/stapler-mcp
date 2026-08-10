@@ -129,7 +129,11 @@ impl NetworkPolicy {
 }
 
 fn is_blocked_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+    // `is_unspecified()` only matches the exact address `0.0.0.0`, but the
+    // entire `0.0.0.0/8` range is "this network" (RFC 791 §3.2) and, on most
+    // OSes, resolves to `127.0.0.1`/local interfaces just like loopback —
+    // `http://0.1.2.3/` must be blocked exactly like `http://0.0.0.0/`.
+    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.octets()[0] == 0
 }
 
 fn is_blocked_ipv6(ip: std::net::Ipv6Addr) -> bool {
@@ -142,7 +146,12 @@ fn is_blocked_ipv6(ip: std::net::Ipv6Addr) -> bool {
     if is_unique_local || is_link_local {
         return true;
     }
-    ip.to_ipv4_mapped().map(is_blocked_ipv4).unwrap_or(false)
+    // `to_ipv4_mapped()` only unwraps the `::ffff:a.b.c.d/96` form. The
+    // legacy IPv4-compatible form `::a.b.c.d` (RFC 4291 §2.5.5.1, deprecated
+    // but still parsed by `Ipv6Addr::from_str`) has an all-zero 96-bit
+    // prefix instead of the `ffff` prefix and would otherwise sail through
+    // this check unblocked — `to_ipv4()` recognizes both forms.
+    ip.to_ipv4().map(is_blocked_ipv4).unwrap_or(false)
 }
 
 /// Best-effort literal check: `crates/core` has no DNS-resolution port (see
@@ -151,7 +160,7 @@ fn is_blocked_ipv6(ip: std::net::Ipv6Addr) -> bool {
 /// that resolves to a private address at request time (DNS rebinding), nor a
 /// redirect an `HttpClient` adapter follows internally — both would need a
 /// check inside the adapter's own connect path to close.
-fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
+pub fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
     if policy == NetworkPolicy::AllowPrivateNetworks {
         return None;
     }
@@ -162,7 +171,10 @@ fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
         url::Host::Ipv6(ip) if is_blocked_ipv6(ip) => {
             Some(format!("{ip} is a loopback/private/link-local address"))
         }
-        url::Host::Domain(d) if d.eq_ignore_ascii_case("localhost") || d.to_ascii_lowercase().ends_with(".localhost") => {
+        url::Host::Domain(d)
+            if d.eq_ignore_ascii_case("localhost")
+                || d.to_ascii_lowercase().ends_with(".localhost") =>
+        {
             Some(format!("{d} is a loopback hostname"))
         }
         _ => None,
@@ -443,6 +455,22 @@ mod ssrf_guard_tests {
     #[test]
     fn should_block_ipv4_mapped_ipv6_of_a_blocked_address_when_enforcing() {
         assert!(blocked("http://[::ffff:127.0.0.1]/"));
+    }
+
+    #[test]
+    fn should_block_entire_0_0_0_0_slash_8_range_when_enforcing() {
+        // Not just the exact address `0.0.0.0` — the whole "this network"
+        // range resolves like loopback on most OSes.
+        assert!(blocked("http://0.0.0.0/"));
+        assert!(blocked("http://0.1.2.3/"));
+    }
+
+    #[test]
+    fn should_block_legacy_ipv4_compatible_ipv6_of_a_blocked_address_when_enforcing() {
+        // `::a.b.c.d` (RFC 4291 IPv4-compatible form, distinct from the
+        // `::ffff:a.b.c.d` mapped form) must be blocked the same way.
+        assert!(blocked("http://[::10.0.0.1]/"));
+        assert!(blocked("http://[::127.0.0.1]/"));
     }
 
     #[test]

@@ -74,6 +74,11 @@ test("daemon architecture and real tools round trip", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "smcp-e2e-"));
     process.env.STAPLER_MCP_HOME = home;
     process.env.BRAVE_API_KEY = "test-key";
+    // The mock HTTP server below binds to 127.0.0.1; the daemon's SSRF guard
+    // (see crates/webcrawl, added in a15ed28) blocks loopback/private
+    // addresses by default. Allow it here, mirroring
+    // crates/cli/tests/webcrawl.rs and crates/cli/tests/docs_index.rs.
+    process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS = "1";
 
     const mock = await startMockBraveServer(
         JSON.stringify({

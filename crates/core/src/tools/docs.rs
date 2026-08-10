@@ -1051,7 +1051,9 @@ mod tests {
         // straddling many raw splitter chunk boundaries.
         let mut code_lines = String::new();
         for i in 0..60 {
-            code_lines.push_str(&format!("let line_{i} = {i}; // padding to force overflow\n"));
+            code_lines.push_str(&format!(
+                "let line_{i} = {i}; // padding to force overflow\n"
+            ));
         }
         let markdown = format!(
             "# Title\n\nSome intro text before the code block.\n\n\
@@ -1813,9 +1815,18 @@ mod tests {
         let mut input = base_input("https://tokio.rs/tokio/tutorial");
         input.source = Some("tokio-tutorial".to_string());
 
-        let output = index_source(&http, &fs, &embedder, &clock, &locks, docs_index_dir, input, NetworkPolicy::Enforce)
-            .await
-            .expect("index_source should succeed");
+        let output = index_source(
+            &http,
+            &fs,
+            &embedder,
+            &clock,
+            &locks,
+            docs_index_dir,
+            input,
+            NetworkPolicy::Enforce,
+        )
+        .await
+        .expect("index_source should succeed");
 
         assert_eq!(
             output.pages_removed,
@@ -1846,9 +1857,18 @@ mod tests {
         let mut input = base_input("https://tokio.rs/tokio/tutorial");
         input.source = Some("tokio-tutorial".to_string());
 
-        let output = index_source(&http, &fs, &embedder, &clock, &locks, docs_index_dir, input, NetworkPolicy::Enforce)
-            .await
-            .expect("index_source should succeed");
+        let output = index_source(
+            &http,
+            &fs,
+            &embedder,
+            &clock,
+            &locks,
+            docs_index_dir,
+            input,
+            NetworkPolicy::Enforce,
+        )
+        .await
+        .expect("index_source should succeed");
 
         let contents = fs
             .get(&chunks_path(docs_index_dir, &id))

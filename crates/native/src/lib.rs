@@ -1,6 +1,7 @@
 //! Native adapter: implements every `stapler-mcp-core::ports` trait for real
 //! OS primitives (tokio Unix sockets, `fs4` flock, detached process spawn).
 
+mod ax;
 mod browser;
 mod embed;
 mod env;

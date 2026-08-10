@@ -248,6 +248,93 @@ pub struct RemoveIndexedSourceOutput {
     pub source_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AxNodeOutput {
+    /// `ref` is a Rust keyword and cannot be a field name, hence the rename.
+    #[serde(rename = "ref")]
+    pub node_ref: String,
+    pub role: String,
+    pub name: String,
+    /// Omitted from JSON entirely for non-form-control nodes rather than
+    /// serialized as `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub children: Vec<AxNodeOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AxSnapshotOutput {
+    pub root: AxNodeOutput,
+    pub url: String,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigated_from: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserNavigateInput {
+    /// The URL to navigate to.
+    pub url: String,
+    /// An existing session to reuse; omit to start a new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Navigation timeout in seconds, defaults to 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserNavigateOutput {
+    pub session_id: String,
+    pub final_url: String,
+    pub snapshot: AxSnapshotOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserClickInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`.
+    pub ref_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTypeInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`.
+    pub ref_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSnapshotInput {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+/// Shared by click/type/snapshot responses.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserActionOutput {
+    pub snapshot: AxSnapshotOutput,
+    /// Carries informational messages such as "click navigated to {url};
+    /// previous refs are now invalid" — never present alongside a top-level
+    /// error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +496,73 @@ mod tests {
                 "sourceName": "tokio-tutorial",
             })
         );
+    }
+
+    #[test]
+    fn browser_navigate_input_should_omit_session_id_when_none_and_use_camelcase() {
+        let input = BrowserNavigateInput {
+            url: "https://example.com".into(),
+            session_id: None,
+            timeout_seconds: None,
+        };
+
+        let json = serde_json::to_string(&input).unwrap();
+
+        assert!(json.contains("\"url\":\"https://example.com\""));
+        assert!(!json.contains("sessionId"));
+    }
+
+    #[test]
+    fn browser_type_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1","refId":"e5","text":"hello"}"#;
+
+        let input: BrowserTypeInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+        assert_eq!(input.ref_id, "e5");
+        assert_eq!(input.text, "hello");
+        assert_eq!(input.timeout_seconds, None);
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "refId": "e5",
+                "text": "hello",
+            })
+        );
+    }
+
+    #[test]
+    fn ax_node_output_should_use_ref_key_and_omit_value_when_non_form_control_node_given() {
+        let node = AxNodeOutput {
+            node_ref: "e3".into(),
+            role: "button".into(),
+            name: "Submit".into(),
+            value: None,
+            children: vec![],
+        };
+
+        let value = serde_json::to_value(&node).unwrap();
+
+        assert_eq!(value.get("ref").unwrap(), "e3");
+        assert!(value.get("nodeRef").is_none());
+        assert!(value.get("node_ref").is_none());
+        assert!(!value.as_object().unwrap().contains_key("value"));
+    }
+
+    #[test]
+    fn ax_node_output_should_include_value_key_when_textbox_node_given() {
+        let node = AxNodeOutput {
+            node_ref: "e2".into(),
+            role: "textbox".into(),
+            name: "Email".into(),
+            value: Some("user@example.com".into()),
+            children: vec![],
+        };
+
+        let value = serde_json::to_value(&node).unwrap();
+
+        assert_eq!(value.get("value").unwrap(), "user@example.com");
     }
 }

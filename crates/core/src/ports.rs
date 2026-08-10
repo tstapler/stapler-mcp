@@ -17,6 +17,16 @@ pub enum PortError {
     Io(String),
     Timeout,
     Other(String),
+    /// No entry exists for the given id — either it was never issued, or it
+    /// was evicted (e.g. by the session idle reaper). The caller's fix is
+    /// always "start a new session."
+    NotFound(String),
+    /// The entry is still present but its underlying resource has died (e.g.
+    /// a browser tab crashed). Deliberately distinct from `NotFound`: the
+    /// caller's fix is *not* "start a new session with a fresh id" — silently
+    /// reusing the same crashed session id would just crash again, so this
+    /// tells the caller the specific id it holds is now dead.
+    SessionCrashed(String),
 }
 
 impl std::fmt::Display for PortError {
@@ -25,6 +35,8 @@ impl std::fmt::Display for PortError {
             PortError::Io(e) => write!(f, "io error: {e}"),
             PortError::Timeout => write!(f, "timed out"),
             PortError::Other(e) => write!(f, "{e}"),
+            PortError::NotFound(e) => write!(f, "not found: {e}"),
+            PortError::SessionCrashed(e) => write!(f, "session crashed: {e}"),
         }
     }
 }
@@ -115,6 +127,52 @@ pub struct PageExtract {
     pub final_url: String,
 }
 
+/// Opaque handle to a persistent browser session (a live tab), returned by
+/// `navigate` and threaded through every subsequent `click`/`type_text`/
+/// `snapshot` call against the same tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionId(pub String);
+
+/// A `ref` string from a previously-returned `AxSnapshot`, identifying the
+/// element to act on. Opaque to callers outside this crate — never a CSS
+/// selector or role/name pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locator(pub String);
+
+/// One node in an accessibility-tree snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AxNode {
+    pub node_ref: String,
+    pub role: String,
+    pub name: String,
+    /// `None` for non-form-control nodes (buttons, generic containers).
+    /// `Some(current_text)` for textbox/combobox-like nodes, populated from
+    /// the CDP AX node's own `value` property where present — lets a caller
+    /// confirm typed text landed from `type_text`'s own returned snapshot
+    /// without a follow-up `snapshot` call.
+    pub value: Option<String>,
+    pub children: Vec<AxNode>,
+}
+
+/// A full accessibility-tree snapshot of a session's current page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AxSnapshot {
+    pub root: AxNode,
+    pub url: String,
+    pub truncated: bool,
+    /// `None` for every snapshot except one returned by `click`/`type_text`
+    /// when that specific call's dispatch caused the page's URL to change —
+    /// in which case it holds the pre-dispatch URL. Never conflated with the
+    /// unrelated SSRF-`blocked` signal.
+    pub navigated_from: Option<String>,
+}
+
+pub struct NavigateResult {
+    pub session_id: SessionId,
+    pub final_url: String,
+    pub snapshot: AxSnapshot,
+}
+
 pub trait BrowserDriver {
     /// Coarse, call-level operation (navigate + read title/HTML/text/final-URL
     /// in one hop) rather than exposing CDP-message-level primitives — this is
@@ -125,6 +183,39 @@ pub trait BrowserDriver {
         url: &str,
         timeout: Duration,
     ) -> Result<PageExtract, PortError>;
+
+    /// Navigates to `url`, either in a fresh tab (`session_id: None`) or an
+    /// existing session's tab (`session_id: Some(id)`, erroring with
+    /// `PortError::NotFound` if `id` has no live session).
+    async fn navigate(
+        &self,
+        url: &str,
+        session_id: Option<&SessionId>,
+        timeout: Duration,
+    ) -> Result<NavigateResult, PortError>;
+    /// Resolves `locator` against `session_id`'s current snapshot and clicks it.
+    async fn click(
+        &self,
+        session_id: &SessionId,
+        locator: &Locator,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
+    /// Resolves `locator` against `session_id`'s current snapshot and types
+    /// `text` into it.
+    async fn type_text(
+        &self,
+        session_id: &SessionId,
+        locator: &Locator,
+        text: &str,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
+    /// Captures a fresh accessibility-tree snapshot of `session_id`'s current
+    /// page without mutating it.
+    async fn snapshot(
+        &self,
+        session_id: &SessionId,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
 }
 
 pub trait FileStore {
@@ -145,4 +236,130 @@ pub trait FileStore {
 /// (which all have at least a partial wasm adapter) is deliberate, not a gap.
 pub trait Embedder {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, PortError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn axnode_debug_format_should_contain_node_ref_role_name_when_button_node_given() {
+        let node = AxNode {
+            node_ref: "e3".into(),
+            role: "button".into(),
+            name: "Submit".into(),
+            value: None,
+            children: vec![],
+        };
+
+        let formatted = format!("{node:?}");
+
+        assert!(formatted.contains("node_ref: \"e3\""));
+        assert!(formatted.contains("role: \"button\""));
+        assert!(formatted.contains("name: \"Submit\""));
+    }
+
+    #[test]
+    fn axnode_value_should_carry_typed_text_independently_of_name_when_textbox_node_given() {
+        let node = AxNode {
+            node_ref: "e2".into(),
+            role: "textbox".into(),
+            name: "Email".into(),
+            value: Some("user@example.com".into()),
+            children: vec![],
+        };
+
+        assert_eq!(node.name, "Email");
+        assert_eq!(node.value, Some("user@example.com".into()));
+    }
+
+    #[test]
+    fn axsnapshot_navigated_from_should_default_to_none_when_returned_by_navigate_or_snapshot() {
+        let snapshot = AxSnapshot {
+            root: AxNode {
+                node_ref: "e1".into(),
+                role: "generic".into(),
+                name: String::new(),
+                value: None,
+                children: vec![],
+            },
+            url: "https://example.com/a".into(),
+            truncated: false,
+            navigated_from: None,
+        };
+
+        assert_eq!(snapshot.navigated_from, None);
+    }
+
+    /// Task 1.1.2 AC: a test double implementing only the 5 `BrowserDriver`
+    /// methods with `todo!()` bodies must compile — confirms the trait
+    /// signatures are well-formed and don't conflict with
+    /// `navigate_and_extract`. The bodies are never invoked.
+    struct StubBrowser;
+
+    impl BrowserDriver for StubBrowser {
+        async fn navigate_and_extract(
+            &self,
+            _url: &str,
+            _timeout: Duration,
+        ) -> Result<PageExtract, PortError> {
+            todo!()
+        }
+
+        async fn navigate(
+            &self,
+            _url: &str,
+            _session_id: Option<&SessionId>,
+            _timeout: Duration,
+        ) -> Result<NavigateResult, PortError> {
+            todo!()
+        }
+
+        async fn click(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
+        async fn type_text(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _text: &str,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
+        async fn snapshot(
+            &self,
+            _session_id: &SessionId,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+    }
+
+    #[test]
+    fn stub_browser_driver_should_compile_when_five_methods_have_todo_bodies() {
+        // Merely constructing it is the assertion: if the trait signatures
+        // were malformed or clashed with `navigate_and_extract`, this file
+        // wouldn't compile at all.
+        let _stub = StubBrowser;
+    }
+
+    #[test]
+    fn port_error_not_found_display_should_include_message_when_formatted() {
+        let err = PortError::NotFound("session sess-1".into());
+        assert_eq!(format!("{err}"), "not found: session sess-1");
+    }
+
+    #[test]
+    fn port_error_session_crashed_display_should_include_message_when_formatted() {
+        let err = PortError::SessionCrashed("sess-2".into());
+        assert_eq!(format!("{err}"), "session crashed: sess-2");
+    }
 }
