@@ -143,6 +143,67 @@ test("isBlockedHost_should_block_ipv4_mapped_ipv6_hosts_in_hex_hextet_form", () 
 });
 
 // ---------------------------------------------------------------------------
+// isBlockedHost must also block the legacy IPv4-*compatible* IPv6 form
+// (RFC 4291 §2.5.5.1, deprecated but still parsed) and the full fe80::/10
+// link-local range — not just the literal "fe80:" prefix. A prior version
+// pattern-matched Node's normalized hostname string, which for
+// "http://[::169.254.169.254]/" normalizes to "::a9fe:a9fe" (no "ffff:"
+// prefix, so it slipped past the IPv4-mapped regex entirely) and for
+// "http://[fe90::1]/" doesn't start with the literal "fe80:" despite being
+// in fe80::/10. See `crates/core/src/tools/webcrawl.rs`'s `is_blocked_ipv6`
+// for the canonical policy this must match.
+test("isBlockedHost_should_block_legacy_ipv4_compatible_ipv6_and_full_fe80_range", () => {
+    const prevEnv = process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS;
+    delete process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS;
+    try {
+        // Legacy IPv4-compatible form, via URL normalization (no "ffff:").
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[::169.254.169.254]/").hostname),
+            true,
+        );
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[::127.0.0.1]/").hostname),
+            true,
+        );
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[::10.0.0.1]/").hostname),
+            true,
+        );
+        // Same forms as raw strings (not routed through URL()).
+        assert.strictEqual(browserGlue.isBlockedHost("::169.254.169.254"), true);
+        assert.strictEqual(browserGlue.isBlockedHost("::127.0.0.1"), true);
+
+        // Full fe80::/10 range (first hextet 0xfe80-0xfebf), not just the
+        // literal "fe80:" prefix.
+        assert.strictEqual(browserGlue.isBlockedHost(new URL("http://[fe90::1]/").hostname), true);
+        assert.strictEqual(browserGlue.isBlockedHost(new URL("http://[febf::1]/").hostname), true);
+        assert.strictEqual(browserGlue.isBlockedHost(new URL("http://[fe80::1]/").hostname), true);
+        // Just outside the range on both ends must stay allowed.
+        assert.strictEqual(browserGlue.isBlockedHost(new URL("http://[fe7f::1]/").hostname), false);
+        assert.strictEqual(browserGlue.isBlockedHost(new URL("http://[fec0::1]/").hostname), false);
+
+        // Negative cases: a real-looking public IPv6 literal (Google DNS,
+        // Cloudflare DNS) and a legacy-compatible-shaped literal for a
+        // public IPv4 address must not be over-blocked.
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[2001:4860:4860::8888]/").hostname),
+            false,
+        );
+        assert.strictEqual(
+            browserGlue.isBlockedHost(new URL("http://[2606:4700:4700::1111]/").hostname),
+            false,
+        );
+        assert.strictEqual(browserGlue.isBlockedHost("::8.8.8.8"), false);
+    } finally {
+        if (prevEnv === undefined) {
+            delete process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS;
+        } else {
+            process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS = prevEnv;
+        }
+    }
+});
+
+// ---------------------------------------------------------------------------
 // Task 4.2.2 (FrameNavigatedGuard): a top-level in-session navigation to a
 // blocked (private/loopback) host must set `session.blocked` to the exact
 // Error-5 recoverable-block wording, byte-identical to native's Task 3.4.2 so

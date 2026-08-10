@@ -830,3 +830,56 @@ async fn ux_ac1_agent_should_complete_navigate_type_type_click_snapshot_using_on
         .await
         .expect("shutdown call should succeed");
 }
+
+/// `MAX_OPEN_SESSIONS` (`crates/native/src/browser.rs`) caps concurrently
+/// open sessions at 20 as a DoS guard. Not exported from that crate (it's a
+/// private `const`), so the limit is duplicated here as a plain literal —
+/// keep it in sync with the source if that constant ever changes.
+const MAX_OPEN_SESSIONS_UNDER_TEST: usize = 20;
+
+/// Drives `stapler_browser_navigate` with no `sessionId` (forcing new-session
+/// creation) up to the cap using `data:` URLs (no mock HTTP server needed —
+/// `url::Url::host()` returns `None` for `data:` URLs, so they skip the SSRF
+/// pre-flight check entirely and don't need `STAPLER_MCP_ALLOW_PRIVATE_NETWORKS`).
+/// The next call past the cap must be rejected with the documented
+/// "too many open browser sessions" error rather than silently overshooting
+/// it — the scenario Item 3's `NewSessionSlotGuard` fix closes.
+#[tokio::test]
+#[ignore]
+async fn navigate_should_reject_new_session_when_max_open_sessions_reached() {
+    let (_tmp, socket, sock_path) = start_daemon(false).await;
+
+    for i in 0..MAX_OPEN_SESSIONS_UNDER_TEST {
+        let page = format!("data:text/html,<html><body>session {i}</body></html>");
+        client::call(
+            &socket,
+            &sock_path,
+            "stapler_browser_navigate",
+            Some(json!({ "url": page })),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("navigate #{i} (within the cap) should succeed, got: {e}"));
+    }
+
+    let one_too_many = "data:text/html,<html><body>one too many</body></html>";
+    let result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_navigate",
+        Some(json!({ "url": one_too_many })),
+        Duration::from_secs(30),
+    )
+    .await;
+    let err = result.expect_err(
+        "navigate past MAX_OPEN_SESSIONS with no sessionId should be rejected, not silently overshoot the cap",
+    );
+    assert!(
+        err.to_string().contains("too many open browser sessions"),
+        "expected the documented cap-exceeded wording, got: {err}"
+    );
+
+    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
+        .await
+        .expect("shutdown call should succeed");
+}

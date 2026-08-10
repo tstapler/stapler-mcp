@@ -168,6 +168,81 @@ function isBlockedIpv4(a, b) {
     return false;
 }
 
+// Parses a bracket-stripped, zone-id-stripped IPv6 literal into its 8
+// uint16 hextets — the JS equivalent of Rust's `Ipv6Addr::segments()`.
+// Handles `::` compression and a trailing embedded IPv4 dotted-quad group
+// (RFC 4291 §2.2 form 3, e.g. "::ffff:1.2.3.4" or the deprecated
+// "::1.2.3.4"). Returns null if `host` isn't a well-formed IPv6 literal.
+//
+// This exists so `isBlockedHost` can replicate `webcrawl.rs`'s
+// `is_blocked_ipv6` bitmask/`to_ipv4()` checks exactly, rather than
+// pattern-matching Node's normalized hostname string — that string's shape
+// depends on the literal's original form (e.g. `new
+// URL('http://[::169.254.169.254]/').hostname` normalizes to `"::a9fe:a9fe"`,
+// not `"::169.254.169.254"`), which made regex matching perpetually one
+// shape behind and let legacy IPv4-compatible literals and the wider
+// fe80::/10 range bypass the guard entirely.
+function parseIpv6Hextets(host) {
+    // Peel off a trailing embedded IPv4 dotted-quad and rewrite it as the
+    // two hex hextets it's equivalent to, then parse the rest normally.
+    const ipv4Tail = host.match(/(^|:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+    if (ipv4Tail) {
+        const octets = ipv4Tail[2].split(".").map(Number);
+        if (octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) {
+            return null;
+        }
+        const hi = ((octets[0] << 8) | octets[1]).toString(16);
+        const lo = ((octets[2] << 8) | octets[3]).toString(16);
+        host = host.slice(0, host.length - ipv4Tail[2].length) + hi + ":" + lo;
+    }
+
+    let compressed = false;
+    let head = host;
+    let tail = "";
+    const compressIdx = host.indexOf("::");
+    if (compressIdx !== -1) {
+        compressed = true;
+        head = host.slice(0, compressIdx);
+        tail = host.slice(compressIdx + 2);
+        if (tail.includes("::")) {
+            return null; // "::" may appear at most once
+        }
+    }
+    const headGroups = head.length ? head.split(":") : [];
+    const tailGroups = tail.length ? tail.split(":") : [];
+    if (!compressed && headGroups.length !== 8) {
+        return null;
+    }
+    if (compressed && headGroups.length + tailGroups.length > 7) {
+        return null;
+    }
+
+    const parseGroup = (g) => (/^[0-9a-f]{1,4}$/.test(g) ? Number.parseInt(g, 16) : null);
+    const headNums = headGroups.map(parseGroup);
+    const tailNums = tailGroups.map(parseGroup);
+    if (headNums.some((n) => n === null) || tailNums.some((n) => n === null)) {
+        return null;
+    }
+    if (!compressed) {
+        return headNums;
+    }
+    const missing = 8 - headNums.length - tailNums.length;
+    return [...headNums, ...new Array(missing).fill(0), ...tailNums];
+}
+
+// Mirrors Rust's `Ipv6Addr::to_ipv4()` exactly:
+// `if let [0, 0, 0, 0, 0, 0 | 0xffff, ab, cd] = self.segments()` — this is
+// deliberately the more permissive unwrap (vs. `to_ipv4_mapped()`) since it
+// also catches the deprecated IPv4-compatible `::a.b.c.d` form, which is
+// the shape `webcrawl.rs`'s canonical `is_blocked_ipv6` relies on to block
+// literals like `::169.254.169.254`.
+function embeddedIpv4FromHextets(h) {
+    if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && (h[5] === 0 || h[5] === 0xffff)) {
+        return [h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff];
+    }
+    return null;
+}
+
 function isBlockedHost(hostname) {
     if (process.env.STAPLER_MCP_ALLOW_PRIVATE_NETWORKS === "1") {
         return false;
@@ -182,29 +257,29 @@ function isBlockedHost(hostname) {
     if (v4) {
         return isBlockedIpv4(Number(v4[1]), Number(v4[2]));
     }
-    if (host === "::1" || host === "::") {
-        return true; // loopback / unspecified
+    if (!host.includes(":")) {
+        return false; // not an IPv4 literal and not IPv6 — e.g. a public hostname
     }
-    if (host.startsWith("fe80:")) {
-        return true; // link-local
+    const hextets = parseIpv6Hextets(host);
+    if (!hextets) {
+        return false; // unparseable literal — not this guard's problem
     }
-    if (host.startsWith("fc") || host.startsWith("fd")) {
-        return true; // unique-local, fc00::/7
+    if (hextets.every((x) => x === 0)) {
+        return true; // unspecified ::
     }
-    // IPv4-mapped IPv6 — mirrors native's `Ipv6Addr::to_ipv4_mapped()`
-    // unwrapping in `blocked_host_reason`. Node's URL parser always
-    // normalizes these to compressed hex-hextet form (e.g. "::ffff:a9fe:a9fe"
-    // for 169.254.169.254), never dotted-quad, so match that shape.
-    const v4MappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-    if (v4MappedHex) {
-        const hi = Number.parseInt(v4MappedHex[1], 16);
-        return isBlockedIpv4((hi >> 8) & 0xff, hi & 0xff);
+    if (hextets.slice(0, 7).every((x) => x === 0) && hextets[7] === 1) {
+        return true; // loopback ::1
     }
-    // Dotted-quad form (::ffff:a.b.c.d or ::a.b.c.d) for callers that
-    // construct the hostname string directly rather than via `URL`.
-    const v4MappedDotted = host.match(/^::(?:ffff:)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (v4MappedDotted) {
-        return isBlockedIpv4(Number(v4MappedDotted[1]), Number(v4MappedDotted[2]));
+    const seg0 = hextets[0];
+    if ((seg0 & 0xfe00) === 0xfc00) {
+        return true; // unique-local fc00::/7
+    }
+    if ((seg0 & 0xffc0) === 0xfe80) {
+        return true; // link-local fe80::/10 (0xfe80-0xfebf), not just the "fe80:" literal prefix
+    }
+    const ipv4 = embeddedIpv4FromHextets(hextets);
+    if (ipv4) {
+        return isBlockedIpv4(ipv4[0], ipv4[1]);
     }
     return false;
 }

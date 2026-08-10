@@ -267,9 +267,41 @@ pub struct NativeBrowser {
     browser: Browser,
     sessions: Rc<RefCell<HashMap<String, BrowserSession>>>,
     next_id: Cell<u64>,
+    /// Reservations for new sessions that have passed the `MAX_OPEN_SESSIONS`
+    /// check but not yet been inserted into `sessions` — see
+    /// `NewSessionSlotGuard`. Without this, concurrent no-`session_id`
+    /// `navigate()` calls could all observe `sessions.len() < MAX_OPEN_SESSIONS`
+    /// before any of them reaches its own `.insert`, overshooting the cap.
+    pending_new_sessions: Cell<usize>,
     /// `pub` so `crates/cli/src/main.rs`'s shutdown sequence can
     /// `take()`/`abort()` it before `close()`ing the browser (Story 2.4).
     pub reaper: RefCell<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// RAII reservation for the `MAX_OPEN_SESSIONS` cap: `navigate()`'s no-`session_id`
+/// branch increments `pending_new_sessions` synchronously (no `.await` between
+/// the check and this guard's construction), then this guard decrements it on
+/// drop — success, early return via `?`, or panic all release the slot exactly
+/// once. This closes the race where the check (`sessions.len() >= MAX_OPEN_SESSIONS`)
+/// and the eventual `sessions.insert(..)` are separated by several `.await`
+/// points (page creation, `goto`, navigation wait, AX capture): without a
+/// synchronous reservation, concurrent callers could all pass the check at the
+/// limit and overshoot it before any of them inserts.
+struct NewSessionSlotGuard<'a> {
+    pending: &'a Cell<usize>,
+}
+
+impl<'a> NewSessionSlotGuard<'a> {
+    fn reserve(pending: &'a Cell<usize>) -> Self {
+        pending.set(pending.get() + 1);
+        Self { pending }
+    }
+}
+
+impl Drop for NewSessionSlotGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.set(self.pending.get().saturating_sub(1));
+    }
 }
 
 impl NativeBrowser {
@@ -313,6 +345,7 @@ impl NativeBrowser {
             browser,
             sessions,
             next_id: Cell::new(0),
+            pending_new_sessions: Cell::new(0),
             reaper: RefCell::new(Some(reaper)),
         })
     }
@@ -740,12 +773,23 @@ impl BrowserDriver for NativeBrowser {
                 None => {
                     // DoS guard: without this cap a caller can spawn tabs
                     // faster than the 300s idle reaper reclaims them,
-                    // exhausting the underlying Chromium process.
-                    if self.sessions.borrow().len() >= MAX_OPEN_SESSIONS {
+                    // exhausting the underlying Chromium process. The check
+                    // includes in-flight reservations (not just what's
+                    // already inserted) so concurrent callers can't all pass
+                    // it simultaneously and overshoot the cap — see
+                    // `NewSessionSlotGuard`.
+                    if self.sessions.borrow().len() + self.pending_new_sessions.get()
+                        >= MAX_OPEN_SESSIONS
+                    {
                         return Err(PortError::Other(format!(
                             "too many open browser sessions (limit {MAX_OPEN_SESSIONS}); close an existing session or wait for idle ones to be reclaimed"
                         )));
                     }
+                    // Reserved synchronously, before any `.await` below —
+                    // released automatically (on success, early `?` return,
+                    // or panic) when this guard drops at the end of this
+                    // match arm.
+                    let _new_session_slot = NewSessionSlotGuard::reserve(&self.pending_new_sessions);
 
                     let id = self.new_session_id();
                     // Created blank (never `new_page(url)`): `new_page` starts
@@ -1685,6 +1729,37 @@ mod tests {
             NetworkPolicy::Enforce,
         );
         assert!(msg.is_none());
+    }
+
+    /// `poll_blocked_grace_period` is a pure function over `Rc<RefCell<Option<String>>>`
+    /// with no `Page`/CDP dependency, so — unlike the rest of this same-call-redirect
+    /// race — it's exercisable fast and offline, without a real Chromium binary.
+    /// This is the native-side counterpart of wasm's
+    /// `npm/test/browser_glue.test.js` fake-`page.goto`/`setTimeout(...,5)`
+    /// tests: it proves the *polling* (not in-band ordering with `goto`/
+    /// `wait_for_navigation`) is what catches a `Page.frameNavigated` listener
+    /// setting `blocked` a few milliseconds after `navigate`'s driver calls
+    /// would otherwise have already returned.
+    #[tokio::test]
+    async fn poll_blocked_grace_period_should_observe_flag_set_shortly_after_polling_starts() {
+        let blocked: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let setter_blocked = blocked.clone();
+
+        // Races the poll against a delayed mutation — analogous to the
+        // wasm test's `setTimeout(..., 5)` firing after the fake driver
+        // call's promise has already resolved.
+        let delayed_set = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            *setter_blocked.borrow_mut() = Some("blocked-host".to_string());
+        };
+
+        let (reason, ()) = tokio::join!(poll_blocked_grace_period(&blocked), delayed_set);
+
+        assert_eq!(
+            reason,
+            Some("blocked-host".to_string()),
+            "the 20ms-step poll (up to 200ms) must observe a flag set 5ms after polling started"
+        );
     }
 
     // ---- Epic 3, Story 3.3: click/type_text dispatch outcome shape ----
