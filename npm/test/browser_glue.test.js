@@ -374,3 +374,214 @@ test("jsBrowserNavigate_should_clear_blocked_flag_when_reused_session_navigates_
 
     browserGlue.sessions.delete(id);
 });
+
+// ---------------------------------------------------------------------------
+// BLOCKER fix (finding #1): `jsBrowserNavigate`'s own navigation must be
+// checked against `session.blocked` before returning a snapshot — a
+// same-call redirect to a blocked host (e.g. the cloud metadata service)
+// must never leak a snapshot. `session.blocked` is set asynchronously by the
+// `framenavigated` listener, so this also exercises the grace-period poll
+// (finding #2) that gives that listener a chance to run before the check.
+
+test("jsBrowserNavigate_should_reject_and_not_return_snapshot_when_navigate_itself_redirects_to_blocked_host", async () => {
+    const { chromium } = require("playwright-core");
+    const originalLaunch = chromium.launch;
+    let framenavigatedHandler;
+    const fakePage = {
+        on: (event, cb) => {
+            if (event === "framenavigated") {
+                framenavigatedHandler = cb;
+            }
+        },
+        goto: async () => {
+            // Simulate the real timing: Playwright fires `framenavigated`
+            // shortly *after* `goto()`'s own promise resolves, not before —
+            // exactly the race the BLOCKER/CRITICAL fixes close.
+            setTimeout(() => {
+                framenavigatedHandler({
+                    parentFrame: () => undefined,
+                    url: () => "http://169.254.169.254/latest/meta-data/",
+                });
+            }, 5);
+        },
+        url: () => "https://example.com/",
+        ariaSnapshot: async () => '- text "leaked metadata: should never be returned"',
+    };
+    const fakeBrowser = { newPage: async () => fakePage, close: async () => {} };
+    chromium.launch = async () => fakeBrowser;
+
+    try {
+        await assert.rejects(
+            () => browserGlue.jsBrowserNavigate("https://example.com/", "", 5000),
+            (err) => {
+                assert.match(err.message, /blocked host '169\.254\.169\.254'/);
+                return true;
+            },
+        );
+    } finally {
+        await browserGlue.jsCloseBrowser().catch(() => {});
+        chromium.launch = originalLaunch;
+    }
+});
+
+// CRITICAL fix (finding #2): the same grace-period poll must apply to
+// click's post-dispatch blocked check, not just navigate's.
+
+test("jsBrowserClick_should_reject_when_click_triggered_navigation_to_blocked_host_fires_shortly_after_click_resolves", async () => {
+    const id = "sess-click-race-1";
+    let framenavigatedHandler;
+    const session = {
+        page: {
+            on: (event, cb) => {
+                if (event === "framenavigated") {
+                    framenavigatedHandler = cb;
+                }
+            },
+            url: () => "https://example.com/before",
+            locator: () => ({
+                click: async () => {
+                    setTimeout(() => {
+                        framenavigatedHandler({
+                            parentFrame: () => undefined,
+                            url: () => "http://169.254.169.254/latest/meta-data/",
+                        });
+                    }, 5);
+                },
+            }),
+            ariaSnapshot: async () => '- text "leaked metadata: should never be returned"',
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    };
+    browserGlue.wireFrameNavigatedGuard(id, session);
+    browserGlue.sessions.set(id, session);
+
+    try {
+        await assert.rejects(
+            () => browserGlue.jsBrowserClick(id, "e1", 5000),
+            (err) => {
+                assert.match(err.message, /blocked host '169\.254\.169\.254'/);
+                return true;
+            },
+        );
+    } finally {
+        browserGlue.sessions.delete(id);
+    }
+});
+
+// MAJOR fix (finding #3): only a genuine "ref missing" Playwright error gets
+// rewritten into the "ref not found" wording; anything else (e.g. execution
+// context destroyed by a same-click navigation) must pass through unchanged
+// so `WasmBrowser::map_js_error` doesn't misclassify it as `NotFound`.
+
+test("jsBrowserClick_should_not_rewrite_non_missing_ref_errors_into_ref_not_found_wording", async () => {
+    const id = "sess-ctx-destroyed-1";
+    const lowLevelError = new Error("Execution context was destroyed, most likely because of a navigation");
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/before",
+            locator: () => ({
+                click: async () => {
+                    throw lowLevelError;
+                },
+            }),
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserClick(id, "e1", 5000),
+        (err) => {
+            assert.strictEqual(err, lowLevelError);
+            assert.doesNotMatch(err.message, /not found or no longer attached/);
+            return true;
+        },
+    );
+
+    browserGlue.sessions.delete(id);
+});
+
+// ---------------------------------------------------------------------------
+// MAJOR fix (finding #5): snapshots must be capped at `MAX_SNAPSHOT_NODES`
+// nodes, with `truncated` reflecting whether the cap was actually hit —
+// previously unbounded, with `truncated` hardcoded to `false`.
+
+test("capSnapshotNodes_should_cap_total_nodes_and_report_truncated_when_tree_exceeds_max", () => {
+    const root = { role: "generic", name: "", ref: "root", children: [] };
+    for (let i = 0; i < browserGlue.MAX_SNAPSHOT_NODES + 50; i++) {
+        root.children.push({ role: "button", name: `n${i}`, ref: `e${i}`, children: [] });
+    }
+
+    const truncated = browserGlue.capSnapshotNodes(root, browserGlue.MAX_SNAPSHOT_NODES);
+
+    assert.strictEqual(truncated, true);
+    // The root itself counts against the cap, so only MAX - 1 children survive.
+    assert.strictEqual(root.children.length, browserGlue.MAX_SNAPSHOT_NODES - 1);
+});
+
+test("capSnapshotNodes_should_report_not_truncated_when_tree_is_within_cap", () => {
+    const root = {
+        role: "generic",
+        name: "",
+        ref: "root",
+        children: [{ role: "button", name: "ok", ref: "e1", children: [] }],
+    };
+
+    const truncated = browserGlue.capSnapshotNodes(root, browserGlue.MAX_SNAPSHOT_NODES);
+
+    assert.strictEqual(truncated, false);
+    assert.strictEqual(root.children.length, 1);
+});
+
+test("jsBrowserSnapshot_should_set_truncated_true_when_aria_snapshot_exceeds_node_cap", async () => {
+    const id = "sess-snapshot-cap-1";
+    const lines = [];
+    for (let i = 0; i < browserGlue.MAX_SNAPSHOT_NODES + 10; i++) {
+        lines.push(`- button "n${i}" [ref=e${i}]`);
+    }
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => lines.join("\n"),
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.truncated, true);
+    assert.strictEqual(snapshot.root.children.length, browserGlue.MAX_SNAPSHOT_NODES - 1);
+
+    browserGlue.sessions.delete(id);
+});
+
+// ---------------------------------------------------------------------------
+// MAJOR fix (finding #6): a hard cap on concurrently open sessions — without
+// one, a caller could spawn unbounded tabs/pages before the idle reaper ever
+// fires.
+
+test("jsBrowserNavigate_should_reject_new_session_when_max_sessions_reached", async () => {
+    const filler = [];
+    for (let i = 0; i < browserGlue.MAX_SESSIONS; i++) {
+        const id = `sess-cap-fill-${i}`;
+        browserGlue.sessions.set(id, {
+            page: { close: async () => {} },
+            lastUsed: Date.now(),
+            blocked: undefined,
+        });
+        filler.push(id);
+    }
+
+    try {
+        await assert.rejects(
+            () => browserGlue.jsBrowserNavigate("https://example.com/", "", 5000),
+            /too many open browser sessions/,
+        );
+    } finally {
+        for (const id of filler) {
+            browserGlue.sessions.delete(id);
+        }
+    }
+});

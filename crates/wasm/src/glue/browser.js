@@ -70,6 +70,16 @@ module.exports.SESSION_IDLE_TIMEOUT_MS = SESSION_IDLE_TIMEOUT_MS;
 // the real 30s timer.
 function reapIdleSessions() {
     for (const [id, s] of sessions) {
+        // A session with an in-flight (or queued) call must not be closed
+        // out from under it — mirrors the native adapter's per-session-lock
+        // fix for the same TOCTOU. `runSerialized` (below) increments
+        // `s.busy` for the duration of every call against this session, so
+        // skipping here just defers the reap until the next 30s scan, by
+        // which point `lastUsed` will have been bumped past the idle window
+        // anyway if the session is still being used.
+        if (s.busy) {
+            continue;
+        }
         if (Date.now() - s.lastUsed > SESSION_IDLE_TIMEOUT_MS) {
             // Best-effort close — a rejected close (e.g. the tab already
             // crashed/closed itself) must not become an unhandled rejection.
@@ -79,6 +89,56 @@ function reapIdleSessions() {
     }
 }
 module.exports.reapIdleSessions = reapIdleSessions;
+
+// Hard cap on concurrently open sessions/tabs, mirroring the native
+// adapter's equivalent limit — without one, a caller can spawn unbounded
+// pages/tabs before the 300s idle reaper ever fires (MAJOR/DoS finding).
+const MAX_SESSIONS = 50;
+module.exports.MAX_SESSIONS = MAX_SESSIONS;
+
+// Per-session in-flight-call serialization (MAJOR/concurrency finding):
+// without this, `reapIdleSessions` can `page.close()` a session whose own
+// call is still running, and two concurrent calls against the same
+// `sessionId` can interleave unsynchronized awaits against the same
+// Playwright `Page`. `session.queue` is a promise chain — each call appends
+// itself and only starts once every previously-queued call on this session
+// has settled; `session.busy` is a simple in-flight counter the reaper
+// checks above.
+function runSerialized(session, fn) {
+    session.busy = (session.busy || 0) + 1;
+    const prior = session.queue || Promise.resolve();
+    const result = prior.then(fn, fn);
+    // Swallow here so a failed call doesn't poison the chain for the next
+    // queued caller — the real rejection still propagates via `result`.
+    session.queue = result.then(
+        () => {},
+        () => {},
+    );
+    return result.finally(() => {
+        session.busy -= 1;
+    });
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// SSRF grace-period poll (BLOCKER/CRITICAL findings): `session.blocked` is
+// set asynchronously by the `framenavigated` listener wired in
+// `wireFrameNavigatedGuard`, so checking it immediately after an awaited
+// navigate/click/fill can race the listener and miss a same-call
+// navigation to a blocked host (e.g. the metadata service). Mirrors the
+// native adapter's `dispatch_action` poll added in commit de6ce2e: up to
+// 200ms total, in 20ms steps, returning as soon as `blocked` is observed.
+async function waitForBlockedGracePeriod(session) {
+    let waited = 0;
+    const step = 20;
+    while (!session.blocked && waited < 200) {
+        await sleep(step);
+        waited += step;
+    }
+}
+module.exports.waitForBlockedGracePeriod = waitForBlockedGracePeriod;
 
 // Guarded module-level singleton, matching the existing lazy `browserPromise`
 // pattern — the interval is only ever created once per process.
@@ -287,11 +347,74 @@ function parseAriaSnapshot(text) {
 }
 module.exports.parseAriaSnapshot = parseAriaSnapshot;
 
+// Mirrors native's `MAX_SNAPSHOT_NODES` (`crates/native/src/ax.rs`) —
+// without a cap, a caller can trigger an unbounded-size snapshot walk
+// (MAJOR/DoS finding) and there was never a way for a wasm-adapter caller
+// to detect truncation (`truncated` was hardcoded `false`).
+const MAX_SNAPSHOT_NODES = 500;
+module.exports.MAX_SNAPSHOT_NODES = MAX_SNAPSHOT_NODES;
+
+// Walks the tree `parseAriaSnapshot` already built and prunes it down to at
+// most `maxNodes` total nodes (root inclusive), in the same pre-order the
+// tree was constructed in. Mutates `children` arrays in place. Returns
+// whether any node was dropped, so callers can set `truncated` accurately
+// instead of hardcoding it.
+function capSnapshotNodes(root, maxNodes) {
+    let count = 1; // the root itself counts against the cap
+    let truncated = false;
+    function visit(node) {
+        const kept = [];
+        for (const child of node.children) {
+            if (count >= maxNodes) {
+                truncated = true;
+                break;
+            }
+            count += 1;
+            kept.push(child);
+            visit(child);
+        }
+        node.children = kept;
+    }
+    visit(root);
+    return truncated;
+}
+module.exports.capSnapshotNodes = capSnapshotNodes;
+
 async function captureSnapshot(page) {
     const text = await page.ariaSnapshot();
     const root = parseAriaSnapshot(text);
-    return { root, url: page.url(), truncated: false };
+    const truncated = capSnapshotNodes(root, MAX_SNAPSHOT_NODES);
+    return { root, url: page.url(), truncated };
 }
+
+// Distinguishes a Playwright error that actually indicates the resolved
+// `ref` is missing/detached/never-became-actionable from any other error
+// (e.g. "execution context was destroyed" from a same-click navigation, or
+// an unrelated dispatch failure) — MAJOR/correctness finding. Only the
+// former should be rewritten into the "ref not found" wording; rewriting
+// unconditionally causes `WasmBrowser::map_js_error`
+// (`crates/wasm/src/browser.rs`) to misclassify a real
+// navigation-in-progress as `PortError::NotFound` and send callers into an
+// incorrect retry loop.
+const MISSING_REF_ERROR_RE =
+    /not attached to the dom|element is not attached|failed to find element|no node found for selector|waiting for (?:locator|selector)|resolved to hidden|strict mode violation|timeout \d+ms exceeded/i;
+
+function isMissingRefError(message) {
+    return MISSING_REF_ERROR_RE.test(message);
+}
+module.exports.isMissingRefError = isMissingRefError;
+
+// Shared catch-block behavior for `jsBrowserClick`/`jsBrowserType`: rewrite
+// only genuine "ref missing" errors into the actionable wording; let
+// anything else (e.g. a same-action navigation tearing down the execution
+// context) pass through unchanged so it isn't misclassified downstream.
+function describeActionError(refId, e) {
+    if (isMissingRefError(e.message)) {
+        return new Error(`ref '${refId}' not found or no longer attached: ${e.message}`);
+    }
+    return e;
+}
+module.exports.describeActionError = describeActionError;
 
 module.exports.jsBrowserNavigate = async function (url, sessionId, timeoutMs) {
     let id = sessionId;
@@ -310,6 +433,11 @@ module.exports.jsBrowserNavigate = async function (url, sessionId, timeoutMs) {
         // (Task 4.2.2's clear-on-re-navigate fix).
         session.blocked = undefined;
     } else {
+        if (sessions.size >= MAX_SESSIONS) {
+            throw new Error(
+                `too many open browser sessions (limit ${MAX_SESSIONS}); close an existing session or wait for the idle reaper`,
+            );
+        }
         const browser = await getBrowser();
         const page = await browser.newPage();
         id = newSessionId();
@@ -320,49 +448,70 @@ module.exports.jsBrowserNavigate = async function (url, sessionId, timeoutMs) {
         ensureReaper();
     }
     session.lastUsed = Date.now();
-    await session.page.goto(url, { timeout: timeoutMs, waitUntil: "load" });
-    const snapshot = await captureSnapshot(session.page);
-    return { sessionId: id, finalUrl: session.page.url(), snapshot };
+    return runSerialized(session, async () => {
+        await session.page.goto(url, { timeout: timeoutMs, waitUntil: "load" });
+        // BLOCKER fix: navigate() itself must not skip the same SSRF check
+        // click/type/snapshot already perform — a redirect (server- or
+        // in-page) during this same `goto` to a blocked host (e.g. the
+        // cloud metadata service) would otherwise leak a full snapshot
+        // before the block is ever surfaced. `session.blocked` is set
+        // asynchronously by the `framenavigated` listener, hence the grace
+        // poll before checking it.
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        const snapshot = await captureSnapshot(session.page);
+        return { sessionId: id, finalUrl: session.page.url(), snapshot };
+    });
 };
 
 module.exports.jsBrowserClick = async function (sessionId, refId, timeoutMs) {
     const session = requireLiveSession(sessionId);
-    const urlBefore = session.page.url();
-    const locator = session.page.locator(`aria-ref=${refId}`);
-    try {
-        await locator.click({ timeout: timeoutMs });
-    } catch (e) {
-        throw new Error(`ref '${refId}' not found or no longer attached: ${e.message}`);
-    }
-    checkBlocked(session);
-    const snapshot = await captureSnapshot(session.page);
-    const urlAfter = session.page.url();
-    if (urlAfter !== urlBefore) {
-        snapshot.navigatedFrom = urlBefore;
-    }
-    return snapshot;
+    return runSerialized(session, async () => {
+        const urlBefore = session.page.url();
+        const locator = session.page.locator(`aria-ref=${refId}`);
+        try {
+            await locator.click({ timeout: timeoutMs });
+        } catch (e) {
+            throw describeActionError(refId, e);
+        }
+        // CRITICAL/SSRF-race fix: give the async `framenavigated` listener a
+        // grace period to observe a click-triggered navigation to a blocked
+        // host before trusting `session.blocked`.
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        const snapshot = await captureSnapshot(session.page);
+        const urlAfter = session.page.url();
+        if (urlAfter !== urlBefore) {
+            snapshot.navigatedFrom = urlBefore;
+        }
+        return snapshot;
+    });
 };
 
 module.exports.jsBrowserType = async function (sessionId, refId, text, timeoutMs) {
     const session = requireLiveSession(sessionId);
-    const urlBefore = session.page.url();
-    const locator = session.page.locator(`aria-ref=${refId}`);
-    try {
-        await locator.fill(text, { timeout: timeoutMs });
-    } catch (e) {
-        throw new Error(`ref '${refId}' not found or no longer attached: ${e.message}`);
-    }
-    checkBlocked(session);
-    const snapshot = await captureSnapshot(session.page);
-    const urlAfter = session.page.url();
-    if (urlAfter !== urlBefore) {
-        snapshot.navigatedFrom = urlBefore;
-    }
-    return snapshot;
+    return runSerialized(session, async () => {
+        const urlBefore = session.page.url();
+        const locator = session.page.locator(`aria-ref=${refId}`);
+        try {
+            await locator.fill(text, { timeout: timeoutMs });
+        } catch (e) {
+            throw describeActionError(refId, e);
+        }
+        // Same SSRF-race fix as `jsBrowserClick` above.
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        const snapshot = await captureSnapshot(session.page);
+        const urlAfter = session.page.url();
+        if (urlAfter !== urlBefore) {
+            snapshot.navigatedFrom = urlBefore;
+        }
+        return snapshot;
+    });
 };
 
 module.exports.jsBrowserSnapshot = async function (sessionId, timeoutMs) {
     const session = requireLiveSession(sessionId);
     void timeoutMs; // snapshot itself has nothing to time out on; kept for a uniform signature
-    return captureSnapshot(session.page);
+    return runSerialized(session, () => captureSnapshot(session.page));
 };
