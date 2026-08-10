@@ -171,7 +171,10 @@ pub fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
         url::Host::Ipv6(ip) if is_blocked_ipv6(ip) => {
             Some(format!("{ip} is a loopback/private/link-local address"))
         }
-        url::Host::Domain(d) if d.eq_ignore_ascii_case("localhost") || d.to_ascii_lowercase().ends_with(".localhost") => {
+        url::Host::Domain(d)
+            if d.eq_ignore_ascii_case("localhost")
+                || d.to_ascii_lowercase().ends_with(".localhost") =>
+        {
             Some(format!("{d} is a loopback hostname"))
         }
         _ => None,

@@ -162,7 +162,9 @@ fn tree_contains_name(node: &Value, needle: &str) -> bool {
 /// Returns the still-live `TempDir` (drop order matters: it must outlive the
 /// daemon subprocess using it as `STAPLER_MCP_HOME`, so the caller must hold
 /// it for the rest of the test) plus what every `client::call` needs.
-async fn start_daemon(allow_private_networks: bool) -> (tempfile::TempDir, NativeSocketFactory, String) {
+async fn start_daemon(
+    allow_private_networks: bool,
+) -> (tempfile::TempDir, NativeSocketFactory, String) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().to_string_lossy().to_string();
     std::env::set_var("STAPLER_MCP_HOME", &home);
@@ -365,9 +367,15 @@ async fn stapler_browser_navigate_should_return_nonempty_session_id_over_real_da
     );
 
     let _ = shutdown_site.send(());
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }
 
 /// REQ-1b integration (validation.md, Task 3.3.1 AC): real mock page with
@@ -414,9 +422,15 @@ async fn click_should_show_clicked_text_when_button_clicked_on_real_page() {
     );
 
     let _ = shutdown_site.send(());
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }
 
 /// REQ-1c integration (validation.md, Task 3.3.2 AC): type into
@@ -478,9 +492,15 @@ async fn type_text_should_reflect_typed_value_in_accessible_value_when_real_inpu
     );
 
     let _ = shutdown_site.send(());
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }
 
 /// REQ-2 integration (validation.md, Task 3.2.1 AC): "exercises the
@@ -524,9 +544,15 @@ async fn navigate_should_return_nonempty_snapshot_when_axtree_built_lazily_on_re
         .expect("sessionId present")
         .to_string();
     let _ = shutdown_site.send(());
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
     let _ = session_id; // kept only for readability of the call sequence above
 }
 
@@ -558,11 +584,19 @@ async fn shutdown_should_abort_reaper_before_browser_close_when_session_open() {
     )
     .await
     .expect("browser_navigate should succeed");
-    assert!(navigate_result["sessionId"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(navigate_result["sessionId"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
 
     let shutdown = tokio::time::timeout(
         Duration::from_secs(15),
-        client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(10)),
+        client::call(
+            &socket,
+            &sock_path,
+            "shutdown",
+            None,
+            Duration::from_secs(10),
+        ),
     )
     .await;
 
@@ -628,7 +662,8 @@ async fn navigate_should_clear_blocked_flag_when_renavigating_previously_blocked
         Duration::from_secs(30),
     )
     .await;
-    let blocked_seen_on_click = matches!(&click_result, Err(e) if e.to_string().contains("blocked"));
+    let blocked_seen_on_click =
+        matches!(&click_result, Err(e) if e.to_string().contains("blocked"));
 
     if !blocked_seen_on_click {
         let snapshot_result = client::call(
@@ -660,7 +695,10 @@ async fn navigate_should_clear_blocked_flag_when_renavigating_previously_blocked
     )
     .await
     .expect("re-navigating a blocked session to a safe URL should succeed and clear the flag");
-    assert_eq!(recovery_result["sessionId"].as_str(), Some(session_id.as_str()));
+    assert_eq!(
+        recovery_result["sessionId"].as_str(),
+        Some(session_id.as_str())
+    );
 
     // Confirm the flag is really cleared: a follow-up snapshot on the same
     // session must succeed, not repeat the stale "blocked" error.
@@ -674,9 +712,15 @@ async fn navigate_should_clear_blocked_flag_when_renavigating_previously_blocked
     .await
     .expect("snapshot after recovery should succeed, confirming the blocked flag was cleared");
 
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }
 
 /// BLOCKER regression test: `navigate()` itself must catch a redirect chained
@@ -722,9 +766,15 @@ async fn navigate_should_itself_catch_a_same_call_redirect_to_a_blocked_host() {
         "expected a 'blocked' error naming the redirect, got: {err}"
     );
 
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }
 
 /// UX AC1 (design/ux.md, validation.md's UX table): call `navigate`; take
@@ -736,8 +786,7 @@ async fn navigate_should_itself_catch_a_same_call_redirect_to_a_blocked_host() {
 /// about) — confirming no step needs a value absent from a prior response.
 #[tokio::test]
 #[ignore]
-async fn ux_ac1_agent_should_complete_navigate_type_type_click_snapshot_using_only_response_refs()
-{
+async fn ux_ac1_agent_should_complete_navigate_type_type_click_snapshot_using_only_response_refs() {
     let (_tmp, socket, sock_path) = start_daemon(true).await;
     let (site_url, shutdown_site) = spawn_mock_site().await;
 
@@ -826,9 +875,15 @@ async fn ux_ac1_agent_should_complete_navigate_type_type_click_snapshot_using_on
     );
 
     let _ = shutdown_site.send(());
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }
 
 /// `MAX_OPEN_SESSIONS` (`crates/native/src/browser.rs`) caps concurrently
@@ -888,9 +943,15 @@ async fn navigate_should_reject_new_session_when_max_open_sessions_reached() {
         "expected the documented cap-exceeded wording, got: {err}"
     );
 
-    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
-        .await
-        .expect("shutdown call should succeed");
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }
 
 /// Actually exercises the check-then-insert race `NewSessionSlotGuard`

@@ -350,9 +350,13 @@ mod tests {
             snapshot: sample_snapshot("https://example.com/", None),
         }));
 
-        let output = browser_navigate(&driver, navigate_input("https://example.com/"), NetworkPolicy::Enforce)
-            .await
-            .expect("navigate should succeed");
+        let output = browser_navigate(
+            &driver,
+            navigate_input("https://example.com/"),
+            NetworkPolicy::Enforce,
+        )
+        .await
+        .expect("navigate should succeed");
 
         assert_eq!(output.session_id, "sess-1");
         assert_eq!(output.final_url, "https://example.com/");
@@ -590,8 +594,8 @@ mod tests {
 
     #[tokio::test]
     async fn browser_type_should_return_action_output_when_type_succeeds() {
-        let driver = FakeBrowserDriver::new()
-            .with_type(Ok(sample_snapshot("https://example.com/", None)));
+        let driver =
+            FakeBrowserDriver::new().with_type(Ok(sample_snapshot("https://example.com/", None)));
 
         let output = browser_type(
             &driver,
@@ -745,8 +749,9 @@ mod tests {
 
     #[tokio::test]
     async fn ux_ac2_session_not_found_error_should_name_session_id_and_corrective_call() {
-        let driver = FakeBrowserDriver::new()
-            .with_snapshot(Err(PortError::NotFound("whatever the driver says".to_string())));
+        let driver = FakeBrowserDriver::new().with_snapshot(Err(PortError::NotFound(
+            "whatever the driver says".to_string(),
+        )));
 
         let err = browser_snapshot(
             &driver,
@@ -758,7 +763,10 @@ mod tests {
         .await
         .expect_err("not-found should surface as an error");
 
-        assert!(err.contains("sess-bogus"), "message should name the session id: {err}");
+        assert!(
+            err.contains("sess-bogus"),
+            "message should name the session id: {err}"
+        );
         assert!(
             err.contains("stapler_browser_navigate"),
             "message should name the corrective call: {err}"
@@ -783,7 +791,9 @@ mod tests {
         .await
         .expect("click should succeed");
 
-        let note = output.note.expect("note should be set when click navigates");
+        let note = output
+            .note
+            .expect("note should be set when click navigates");
         assert!(
             note.contains("https://example.com/dashboard"),
             "note should name the new url: {note}"
@@ -806,8 +816,8 @@ mod tests {
     async fn ux_ac5_every_error_variant_should_name_a_specific_recovery_call_except_ssrf_target_block(
     ) {
         async fn session_not_found_via_snapshot() -> String {
-            let driver =
-                FakeBrowserDriver::new().with_snapshot(Err(PortError::NotFound("sess-1".to_string())));
+            let driver = FakeBrowserDriver::new()
+                .with_snapshot(Err(PortError::NotFound("sess-1".to_string())));
             browser_snapshot(
                 &driver,
                 BrowserSnapshotInput {
@@ -897,7 +907,10 @@ mod tests {
     async fn ux_ac9_successful_response_should_never_contain_top_level_error_key_alongside_note() {
         let success = BrowserActionOutput {
             snapshot: to_snapshot_output(sample_snapshot("https://example.com/", None)),
-            note: Some("click navigated to https://example.com/; previous element refs are now invalid".to_string()),
+            note: Some(
+                "click navigated to https://example.com/; previous element refs are now invalid"
+                    .to_string(),
+            ),
         };
         let json = serde_json::to_value(&success).expect("serialize");
         assert!(json.get("error").is_none());

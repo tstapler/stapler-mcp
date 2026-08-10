@@ -4,8 +4,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use chromiumoxide::cdp::browser_protocol::accessibility::{EnableParams, GetPartialAxTreeParams};
-use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, DescribeNodeParams, ResolveNodeParams};
-use chromiumoxide::cdp::browser_protocol::page::{EventFrameNavigated, EventFrameRequestedNavigation};
+use chromiumoxide::cdp::browser_protocol::dom::{
+    BackendNodeId, DescribeNodeParams, ResolveNodeParams,
+};
+use chromiumoxide::cdp::browser_protocol::page::{
+    EventFrameNavigated, EventFrameRequestedNavigation,
+};
 use chromiumoxide::cdp::browser_protocol::target::EventTargetCrashed;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::{Browser, BrowserConfig, Page};
@@ -335,11 +339,7 @@ impl NativeBrowser {
 
         let sessions: Rc<RefCell<HashMap<String, BrowserSession>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let reaper = spawn_reaper(
-            sessions.clone(),
-            crate::NativeClock,
-            crate::NativeSleeper,
-        );
+        let reaper = spawn_reaper(sessions.clone(), crate::NativeClock, crate::NativeSleeper);
 
         Ok(NativeBrowser {
             browser,
@@ -574,7 +574,11 @@ async fn dispatch_click(page: &Page, backend_node_id: BackendNodeId) -> Result<(
     .await
 }
 
-async fn dispatch_type(page: &Page, backend_node_id: BackendNodeId, text: &str) -> Result<(), PortError> {
+async fn dispatch_type(
+    page: &Page,
+    backend_node_id: BackendNodeId,
+    text: &str,
+) -> Result<(), PortError> {
     invoke_on_node(
         page,
         backend_node_id,
@@ -646,8 +650,7 @@ async fn spawn_session_listeners(
     // Checking the *requested* URL here closes that gap regardless of
     // whether the target is reachable.
     let main_frame_id = page.mainframe().await.ok().flatten();
-    if let Ok(mut requested_events) = page.event_listener::<EventFrameRequestedNavigation>().await
-    {
+    if let Ok(mut requested_events) = page.event_listener::<EventFrameRequestedNavigation>().await {
         let session_id_for_requests = session_id.clone();
         let blocked_for_requests = blocked.clone();
         let main_frame_id = main_frame_id.clone();
@@ -659,11 +662,9 @@ async fn spawn_session_listeners(
                 let policy = NetworkPolicy::from_env(
                     std::env::var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS").ok(),
                 );
-                if let Some(msg) = frame_navigated_blocked_message(
-                    &session_id_for_requests,
-                    &event.url,
-                    policy,
-                ) {
+                if let Some(msg) =
+                    frame_navigated_blocked_message(&session_id_for_requests, &event.url, policy)
+                {
                     *blocked_for_requests.borrow_mut() = Some(msg);
                 }
             }
@@ -789,7 +790,8 @@ impl BrowserDriver for NativeBrowser {
                     // released automatically (on success, early `?` return,
                     // or panic) when this guard drops at the end of this
                     // match arm.
-                    let _new_session_slot = NewSessionSlotGuard::reserve(&self.pending_new_sessions);
+                    let _new_session_slot =
+                        NewSessionSlotGuard::reserve(&self.pending_new_sessions);
 
                     let id = self.new_session_id();
                     // Created blank (never `new_page(url)`): `new_page` starts
@@ -909,7 +911,16 @@ impl BrowserDriver for NativeBrowser {
                 Some(id) => {
                     touch_or_evict(&self.sessions, &id.0, now_millis())?;
 
-                    let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+                    let (
+                        page,
+                        latest_refs,
+                        known_refs,
+                        nav_generation,
+                        next_ref_id,
+                        latest_url,
+                        blocked,
+                        lock,
+                    ) = {
                         let map = self.sessions.borrow();
                         let session = map
                             .get(&id.0)
@@ -1036,7 +1047,16 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+            let (
+                page,
+                latest_refs,
+                known_refs,
+                nav_generation,
+                next_ref_id,
+                latest_url,
+                blocked,
+                lock,
+            ) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
@@ -1107,7 +1127,16 @@ impl NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+            let (
+                page,
+                latest_refs,
+                known_refs,
+                nav_generation,
+                next_ref_id,
+                latest_url,
+                blocked,
+                lock,
+            ) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
@@ -1268,7 +1297,8 @@ mod tests {
         // cares about (`sessions` starts empty) is exercised directly here
         // instead, mirroring the same `Rc<RefCell<HashMap<...>>>` type
         // `launch()` constructs.
-        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> = Rc::new(RefCell::new(HashMap::new()));
+        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         assert_eq!(sessions.borrow().len(), 0);
     }
 
@@ -1292,7 +1322,8 @@ mod tests {
     ) {
         let now = now_millis();
         let idle_since = now - (SESSION_IDLE_TIMEOUT.as_millis() as u64 + 1_000);
-        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> = Rc::new(RefCell::new(HashMap::new()));
+        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         let session = FakeSession::new(idle_since);
         let closed_flag = session.closed.clone();
         sessions.borrow_mut().insert("sess-1".to_string(), session);
@@ -1306,8 +1337,15 @@ mod tests {
         // First poll: does the synchronous removal, then hits `YieldOnce`'s
         // pending state inside `close().await` and returns `Pending`.
         assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
-        assert_eq!(sessions.borrow().len(), 0, "session must be removed from the map before close() resolves");
-        assert!(!closed_flag.get(), "close() must not have finished yet at this point");
+        assert_eq!(
+            sessions.borrow().len(),
+            0,
+            "session must be removed from the map before close() resolves"
+        );
+        assert!(
+            !closed_flag.get(),
+            "close() must not have finished yet at this point"
+        );
 
         // Second poll: `YieldOnce` resolves, `close()` finishes.
         assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(())));
@@ -1317,7 +1355,8 @@ mod tests {
     #[tokio::test]
     async fn reap_expired_should_not_evict_session_when_last_used_within_timeout() {
         let now = now_millis();
-        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> = Rc::new(RefCell::new(HashMap::new()));
+        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         sessions
             .borrow_mut()
             .insert("sess-1".to_string(), FakeSession::new(now - 1_000));
@@ -1332,7 +1371,8 @@ mod tests {
     #[test]
     fn bump_last_used_should_prevent_eviction_when_call_in_flight_during_scan() {
         let t0 = 1_000_000u64;
-        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> = Rc::new(RefCell::new(HashMap::new()));
+        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         sessions
             .borrow_mut()
             .insert("sess-1".to_string(), FakeSession::new(t0 - 400_000));
@@ -1851,7 +1891,10 @@ mod tests {
         let blocked: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let crashed = Rc::new(Cell::new(false));
 
-        assert!(blocked.borrow().is_none(), "snapshot must check this on entry, unmodified here");
+        assert!(
+            blocked.borrow().is_none(),
+            "snapshot must check this on entry, unmodified here"
+        );
 
         let mut refs = HashMap::new();
         refs.insert("ref-1".to_string(), fake_resolved_ref(1, "button"));
@@ -1972,8 +2015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reaped_session_should_surface_not_found_through_browser_navigate_click_and_snapshot()
-    {
+    async fn reaped_session_should_surface_not_found_through_browser_navigate_click_and_snapshot() {
         use stapler_mcp_core::schema::{
             BrowserClickInput, BrowserNavigateInput, BrowserSnapshotInput,
         };
@@ -1982,7 +2024,8 @@ mod tests {
 
         let now = now_millis();
         let idle_since = now - (SESSION_IDLE_TIMEOUT.as_millis() as u64 + 1_000);
-        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> = Rc::new(RefCell::new(HashMap::new()));
+        let sessions: Rc<RefCell<HashMap<String, FakeSession>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         sessions
             .borrow_mut()
             .insert("sess-1".to_string(), FakeSession::new(idle_since));
@@ -1990,7 +2033,11 @@ mod tests {
         // Simulate the reaper's background scan evicting the idle session —
         // the exact same function the real `spawn_reaper` loop calls.
         reap_expired(&sessions, now).await;
-        assert_eq!(sessions.borrow().len(), 0, "reaper should have evicted the idle session");
+        assert_eq!(
+            sessions.borrow().len(),
+            0,
+            "reaper should have evicted the idle session"
+        );
 
         let driver = ReapAwareFakeDriver { sessions };
 

@@ -275,7 +275,10 @@ fn walk_children<'a>(
         // otherwise a node that is still live and unchanged gets a brand-new
         // ref on every single capture, invalidating any ref a caller is
         // still holding from an earlier snapshot in the same navigation.
-        let node_ref = match child.backend_node_id.and_then(|id| previous_by_backend_id.get(&id)) {
+        let node_ref = match child
+            .backend_node_id
+            .and_then(|id| previous_by_backend_id.get(&id))
+        {
             Some(existing) => existing.to_string(),
             None => {
                 let n = next_ref_id.get();
@@ -330,8 +333,7 @@ mod tests {
     // ---- Task 3.1.1 ----
 
     #[test]
-    fn capture_snapshot_should_prune_ignored_node_and_assign_refs_when_axtree_has_hidden_sibling()
-    {
+    fn capture_snapshot_should_prune_ignored_node_and_assign_refs_when_axtree_has_hidden_sibling() {
         let next_ref_id = Cell::new(1);
         let nodes = vec![
             node("1", None, false, None, None),
@@ -339,7 +341,12 @@ mod tests {
             node("3", Some("1"), true, None, None),
         ];
 
-        let capture = build_tree(&nodes, &next_ref_id, "https://example.com".into(), &HashMap::new());
+        let capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
 
         assert_eq!(capture.snapshot.root.children.len(), 1);
         let child = &capture.snapshot.root.children[0];
@@ -356,7 +363,12 @@ mod tests {
             node("1", None, false, None, None),
             node("2", Some("1"), false, Some("button"), Some("Go")),
         ];
-        let first = build_tree(&first_nodes, &next_ref_id, "https://example.com/a".into(), &HashMap::new());
+        let first = build_tree(
+            &first_nodes,
+            &next_ref_id,
+            "https://example.com/a".into(),
+            &HashMap::new(),
+        );
         assert_eq!(first.snapshot.root.children[0].node_ref, "e1");
         assert_eq!(next_ref_id.get(), 2);
 
@@ -365,7 +377,12 @@ mod tests {
             node("10", None, false, None, None),
             node("11", Some("10"), false, Some("link"), Some("Home")),
         ];
-        let second = build_tree(&second_nodes, &next_ref_id, "https://example.com/b".into(), &HashMap::new());
+        let second = build_tree(
+            &second_nodes,
+            &next_ref_id,
+            "https://example.com/b".into(),
+            &HashMap::new(),
+        );
 
         assert_eq!(second.snapshot.root.children[0].node_ref, "e2");
         assert_ne!(second.snapshot.root.children[0].node_ref, "e1");
@@ -387,7 +404,12 @@ mod tests {
             ));
         }
 
-        let capture = build_tree(&nodes, &next_ref_id, "https://example.com".into(), &HashMap::new());
+        let capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
 
         assert!(capture.snapshot.truncated);
         assert_eq!(capture.snapshot.root.children.len(), MAX_SNAPSHOT_NODES);
@@ -407,7 +429,12 @@ mod tests {
             node("2", Some("1"), false, Some("button"), Some("Go")),
         ];
 
-        let capture = build_tree(&nodes, &next_ref_id, "https://example.com".into(), &HashMap::new());
+        let capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
 
         assert_eq!(capture.snapshot.root.children[0].role, "button");
     }
@@ -429,7 +456,12 @@ mod tests {
             node("4", Some("1"), false, Some("button"), Some("Visible")),
         ];
 
-        let capture = build_tree(&nodes, &next_ref_id, "https://example.com".into(), &HashMap::new());
+        let capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
 
         assert_eq!(capture.snapshot.root.children.len(), 1);
         assert_eq!(capture.snapshot.root.children[0].name, "Visible");
@@ -443,7 +475,12 @@ mod tests {
             node("2", Some("1"), false, Some("textbox"), Some("Name")),
         ];
 
-        let capture = build_tree(&nodes, &next_ref_id, "https://example.com".into(), &HashMap::new());
+        let capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
 
         let resolved = capture.refs.get("e1").expect("ref e1 should be resolvable");
         assert_eq!(resolved.role, "textbox");

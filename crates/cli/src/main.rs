@@ -130,9 +130,10 @@ async fn run_daemon() {
     // comment. Read once via `EnvPort` rather than `std::env` directly so
     // it's still exercised through the same seam as everything else in
     // `crates/core`.
-    let network_policy = webcrawl::NetworkPolicy::from_env(
-        stapler_mcp_core::ports::EnvPort::var(&env, "STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"),
-    );
+    let network_policy = webcrawl::NetworkPolicy::from_env(stapler_mcp_core::ports::EnvPort::var(
+        &env,
+        "STAPLER_MCP_ALLOW_PRIVATE_NETWORKS",
+    ));
     daemon.register(
         "read_website",
         json_handler({

@@ -17,11 +17,20 @@ extern "C" {
     fn js_close_browser() -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = jsBrowserNavigate)]
-    fn js_browser_navigate(url: &str, session_id: Option<String>, timeout_ms: f64) -> js_sys::Promise;
+    fn js_browser_navigate(
+        url: &str,
+        session_id: Option<String>,
+        timeout_ms: f64,
+    ) -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsBrowserClick)]
     fn js_browser_click(session_id: &str, ref_id: &str, timeout_ms: f64) -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsBrowserType)]
-    fn js_browser_type(session_id: &str, ref_id: &str, text: &str, timeout_ms: f64) -> js_sys::Promise;
+    fn js_browser_type(
+        session_id: &str,
+        ref_id: &str,
+        text: &str,
+        timeout_ms: f64,
+    ) -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsBrowserSnapshot)]
     fn js_browser_snapshot(session_id: &str, timeout_ms: f64) -> js_sys::Promise;
 }
@@ -112,7 +121,10 @@ fn map_js_error(message: String) -> PortError {
     let lower = message.to_ascii_lowercase();
     if lower.contains("crashed") {
         PortError::SessionCrashed(message)
-    } else if lower.contains("no session") || lower.contains("blocked") || lower.contains("not found") {
+    } else if lower.contains("no session")
+        || lower.contains("blocked")
+        || lower.contains("not found")
+    {
         PortError::NotFound(message)
     } else {
         PortError::Other(message)
@@ -218,9 +230,12 @@ impl BrowserDriver for WasmBrowser {
         session_id: &SessionId,
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError> {
-        let result = JsFuture::from(js_browser_snapshot(&session_id.0, timeout.as_millis() as f64))
-            .await
-            .map_err(js_reject_to_port_error)?;
+        let result = JsFuture::from(js_browser_snapshot(
+            &session_id.0,
+            timeout.as_millis() as f64,
+        ))
+        .await
+        .map_err(js_reject_to_port_error)?;
 
         let parsed: JsAxSnapshot =
             serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))?;
@@ -239,7 +254,8 @@ mod tests {
     /// `stapler_browser_navigate`) applies to the wasm adapter too.
     #[test]
     fn wasm_browser_navigate_should_map_no_session_marker_to_port_error_not_found() {
-        let message = "no session 'sess-9' found; call stapler_browser_navigate to start one".to_string();
+        let message =
+            "no session 'sess-9' found; call stapler_browser_navigate to start one".to_string();
 
         let err = map_js_error(message.clone());
 
