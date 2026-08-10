@@ -25,6 +25,13 @@ use crate::ax;
 /// evicts it from the registry.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Hard cap on concurrently open sessions. Without this, a caller can spawn
+/// unbounded tabs/pages faster than the 300s idle reaper can catch up,
+/// exhausting the underlying browser process (DoS). Mirrors the spirit of
+/// `ax::MAX_SNAPSHOT_NODES` — a generous but finite ceiling, not a tuned
+/// capacity limit.
+const MAX_OPEN_SESSIONS: usize = 20;
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -64,6 +71,15 @@ trait SessionState {
     /// directly by `tests::target_crashed_handler_*` until then.
     #[allow(dead_code)]
     fn set_crashed(&self);
+    /// True while some other in-flight call currently holds this session's
+    /// per-session lock (see `BrowserSession::lock`). `reap_expired` must
+    /// never evict a busy session even if its `last_used` looks stale — the
+    /// in-flight call hasn't reached its own `last_used` bump yet, so a long
+    /// call would otherwise be reaped out from under itself (TOCTOU). Default
+    /// `false` for `FakeSession`, which has no real lock to check.
+    fn is_busy(&self) -> bool {
+        false
+    }
 }
 
 /// Extends `SessionState` with the ability to consume `self` and close the
@@ -122,6 +138,14 @@ struct BrowserSession {
     /// session's page is created (Epic 3, Story 3.2); checked by every
     /// `BrowserDriver` method before use (Story 2.5).
     crashed: Rc<Cell<bool>>,
+    /// Serializes every session-mutating `BrowserDriver` call
+    /// (`navigate`/`click`/`type_text`/`snapshot`) against this session's
+    /// `Page`. Held for the full duration of the call (across all its
+    /// `.await` points), so two concurrent calls against the same
+    /// `sessionId` can never interleave CDP round-trips against a shared
+    /// `Page`/ref maps. Also doubles as the `is_busy()` signal the reaper
+    /// consults so it never evicts a session mid-call.
+    lock: Rc<tokio::sync::Mutex<()>>,
 }
 
 impl SessionState for BrowserSession {
@@ -139,6 +163,10 @@ impl SessionState for BrowserSession {
 
     fn set_crashed(&self) {
         self.crashed.set(true);
+    }
+
+    fn is_busy(&self) -> bool {
+        self.lock.try_lock().is_err()
     }
 }
 
@@ -189,7 +217,10 @@ async fn reap_expired<S: CloseableSession>(sessions: &Rc<RefCell<HashMap<String,
         let mut map = sessions.borrow_mut();
         let expired_ids: Vec<String> = map
             .iter()
-            .filter(|(_, s)| now.saturating_sub(s.last_used()) > SESSION_IDLE_TIMEOUT.as_millis() as u64)
+            .filter(|(_, s)| {
+                !s.is_busy()
+                    && now.saturating_sub(s.last_used()) > SESSION_IDLE_TIMEOUT.as_millis() as u64
+            })
             .map(|(id, _)| id.clone())
             .collect();
         expired_ids
@@ -447,6 +478,7 @@ async fn wait_and_capture(
 async fn invoke_on_node(
     page: &Page,
     backend_node_id: BackendNodeId,
+    action_name: &str,
     js_fn: &str,
     args: Vec<serde_json::Value>,
 ) -> Result<(), PortError> {
@@ -482,22 +514,38 @@ async fn invoke_on_node(
         .await
         .map_err(|e| PortError::Other(e.to_string()))?;
 
+    // Deliberately does not forward `exception.exception.value`/`description`
+    // to the caller: `ExceptionDetails`' debug text is whatever the page's own
+    // script produced (e.g. a thrown error's message can embed
+    // `localStorage`/DOM text the page script had access to), so relaying it
+    // verbatim would be an info leak from the target page to the MCP caller.
+    // Only the fixed action name and the CDP-assigned `exception_id` (an
+    // opaque integer, not page-controlled) are surfaced.
     if let Some(exception) = &response.result.exception_details {
         return Err(PortError::Other(format!(
-            "dispatch raised an exception: {exception:?}"
+            "{action_name} raised an exception on the page (exception id {})",
+            exception.exception_id
         )));
     }
     Ok(())
 }
 
 async fn dispatch_click(page: &Page, backend_node_id: BackendNodeId) -> Result<(), PortError> {
-    invoke_on_node(page, backend_node_id, "function() { this.click(); }", vec![]).await
+    invoke_on_node(
+        page,
+        backend_node_id,
+        "click",
+        "function() { this.click(); }",
+        vec![],
+    )
+    .await
 }
 
 async fn dispatch_type(page: &Page, backend_node_id: BackendNodeId, text: &str) -> Result<(), PortError> {
     invoke_on_node(
         page,
         backend_node_id,
+        "type",
         "function(text) { this.focus(); this.value = text; \
          this.dispatchEvent(new Event('input', {bubbles: true})); \
          this.dispatchEvent(new Event('change', {bubbles: true})); }",
@@ -523,6 +571,23 @@ fn frame_navigated_blocked_message(
     Some(format!(
         "session '{session_id}' navigated to a blocked host '{host}' during the last action; call stapler_browser_navigate with this sessionId and a safe URL to recover it, or start a fresh session"
     ))
+}
+
+/// Polls `blocked` for up to 200ms in 20ms steps, giving the async
+/// `Page.frameNavigated`/`Page.frameRequestedNavigation` listener spawned by
+/// `spawn_session_listeners` a chance to observe and flag a same-call
+/// navigation to a blocked host before the caller sees a result. Shared by
+/// `navigate` (BLOCKER fix: a redirect during the navigation itself must not
+/// leak a snapshot of the blocked host) and `dispatch_action` (a click/type
+/// that triggers an in-page navigation).
+async fn poll_blocked_grace_period(blocked: &Rc<RefCell<Option<String>>>) -> Option<String> {
+    let mut waited = Duration::ZERO;
+    let step = Duration::from_millis(20);
+    while blocked.borrow().is_none() && waited < Duration::from_millis(200) {
+        tokio::time::sleep(step).await;
+        waited += step;
+    }
+    blocked.borrow().clone()
 }
 
 /// Registers this session's `Page.frameNavigated`/`Page.frameRequestedNavigation`
@@ -673,10 +738,30 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             match session_id {
                 None => {
+                    // DoS guard: without this cap a caller can spawn tabs
+                    // faster than the 300s idle reaper reclaims them,
+                    // exhausting the underlying Chromium process.
+                    if self.sessions.borrow().len() >= MAX_OPEN_SESSIONS {
+                        return Err(PortError::Other(format!(
+                            "too many open browser sessions (limit {MAX_OPEN_SESSIONS}); close an existing session or wait for idle ones to be reclaimed"
+                        )));
+                    }
+
                     let id = self.new_session_id();
+                    // Created blank (never `new_page(url)`): `new_page` starts
+                    // the navigation to `url` immediately, and a page whose
+                    // script redirects to a blocked host right after load can
+                    // commit that redirect before `spawn_session_listeners`
+                    // below has subscribed to the CDP event stream — the
+                    // listener is registered second, but chromiumoxide's
+                    // `new_page` doesn't block until it's attached. Starting
+                    // from `about:blank` decouples "tab exists" from
+                    // "navigation to caller's url has started", so the
+                    // listeners are provably live before the first byte of
+                    // `url` is requested.
                     let page = self
                         .browser
-                        .new_page(url)
+                        .new_page("about:blank")
                         .await
                         .map_err(|e| PortError::Other(e.to_string()))?;
 
@@ -689,10 +774,6 @@ impl BrowserDriver for NativeBrowser {
                         .await
                         .map_err(|e| PortError::Other(e.to_string()))?;
 
-                    page.wait_for_navigation()
-                        .await
-                        .map_err(|e| PortError::Other(e.to_string()))?;
-
                     let latest_refs = Rc::new(RefCell::new(HashMap::new()));
                     let known_refs = Rc::new(RefCell::new(HashMap::new()));
                     let nav_generation = Rc::new(Cell::new(0u64));
@@ -701,8 +782,52 @@ impl BrowserDriver for NativeBrowser {
                     let blocked = Rc::new(RefCell::new(None));
                     let crashed = Rc::new(Cell::new(false));
 
+                    // Registered *before* `wait_for_navigation` (BLOCKER fix):
+                    // a redirect chained onto this same initial navigation —
+                    // server-side or an immediate in-page `location.href` —
+                    // can commit before this call ever returns. Attaching the
+                    // listeners only after `wait_for_navigation` resolved (the
+                    // previous ordering) meant that commit was missed
+                    // entirely, so a public URL that redirects to a blocked
+                    // host (e.g. the cloud metadata service) would have its
+                    // snapshot returned to the caller with no block ever
+                    // surfaced.
                     spawn_session_listeners(&page, id.clone(), blocked.clone(), crashed.clone())
                         .await;
+
+                    // Now safe to actually request the caller's URL: the
+                    // listeners are attached, so any redirect chained onto
+                    // this navigation (server-side or in-page) is observed.
+                    page.goto(url)
+                        .await
+                        .map_err(|e| PortError::Other(e.to_string()))?;
+                    page.wait_for_navigation()
+                        .await
+                        .map_err(|e| PortError::Other(e.to_string()))?;
+
+                    // Give the listener a moment to observe a same-call
+                    // redirect before deciding whether to capture a snapshot
+                    // at all.
+                    if let Some(reason) = poll_blocked_grace_period(&blocked).await {
+                        // The session is still inserted (with no snapshot
+                        // ever captured) so the caller can recover via the
+                        // documented path: re-navigate this sessionId to a
+                        // safe URL.
+                        let session = BrowserSession {
+                            page,
+                            last_used: Cell::new(now_millis()),
+                            latest_refs,
+                            known_refs,
+                            nav_generation,
+                            next_ref_id,
+                            latest_url,
+                            blocked,
+                            crashed,
+                            lock: Rc::new(tokio::sync::Mutex::new(())),
+                        };
+                        self.sessions.borrow_mut().insert(id, session);
+                        return Err(PortError::NotFound(reason));
+                    }
 
                     // Fresh session: `latest_refs` is still empty, so there's
                     // nothing to borrow across the `.await` — pass an empty
@@ -727,6 +852,7 @@ impl BrowserDriver for NativeBrowser {
                         latest_url,
                         blocked,
                         crashed,
+                        lock: Rc::new(tokio::sync::Mutex::new(())),
                     };
                     self.sessions.borrow_mut().insert(id.clone(), session);
 
@@ -739,7 +865,7 @@ impl BrowserDriver for NativeBrowser {
                 Some(id) => {
                     touch_or_evict(&self.sessions, &id.0, now_millis())?;
 
-                    let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked) = {
+                    let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
                         let map = self.sessions.borrow();
                         let session = map
                             .get(&id.0)
@@ -752,8 +878,16 @@ impl BrowserDriver for NativeBrowser {
                             session.next_ref_id.clone(),
                             session.latest_url.clone(),
                             session.blocked.clone(),
+                            session.lock.clone(),
                         )
                     };
+
+                    // Serializes this call against any other concurrent
+                    // navigate/click/type_text/snapshot on the same
+                    // sessionId — held for the rest of this branch, across
+                    // every `.await` below, so two calls against the same
+                    // `Page` never interleave CDP round-trips.
+                    let _session_guard = lock.lock().await;
 
                     // This call's own navigation is about to supersede
                     // whatever `blocked` may have recorded from a prior
@@ -769,6 +903,17 @@ impl BrowserDriver for NativeBrowser {
                         .map_err(|e| PortError::Other(e.to_string()))?;
 
                     nav_generation.set(nav_generation.get() + 1);
+
+                    // BLOCKER fix: give the frameNavigated/frameRequestedNavigation
+                    // listener a chance to flag a redirect chained onto this
+                    // same `goto` before capturing (let alone returning) a
+                    // snapshot of whatever page it landed on.
+                    if let Some(reason) = poll_blocked_grace_period(&blocked).await {
+                        if let Some(session) = self.sessions.borrow().get(&id.0) {
+                            session.last_used.set(now_millis());
+                        }
+                        return Err(PortError::NotFound(reason));
+                    }
 
                     // Real navigation to a new URL: an old ref's
                     // `BackendNodeId` has no relationship to this new
@@ -847,7 +992,7 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked) = {
+            let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
@@ -860,8 +1005,11 @@ impl BrowserDriver for NativeBrowser {
                     session.next_ref_id.clone(),
                     session.latest_url.clone(),
                     session.blocked.clone(),
+                    session.lock.clone(),
                 )
             };
+
+            let _session_guard = lock.lock().await;
 
             if let Some(reason) = blocked.borrow().clone() {
                 return Err(PortError::NotFound(reason));
@@ -915,7 +1063,7 @@ impl NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked) = {
+            let (page, latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
@@ -928,8 +1076,11 @@ impl NativeBrowser {
                     session.next_ref_id.clone(),
                     session.latest_url.clone(),
                     session.blocked.clone(),
+                    session.lock.clone(),
                 )
             };
+
+            let _session_guard = lock.lock().await;
 
             if let Some(reason) = blocked.borrow().clone() {
                 return Err(PortError::NotFound(reason));
@@ -957,13 +1108,7 @@ impl NativeBrowser {
             // Grace period: give the `Page.frameNavigated` listener a chance
             // to observe and flag a same-call in-page navigation before this
             // call returns (Task 3.3.1's SSRF same-call disclosure AC).
-            let mut waited = Duration::ZERO;
-            let step = Duration::from_millis(20);
-            while blocked.borrow().is_none() && waited < Duration::from_millis(200) {
-                tokio::time::sleep(step).await;
-                waited += step;
-            }
-            if let Some(reason) = blocked.borrow().clone() {
+            if let Some(reason) = poll_blocked_grace_period(&blocked).await {
                 return Err(PortError::NotFound(reason));
             }
 

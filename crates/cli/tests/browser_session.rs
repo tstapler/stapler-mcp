@@ -679,6 +679,54 @@ async fn navigate_should_clear_blocked_flag_when_renavigating_previously_blocked
         .expect("shutdown call should succeed");
 }
 
+/// BLOCKER regression test: `navigate()` itself must catch a redirect chained
+/// onto its own goto/wait_for_navigation, not just a later `click`/`type`
+/// call — this is the scenario a review agent flagged as uncovered (only the
+/// in-page-*link-click* path was exercised, by the test above). The page
+/// here redirects itself via an inline `<script>` firing on load, so the
+/// navigation-to-a-blocked-host happens synchronously as part of `navigate`'s
+/// own `page.goto`/`wait_for_navigation`, before `navigate` ever returns —
+/// exactly the same-call disclosure gap the fix in `crates/native/src/browser.rs`
+/// (registering `spawn_session_listeners` *before* `wait_for_navigation`, then
+/// polling `blocked` via `poll_blocked_grace_period`) closes. If `navigate`
+/// returned `Ok` with a snapshot here, it would mean the metadata-service
+/// response leaked to the caller in the very call meant to block it.
+///
+/// Deliberately a `data:` URL, for the same reason as the test above:
+/// `url::Url::host()` returns `None` for it, so the pre-flight
+/// `blocked_host_reason` check in `crates/core/src/tools/browser.rs` (which
+/// only inspects the navigate call's own literal target) never rejects the
+/// call — only `FrameNavigatedGuard`, watching the *actual* committed/requested
+/// navigation, can catch the in-page redirect to the link-local address.
+#[tokio::test]
+#[ignore]
+async fn navigate_should_itself_catch_a_same_call_redirect_to_a_blocked_host() {
+    let (_tmp, socket, sock_path) = start_daemon(false).await;
+
+    let self_redirecting_page = "data:text/html,<html><body><script>location.href='http://169.254.169.254/latest/meta-data/'</script></body></html>";
+    let navigate_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_navigate",
+        Some(json!({ "url": self_redirecting_page })),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let err = navigate_result.expect_err(
+        "navigate() must not return Ok (with a snapshot of the blocked host) when its own \
+         navigation redirects to a link-local address before the call returns",
+    );
+    assert!(
+        err.to_string().contains("blocked"),
+        "expected a 'blocked' error naming the redirect, got: {err}"
+    );
+
+    client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
+        .await
+        .expect("shutdown call should succeed");
+}
+
 /// UX AC1 (design/ux.md, validation.md's UX table): call `navigate`; take
 /// `ref`s from that one response only; then call `type`, `type`, `click`,
 /// `snapshot` in sequence, never issuing a role/name pair or CSS selector to
