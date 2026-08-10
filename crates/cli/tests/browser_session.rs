@@ -843,7 +843,16 @@ const MAX_OPEN_SESSIONS_UNDER_TEST: usize = 20;
 /// pre-flight check entirely and don't need `STAPLER_MCP_ALLOW_PRIVATE_NETWORKS`).
 /// The next call past the cap must be rejected with the documented
 /// "too many open browser sessions" error rather than silently overshooting
-/// it — the scenario Item 3's `NewSessionSlotGuard` fix closes.
+/// it. This exercises the boundary end to end through the real daemon/socket
+/// protocol, but — see `navigate_concurrent_should_not_exceed_max_open_sessions`
+/// below — the daemon's accept loop (`Daemon::run` in
+/// `crates/core/src/daemon.rs`) handles exactly one request at a time
+/// (accept -> read -> dispatch -> respond -> accept again), so sequential
+/// calls here can never exercise the actual check-then-insert race that
+/// `NewSessionSlotGuard` (`crates/native/src/browser.rs`) closes; this test
+/// would pass identically even with that guard deleted. It's kept for its own
+/// sake — it's still the only coverage of the cap's error message/wording
+/// through the real client/daemon protocol.
 #[tokio::test]
 #[ignore]
 async fn navigate_should_reject_new_session_when_max_open_sessions_reached() {
@@ -882,4 +891,104 @@ async fn navigate_should_reject_new_session_when_max_open_sessions_reached() {
     client::call(&socket, &sock_path, "shutdown", None, Duration::from_secs(2))
         .await
         .expect("shutdown call should succeed");
+}
+
+/// Actually exercises the check-then-insert race `NewSessionSlotGuard`
+/// (`crates/native/src/browser.rs`) closes, by driving many `navigate()`
+/// calls concurrently against a single shared `NativeBrowser` instance
+/// directly — bypassing `stapler_mcp_core::daemon::Daemon::run`'s socket/accept
+/// loop entirely, since that loop serves one request fully (accept -> read ->
+/// dispatch -> respond) before accepting the next, so no two tool calls are
+/// ever in flight at once through it; driving this test's calls through the
+/// real daemon subprocess (like its sibling test above) could never make
+/// two `navigate()` calls overlap, sequential-loop or not.
+///
+/// Here, `futures::future::join_all` polls every call's future on the same
+/// task, so when one call's `navigate()` yields at an `.await` point (tab
+/// creation, `goto`, the navigation-complete wait, AX capture — several
+/// points between the `MAX_OPEN_SESSIONS` check and the eventual
+/// `sessions.insert(..)`), another call's future gets polled and can reach
+/// its own check before the first has inserted. Without `NewSessionSlotGuard`
+/// reserving a slot synchronously at check time, that interleaving lets more
+/// than `MAX_OPEN_SESSIONS_UNDER_TEST` calls pass the check and overshoot the
+/// cap; the assertion below is on the *aggregate* outcome (total successful
+/// creations), not just that any one call was rejected.
+///
+/// (Verified locally: temporarily commenting out `NewSessionSlotGuard::reserve`'s
+/// call in `browser.rs` made this test's `ok_count` exceed
+/// `MAX_OPEN_SESSIONS_UNDER_TEST`; restoring it brings `ok_count` back down to
+/// exactly the cap.)
+#[tokio::test]
+#[ignore]
+async fn navigate_concurrent_should_not_exceed_max_open_sessions() {
+    use stapler_mcp_core::schema::BrowserNavigateInput;
+    use stapler_mcp_core::tools::browser::browser_navigate;
+    use stapler_mcp_core::tools::webcrawl::NetworkPolicy;
+    use stapler_mcp_native::NativeBrowser;
+
+    // `NativeBrowser` spawns a `!Send` idle-session reaper via
+    // `tokio::task::spawn_local` at `launch()` time (production always runs
+    // this inside `main.rs`'s `LocalSet::block_on`), so this test needs its
+    // own `LocalSet` around the whole body rather than the bare
+    // `#[tokio::test]` runtime the rest of this file's daemon-driven tests use.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut browser = NativeBrowser::launch()
+                .await
+                .expect("NativeBrowser::launch should succeed with a real Chrome/Chromium binary");
+
+            const EXTRA_CALLS: usize = 10;
+            const TOTAL_CALLS: usize = MAX_OPEN_SESSIONS_UNDER_TEST + EXTRA_CALLS;
+
+            let calls = (0..TOTAL_CALLS).map(|i| {
+                let browser = &browser;
+                async move {
+                    let page = format!("data:text/html,<html><body>session {i}</body></html>");
+                    browser_navigate(
+                        browser,
+                        BrowserNavigateInput {
+                            url: page,
+                            session_id: None,
+                            timeout_seconds: None,
+                        },
+                        NetworkPolicy::Enforce,
+                    )
+                    .await
+                }
+            });
+            let results = futures::future::join_all(calls).await;
+
+            let mut ok_count = 0usize;
+            let mut err_count = 0usize;
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(_) => ok_count += 1,
+                    Err(e) => {
+                        assert!(
+                            e.contains("too many open browser sessions"),
+                            "navigate #{i} failed with an unexpected error (expected the cap-exceeded wording), got: {e}"
+                        );
+                        err_count += 1;
+                    }
+                }
+            }
+
+            assert_eq!(
+                ok_count, MAX_OPEN_SESSIONS_UNDER_TEST,
+                "expected exactly MAX_OPEN_SESSIONS_UNDER_TEST ({MAX_OPEN_SESSIONS_UNDER_TEST}) of the \
+                 {TOTAL_CALLS} concurrent no-sessionId navigates to succeed and the rest rejected — got \
+                 {ok_count} successes and {err_count} rejections. A count above the cap means concurrent \
+                 calls overshot MAX_OPEN_SESSIONS (the race NewSessionSlotGuard exists to close)."
+            );
+            assert_eq!(err_count, EXTRA_CALLS, "expected the remaining {EXTRA_CALLS} calls to be rejected");
+
+            let reaper_handle = browser.reaper.borrow_mut().take();
+            if let Some(handle) = reaper_handle {
+                handle.abort();
+                let _ = handle.await;
+            }
+            browser.close().await;
+        })
+        .await;
 }
