@@ -92,18 +92,26 @@ verbatim — never hand-authored twice.
 | `brave_web_search` | Stateless HTTP wrapper over the Brave Search API. Reads `BRAVE_API_KEY` from the **daemon's** environment. Base URL overridable via `BRAVE_API_BASE_URL` (used by both adapters' test suites to point at a mock server). |
 | `read_website` | Fetch a URL (optionally BFS-crawling same-host links up to `maxDepth`/`maxPages`), extract main content via Readability-style extraction, return it as Markdown. Cached by URL hash on the daemon — a cache hit skips the network fetch entirely (at the cost of not expanding that page's links further). Respects `robots.txt`. |
 | `download_website` | Same crawl/`robots.txt` mechanics as `read_website`, saves raw HTML per page under `saveDir` instead of extracting Markdown. Merges what were two separate third-party MCP servers this user ran before. |
+| `stapler_index_docs` / `stapler_search_docs` / `stapler_list_indexed_sources` / `stapler_remove_indexed_source` | Native-only: crawl a doc site, embed it locally (`fastembed`/`all-MiniLM-L6-v2`), and semantically search it — a narrower-scope, in-process replacement for the Node `docs-mcp-server`. `stapler_`-prefixed to avoid a tool-name collision with that server's own `search_docs`. |
+| `stapler_browser_navigate` / `stapler_browser_click` / `stapler_browser_type` / `stapler_browser_snapshot` | `playwright-mcp`-style browser automation via accessibility-tree snapshots, with a `sessionId` threaded across calls and a 300s idle-timeout reaper for abandoned sessions. |
 
-All four are verified end-to-end on both adapters: daemon started, a client
-dialed its socket, `fetch_page` rendered `https://example.com` and returned
-real title/text, `brave_web_search` returned a clean error when the key was
-absent and correct results against a mock server otherwise, and
-`read_website`/`download_website` correctly BFS-crawled a synthetic
-multi-page site while respecting a disallow rule in its `robots.txt`.
+All tools are verified end-to-end against real dependencies (a real headless
+Chrome, a real mock/live HTTP server) rather than mocked ports — on both
+adapters, except docs-index, which is native-only. See
+[`NOTES.md`](./NOTES.md) for the phase-by-phase verification detail and the
+real bugs each round of testing found.
 
 ## Deferred
 
-See [`NOTES.md`](./NOTES.md) — `playwright-mcp`-style browser automation is
-next; `docs-mcp-server`-style doc indexing stays explicitly out of scope.
+See [`NOTES.md`](./NOTES.md) for the full log. Remaining open items are
+tracked as GitHub issues, all "later"/non-blocking: wiring wasm/npm
+packaging into CI and publishing to npm
+([#8](https://github.com/tstapler/stapler-mcp/issues/8)), the wasm HTTP
+adapter not capturing `final_url` on redirect
+([#9](https://github.com/tstapler/stapler-mcp/issues/9)), and whether
+docs-index's deliberately narrow scope (Markdown/HTML only, one local
+embedding model, brute-force cosine search) is ever worth widening
+([#10](https://github.com/tstapler/stapler-mcp/issues/10)).
 
 ## Usage
 

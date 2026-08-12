@@ -135,23 +135,64 @@ choices) came out of a dedicated planning pass and is summarized in
     `download_website` — not introduced or worsened by this feature, and
     out of scope to fix here.
 
+- **Phase 5** — `crates/core/src/tools/browser.rs` plus native
+  (`crates/native/src/browser.rs`, `crates/native/src/ax.rs`) and wasm
+  (`crates/wasm/src/browser.rs`, `crates/wasm/src/glue/browser.js`) adapters:
+  `playwright-mcp`-style browser automation via accessibility-tree snapshots
+  — `stapler_browser_navigate`/`stapler_browser_click`/`stapler_browser_type`/
+  `stapler_browser_snapshot`. Extends `BrowserDriver` with session-scoped
+  `navigate`/`click`/`type_text`/`snapshot` and a `SessionId`/`Locator`/
+  `AxNode`/`AxSnapshot` vocabulary threaded across calls, plus
+  `PortError::NotFound`/`SessionCrashed`. Confirms the asymmetry flagged when
+  this was deferred: `chromiumoxide` only exposes the raw CDP `Accessibility`
+  domain, so the native adapter got its own hand-rolled AX-tree walker
+  (`ax.rs`) while the wasm/`playwright-core` adapter got accessible-role/name
+  locators for free.
+  - Session lifecycle is the same shape on both adapters: an in-memory
+    session registry, a 300s idle-timeout reaper, and
+    `Target.targetCrashed`/`page.on('crash')`-based crash detection that
+    surfaces as an actionable `SessionCrashed` error on the next call instead
+    of hanging. Open-session caps differ and are left un-reconciled: native's
+    `MAX_OPEN_SESSIONS = 20` (`browser.rs`) vs. wasm's `MAX_SESSIONS = 50`
+    (`glue/browser.js`); both cap accessibility-tree walks at
+    `MAX_SNAPSHOT_NODES = 500`.
+  - **Real bugs found by testing against real Chrome, not by compiling or
+    reviewing**: an AX-tree walker that minted a fresh `ref` string on every
+    capture made a `ref` returned by one call unresolvable by the very next
+    call on the same still-open page — fixed by threading
+    `previous_refs`/`previous_by_backend_id` so a node's ref is reused when
+    its `BackendNodeId` is recognized from the prior capture, while a genuine
+    re-navigation still gets a fresh map. The SSRF re-check only watched
+    `Page.frameNavigated` (committed URL), which never fires for a navigation
+    to an unreachable link-local host since Chrome commits to its own error
+    page instead of the attempted destination — fixed by adding a second
+    listener on `Page.frameRequestedNavigation` (intended destination, fires
+    regardless of success). Both found by the `#[ignore]`d real-Chrome tests
+    in `crates/cli/tests/browser_session.rs` (8 tests, all passing), not by
+    unit tests against a mock.
+  - **Concurrency/SSRF races found in adversarial PR review**, not by initial
+    testing: a same-call redirect to a blocked host (e.g. the cloud metadata
+    service) could leak a full snapshot before the block was surfaced;
+    concurrent calls against the same session could interleave, or let the
+    idle reaper close a session mid-call — closed with a per-session
+    lock/mutex serializing calls on both adapters, reused as a busy signal so
+    the reaper skips in-flight sessions; a soft check-then-insert race let
+    concurrent no-`session_id` `navigate()` calls overshoot
+    `MAX_OPEN_SESSIONS` — closed with `NewSessionSlotGuard`, an RAII slot
+    reservation taken before the first await. Also closed matching
+    IPv4-mapped/IPv4-compatible IPv6 SSRF gaps on both adapters, and
+    tightened `webcrawl.rs`'s own guard to match (full `0.0.0.0/8`, legacy
+    `::a.b.c.d` form) as a byproduct.
+  - Verified via `crates/cli/tests/browser_session.rs` (8 tests gated behind
+    real Chrome, `#[ignore]`d in CI, all passing locally) and
+    `npm/test/browser_glue.test.js` (21/21 passing, up from 14/14 before the
+    adversarial-review fixes).
+
 ## Deferred
 
-### `playwright-mcp` equivalent — browser automation tools
-
-Full browser automation via accessibility-tree snapshots (navigate, click,
-type, snapshot). The `BrowserDriver` port already established for
-`fetch_page` needs extending with persistent-tab/session semantics — unlike
-`fetch_page` (one-shot, fresh tab per call), automation needs a `session_id`
-threaded across `navigate` → `click` → `type` → `snapshot` calls, plus an
-idle-timeout reaper for abandoned sessions.
-
-Real, asymmetric cost to flag: on the Node side, `playwright-core` gives
-accessible-role/name locators for free; on the native side, `chromiumoxide`
-only exposes the raw CDP `Accessibility` domain, so the native adapter has
-to implement its own AX-tree walk + role/name resolution to match what Node
-gets for free. Budget for this explicitly, don't assume parity between the
-two adapters here.
+Three items below are narrow enough that they're tracked as GitHub issues
+rather than fully re-derived here — see the issue for current status/discussion,
+this file just gives the pointer.
 
 ### `docs-mcp-server` equivalent — done (Phase 4), narrower scope by design
 
@@ -165,9 +206,21 @@ still connected as of this writing (`~/.claude.json`'s `"docs"` entry) —
 disconnecting it, and deciding whether the wider format/provider surface is
 ever worth adding, are open follow-ups, not blocked on anything technical
 (the tool-name collision that made coexistence awkward is resolved via the
-`stapler_` prefix above).
+`stapler_` prefix above). Tracked as
+[issue #10](https://github.com/tstapler/stapler-mcp/issues/10) — explicitly
+"later," revisit only if the brute-force cosine search stops scaling or a
+concrete non-Markdown/non-local-embedding need shows up.
 
-### npm packaging/publishing polish (Phase 5)
+### wasm `final_url` on redirect
+
+`crates/wasm/src/http.rs`'s adapter doesn't populate `final_url` after a
+redirect the way the native adapter does, so `sourceUrl` metadata on a
+redirected docs-index source is the pre-redirect URL on the wasm side only.
+Tracked as
+[issue #9](https://github.com/tstapler/stapler-mcp/issues/9) — small,
+low-impact, "later."
+
+### npm packaging/publishing polish (Phase 6)
 
 - Wire `wasm-pack build --target nodejs` (or the plain `cargo build
   --target wasm32-unknown-unknown` + `wasm-bindgen` CLI fallback actually
@@ -181,6 +234,9 @@ ever worth adding, are open follow-ups, not blocked on anything technical
   Gatekeeper problem the whole wasm/Node distribution exists to avoid.
 - Publish to npm; real cross-implementation interop is already proven, this
   phase is packaging/CI/docs, not new architecture.
+
+Tracked as [issue #8](https://github.com/tstapler/stapler-mcp/issues/8) —
+"later," purely operational, doesn't change user-facing capability.
 
 ## Non-goals (for now)
 
