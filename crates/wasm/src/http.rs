@@ -39,12 +39,16 @@ impl HttpClient for WasmHttp {
             .map_err(|_| PortError::Other("missing body in HTTP response".to_string()))?;
         let body = js_sys::Uint8Array::new(&body_val).to_vec();
 
-        // TODO(docs-index-wasm): capture the real post-redirect URL via response.url
-        // on the JS side if/when a wasm Embedder exists.
+        let final_url = js_sys::Reflect::get(&result, &JsValue::from_str("url"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| url.to_string());
+
         Ok(HttpResponse {
             status,
             body,
-            final_url: url.to_string(),
+            final_url,
         })
     }
 }
