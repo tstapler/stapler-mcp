@@ -1479,7 +1479,10 @@ mod tests {
             .await
             .expect_err("out-of-range index should be rejected");
 
-        assert!(err.contains("no tab at index 9"), "unexpected message: {err}");
+        assert!(
+            err.contains("no tab at index 9"),
+            "unexpected message: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1529,7 +1532,10 @@ mod tests {
             .await
             .expect_err("out-of-range index should be rejected");
 
-        assert!(err.contains("no tab at index 9"), "unexpected message: {err}");
+        assert!(
+            err.contains("no tab at index 9"),
+            "unexpected message: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1799,8 +1805,8 @@ mod tests {
 
     #[tokio::test]
     async fn browser_wait_for_should_return_action_output_when_text_condition_succeeds() {
-        let driver =
-            FakeBrowserDriver::new().with_wait_for(Ok(sample_snapshot("https://example.com/", None)));
+        let driver = FakeBrowserDriver::new()
+            .with_wait_for(Ok(sample_snapshot("https://example.com/", None)));
 
         let output = browser_wait_for(
             &driver,

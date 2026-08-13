@@ -177,10 +177,16 @@ pub struct NavigateResult {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TabAction {
     List,
-    New { url: Option<String> },
-    Select { index: usize },
+    New {
+        url: Option<String>,
+    },
+    Select {
+        index: usize,
+    },
     /// `None` closes whichever tab is currently active.
-    Close { index: Option<usize> },
+    Close {
+        index: Option<usize>,
+    },
 }
 
 /// One entry in a `TabsResult` listing.

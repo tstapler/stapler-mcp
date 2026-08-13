@@ -412,7 +412,8 @@ impl BrowserDriver for WasmBrowser {
         values: &[String],
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError> {
-        let values_json = serde_json::to_string(values).map_err(|e| PortError::Other(e.to_string()))?;
+        let values_json =
+            serde_json::to_string(values).map_err(|e| PortError::Other(e.to_string()))?;
         let result = JsFuture::from(js_browser_select_option(
             &session_id.0,
             &locator.0,
@@ -527,7 +528,9 @@ mod tests {
     /// `PortError::Timeout` like native's, not `PortError::Other`.
     #[test]
     fn map_js_error_should_map_wait_for_timed_out_marker_to_port_error_timeout() {
-        let message = "wait_for timed out waiting for text to appear: \"Loaded\": Timeout 5000ms exceeded".to_string();
+        let message =
+            "wait_for timed out waiting for text to appear: \"Loaded\": Timeout 5000ms exceeded"
+                .to_string();
 
         let err = map_js_error(message);
 

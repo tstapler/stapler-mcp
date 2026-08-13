@@ -19,11 +19,11 @@ use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{EnvPort, LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
-    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput,
-    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
-    BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
-    FetchPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
+    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
+    BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
+    DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, ReadWebsiteInput,
+    ReadWebsiteOutput,
 };
 use stapler_mcp_core::tools::{browser as browser_tools, fetch, search, webcrawl};
 

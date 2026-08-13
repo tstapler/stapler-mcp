@@ -14,13 +14,13 @@ use stapler_mcp_core::client::{self, EnsureOptions};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
-    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput,
-    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
-    BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
-    FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
-    ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput,
-    RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
+    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
+    BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
+    DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, IndexDocsInput,
+    IndexDocsOutput, ListIndexedSourcesInput, ListIndexedSourcesOutput, ReadWebsiteInput,
+    ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
+    SearchDocsOutput,
 };
 use stapler_mcp_native::{
     NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,

@@ -683,7 +683,14 @@ async fn dispatch_key_event(
     backend_node_id: Option<BackendNodeId>,
 ) -> Result<(), PortError> {
     if let Some(id) = backend_node_id {
-        invoke_on_node(page, id, "press_key", "function() { this.focus(); }", vec![]).await?;
+        invoke_on_node(
+            page,
+            id,
+            "press_key",
+            "function() { this.focus(); }",
+            vec![],
+        )
+        .await?;
     }
 
     let key_definition = keys::get_key_definition(key)
@@ -1581,8 +1588,13 @@ impl BrowserDriver for NativeBrowser {
         locator: Option<&Locator>,
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError> {
-        self.dispatch_action(session_id, locator, timeout, Action::PressKey(key.to_string()))
-            .await
+        self.dispatch_action(
+            session_id,
+            locator,
+            timeout,
+            Action::PressKey(key.to_string()),
+        )
+        .await
     }
 
     /// Blocks until `condition` is satisfied, then captures a fresh
@@ -1773,13 +1785,7 @@ impl NativeBrowser {
                 let (backend_node_id, expected_role) = {
                     let refs = latest_refs.borrow();
                     let known = known_refs.borrow();
-                    resolve_locator_impl(
-                        &refs,
-                        &known,
-                        nav_generation.get(),
-                        locator,
-                        &url_before,
-                    )?
+                    resolve_locator_impl(&refs, &known, nav_generation.get(), locator, &url_before)?
                 };
                 verify_node_live(&page, backend_node_id, &expected_role, locator).await?;
                 Some(backend_node_id)

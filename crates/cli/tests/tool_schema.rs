@@ -73,13 +73,11 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
         ),
         (
             "stapler_browser_click",
-            schema_for_input::<BrowserClickInput>()
-                .expect("BrowserClickInput schemars schema"),
+            schema_for_input::<BrowserClickInput>().expect("BrowserClickInput schemars schema"),
         ),
         (
             "stapler_browser_type",
-            schema_for_input::<BrowserTypeInput>()
-                .expect("BrowserTypeInput schemars schema"),
+            schema_for_input::<BrowserTypeInput>().expect("BrowserTypeInput schemars schema"),
         ),
         (
             "stapler_browser_snapshot",
@@ -111,8 +109,7 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
         ),
         (
             "stapler_browser_wait_for",
-            schema_for_input::<BrowserWaitForInput>()
-                .expect("BrowserWaitForInput schemars schema"),
+            schema_for_input::<BrowserWaitForInput>().expect("BrowserWaitForInput schemars schema"),
         ),
     ];
 
