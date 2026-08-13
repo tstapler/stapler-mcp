@@ -103,15 +103,19 @@ real bugs each round of testing found.
 
 ## Deferred
 
-See [`NOTES.md`](./NOTES.md) for the full log. Remaining open items are
-tracked as GitHub issues, all "later"/non-blocking: wiring wasm/npm
-packaging into CI and publishing to npm
-([#8](https://github.com/tstapler/stapler-mcp/issues/8)), the wasm HTTP
-adapter not capturing `final_url` on redirect
-([#9](https://github.com/tstapler/stapler-mcp/issues/9)), and whether
-docs-index's deliberately narrow scope (Markdown/HTML only, one local
-embedding model, brute-force cosine search) is ever worth widening
-([#10](https://github.com/tstapler/stapler-mcp/issues/10)).
+See [`NOTES.md`](./NOTES.md) for the full log. Wiring wasm/npm packaging
+into CI ([#8](https://github.com/tstapler/stapler-mcp/issues/8)) and the
+wasm HTTP adapter not capturing `final_url` on redirect
+([#9](https://github.com/tstapler/stapler-mcp/issues/9)) are both closed —
+CI now builds `npm/pkg/` via `wasm-bindgen` and runs `npm test` on every
+push, and the fix landed in `crates/wasm/src/glue/http.js`. Publishing the
+npm package to the public registry remains deliberately undone (needs
+explicit sign-off + credentials; `npm/package.json` keeps `"private": true`
+as a guard). The one still-open item is whether docs-index's deliberately
+narrow scope (Markdown/HTML only, one local embedding model, brute-force
+cosine search) is ever worth widening
+([#10](https://github.com/tstapler/stapler-mcp/issues/10)) — "no action
+yet."
 
 ## Usage
 

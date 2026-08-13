@@ -190,53 +190,60 @@ choices) came out of a dedicated planning pass and is summarized in
 
 ## Deferred
 
-Three items below are narrow enough that they're tracked as GitHub issues
-rather than fully re-derived here — see the issue for current status/discussion,
-this file just gives the pointer.
+One item below is narrow enough that it's tracked as a GitHub issue rather
+than fully re-derived here — see the issue for current status/discussion,
+this file just gives the pointer. The other two originally tracked here
+(wasm `final_url`, npm CI/packaging) have since been fixed and closed; kept
+below for the historical record.
 
-### `docs-mcp-server` equivalent — done (Phase 4), narrower scope by design
+### docs-index scope: wider format support, multi-provider embeddings, ANN index
 
 The native, single-doc-format v1 shipped as Phase 4 (`docs.rs`,
 `stapler_index_docs`/`stapler_search_docs`/`stapler_list_indexed_sources`/
 `stapler_remove_indexed_source`) — see the "Done" section above. It does not
 match the original `@arabold/docs-mcp-server`'s full scope (90+ format
 parsers, multi-provider embeddings, a web UI): it's Markdown/HTML-via-crawl
-only, one pinned local embedding model, no UI. `docs-mcp-server` itself is
-still connected as of this writing (`~/.claude.json`'s `"docs"` entry) —
-disconnecting it, and deciding whether the wider format/provider surface is
-ever worth adding, are open follow-ups, not blocked on anything technical
-(the tool-name collision that made coexistence awkward is resolved via the
-`stapler_` prefix above). Tracked as
+only, one pinned local embedding model, no UI, brute-force cosine search.
+That legacy server itself was disconnected from `~/.claude.json` in
+[issue #2](https://github.com/tstapler/stapler-mcp/issues/2). Whether the
+wider format/provider/ANN-index surface is ever worth adding is tracked as
 [issue #10](https://github.com/tstapler/stapler-mcp/issues/10) — explicitly
-"later," revisit only if the brute-force cosine search stops scaling or a
-concrete non-Markdown/non-local-embedding need shows up.
+"no action yet," revisit only if the `search_docs` latency benchmark
+([#5](https://github.com/tstapler/stapler-mcp/issues/5) — closed; measured
+~7ms/call release at `MAX_CHUNKS_PER_SOURCE` scale, comfortably sub-second)
+stops holding at real-world scale, or a concrete non-Markdown/non-local-
+embedding need shows up.
 
-### wasm `final_url` on redirect
+### wasm `final_url` on redirect — fixed
 
-`crates/wasm/src/http.rs`'s adapter doesn't populate `final_url` after a
+`crates/wasm/src/http.rs`'s adapter didn't populate `final_url` after a
 redirect the way the native adapter does, so `sourceUrl` metadata on a
-redirected docs-index source is the pre-redirect URL on the wasm side only.
-Tracked as
-[issue #9](https://github.com/tstapler/stapler-mcp/issues/9) — small,
-low-impact, "later."
+redirected docs-index source was the pre-redirect URL on the wasm side only.
+Fixed by returning `resp.url` from the `fetch()` glue and reading it via
+`Reflect::get`. Was [issue #9](https://github.com/tstapler/stapler-mcp/issues/9) — closed.
 
-### npm packaging/publishing polish (Phase 6)
+### npm packaging/publishing polish (Phase 6) — CI + fast path done, publish still deferred
 
-- Wire `wasm-pack build --target nodejs` (or the plain `cargo build
-  --target wasm32-unknown-unknown` + `wasm-bindgen` CLI fallback actually
-  used so far) into CI, so `npm/pkg/` is a release artifact, never hand-built
-  by an end user.
+- Wire `wasm-bindgen` into CI, so `npm/pkg/` is built fresh every run instead
+  of hand-built by an end user — done, CI's `wasm` job now runs
+  `wasm-bindgen` (pinned to the `wasm-bindgen` crate's `Cargo.lock` version)
+  followed by `npm ci && npm test`.
 - Opportunistic native-binary fast path: before spawning the Node-hosted
   daemon, check whether a `cargo install`ed native `stapler-mcp` binary is
   already on `PATH`, and prefer spawning that instead (real `flock`, real
   `chromiumoxide`, multi-core) — safe because a binary the user built
   themselves was never downloaded/quarantined, so it doesn't reintroduce the
-  Gatekeeper problem the whole wasm/Node distribution exists to avoid.
-- Publish to npm; real cross-implementation interop is already proven, this
-  phase is packaging/CI/docs, not new architecture.
+  Gatekeeper problem the whole wasm/Node distribution exists to avoid. Done
+  in `crates/wasm/src/glue/process.js`'s `findNativeBinary`.
+- Publish to npm — still not done. Deliberately left out: claiming a public
+  package name is a hard-to-reverse, externally-visible action that needs
+  explicit sign-off and registry credentials, not something to do as a
+  matter of course. `npm/package.json` keeps `"private": true` as a guard
+  against an accidental publish in the meantime.
 
-Tracked as [issue #8](https://github.com/tstapler/stapler-mcp/issues/8) —
-"later," purely operational, doesn't change user-facing capability.
+Was [issue #8](https://github.com/tstapler/stapler-mcp/issues/8) — closed
+with the publish sub-part explicitly left undone; re-open (or file a fresh
+issue) if actual registry publishing is ever wanted.
 
 ## Non-goals (for now)
 
