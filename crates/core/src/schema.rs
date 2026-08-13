@@ -335,6 +335,119 @@ pub struct BrowserActionOutput {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCloseSessionInput {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCloseSessionOutput {
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserTabsAction {
+    List,
+    New,
+    Select,
+    Close,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTabsInput {
+    pub session_id: String,
+    pub action: BrowserTabsAction,
+    /// Which tab to act on for `select`/`close`; omit `close` to close the
+    /// current tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    /// URL to open in the new tab for `new`; omit for a blank tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTabInfo {
+    pub index: usize,
+    pub url: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTabsOutput {
+    pub tabs: Vec<BrowserTabInfo>,
+    pub active_index: usize,
+    /// Populated only for `new`/`select`; `None` for `list`/`close`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<AxSnapshotOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserHoverInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`.
+    pub ref_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSelectOptionInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`, identifying the
+    /// `<select>`-like control.
+    pub ref_id: String,
+    /// Option value(s) to select; multiple entries select multiple options
+    /// in a multi-select control.
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPressKeyInput {
+    pub session_id: String,
+    /// Key name as understood by the underlying browser automation (e.g.
+    /// `"Enter"`, `"ArrowDown"`).
+    pub key: String,
+    /// A `ref` from a previous `AxSnapshotOutput`; omit to send the key to
+    /// the page's currently focused element.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserWaitForInput {
+    pub session_id: String,
+    /// Wait until this text appears on the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Wait until this text disappears from the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_gone: Option<String>,
+    /// Wait a fixed delay in milliseconds instead of polling for text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_ms: Option<u64>,
+    /// Bounds the whole wait; not meaningful together with `timeMs` beyond
+    /// it, since `timeMs` is itself the delay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +677,217 @@ mod tests {
         let value = serde_json::to_value(&node).unwrap();
 
         assert_eq!(value.get("value").unwrap(), "user@example.com");
+    }
+
+    #[test]
+    fn browser_close_session_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1"}"#;
+
+        let input: BrowserCloseSessionInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(round_tripped, serde_json::json!({"sessionId": "sess-1"}));
+    }
+
+    #[test]
+    fn browser_close_session_output_should_serialize_camel_case_when_given() {
+        let output = BrowserCloseSessionOutput { closed: true };
+
+        let value = serde_json::to_value(&output).unwrap();
+
+        assert_eq!(value, serde_json::json!({"closed": true}));
+    }
+
+    #[test]
+    fn browser_tabs_action_should_serialize_lowercase_when_each_variant_given() {
+        assert_eq!(
+            serde_json::to_value(BrowserTabsAction::List).unwrap(),
+            serde_json::json!("list")
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserTabsAction::New).unwrap(),
+            serde_json::json!("new")
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserTabsAction::Select).unwrap(),
+            serde_json::json!("select")
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserTabsAction::Close).unwrap(),
+            serde_json::json!("close")
+        );
+    }
+
+    #[test]
+    fn browser_tabs_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1","action":"select","index":2}"#;
+
+        let input: BrowserTabsInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+        assert_eq!(input.action, BrowserTabsAction::Select);
+        assert_eq!(input.index, Some(2));
+        assert_eq!(input.url, None);
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "action": "select",
+                "index": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn browser_tabs_input_should_omit_index_and_url_when_none_and_action_list_given() {
+        let input = BrowserTabsInput {
+            session_id: "sess-1".into(),
+            action: BrowserTabsAction::List,
+            index: None,
+            url: None,
+            timeout_seconds: None,
+        };
+
+        let json = serde_json::to_string(&input).unwrap();
+
+        assert!(!json.contains("index"));
+        assert!(!json.contains("url"));
+        assert!(!json.contains("timeoutSeconds"));
+    }
+
+    #[test]
+    fn browser_tabs_output_should_serialize_camel_case_and_omit_snapshot_when_list_given() {
+        let output = BrowserTabsOutput {
+            tabs: vec![BrowserTabInfo {
+                index: 0,
+                url: "https://example.com".into(),
+                title: "Example".into(),
+            }],
+            active_index: 0,
+            snapshot: None,
+        };
+
+        let value = serde_json::to_value(&output).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "tabs": [{"index": 0, "url": "https://example.com", "title": "Example"}],
+                "activeIndex": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn browser_hover_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1","refId":"e5"}"#;
+
+        let input: BrowserHoverInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+        assert_eq!(input.ref_id, "e5");
+        assert_eq!(input.timeout_seconds, None);
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!({"sessionId": "sess-1", "refId": "e5"})
+        );
+    }
+
+    #[test]
+    fn browser_select_option_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1","refId":"e5","values":["a","b"]}"#;
+
+        let input: BrowserSelectOptionInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+        assert_eq!(input.ref_id, "e5");
+        assert_eq!(input.values, vec!["a".to_string(), "b".to_string()]);
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "refId": "e5",
+                "values": ["a", "b"],
+            })
+        );
+    }
+
+    #[test]
+    fn browser_press_key_input_should_omit_ref_id_when_none_and_use_camelcase() {
+        let input = BrowserPressKeyInput {
+            session_id: "sess-1".into(),
+            key: "Enter".into(),
+            ref_id: None,
+            timeout_seconds: None,
+        };
+
+        let json = serde_json::to_string(&input).unwrap();
+
+        assert!(json.contains("\"key\":\"Enter\""));
+        assert!(!json.contains("refId"));
+    }
+
+    #[test]
+    fn browser_press_key_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1","key":"ArrowDown","refId":"e5"}"#;
+
+        let input: BrowserPressKeyInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+        assert_eq!(input.key, "ArrowDown");
+        assert_eq!(input.ref_id, Some("e5".to_string()));
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "key": "ArrowDown",
+                "refId": "e5",
+            })
+        );
+    }
+
+    #[test]
+    fn browser_wait_for_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1","text":"Loaded","timeoutSeconds":10}"#;
+
+        let input: BrowserWaitForInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+        assert_eq!(input.text, Some("Loaded".to_string()));
+        assert_eq!(input.text_gone, None);
+        assert_eq!(input.time_ms, None);
+        assert_eq!(input.timeout_seconds, Some(10));
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "text": "Loaded",
+                "timeoutSeconds": 10,
+            })
+        );
+    }
+
+    #[test]
+    fn browser_wait_for_input_should_omit_optional_fields_when_none_given() {
+        let input = BrowserWaitForInput {
+            session_id: "sess-1".into(),
+            text: None,
+            text_gone: None,
+            time_ms: Some(500),
+            timeout_seconds: None,
+        };
+
+        let json = serde_json::to_string(&input).unwrap();
+
+        assert!(!json.contains("\"text\""));
+        assert!(!json.contains("textGone"));
+        assert!(json.contains("\"timeMs\":500"));
+        assert!(!json.contains("timeoutSeconds"));
     }
 }

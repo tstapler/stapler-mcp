@@ -8,9 +8,11 @@ use stapler_mcp_core::daemon::{json_handler, Daemon};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
-    BraveSearchInput, BrowserClickInput, BrowserNavigateInput, BrowserSnapshotInput,
-    BrowserTypeInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
-    ListIndexedSourcesInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
+    BraveSearchInput, BrowserClickInput, BrowserCloseSessionInput, BrowserHoverInput,
+    BrowserNavigateInput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
+    BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput,
+    IndexDocsInput, ListIndexedSourcesInput, ReadWebsiteInput, RemoveIndexedSourceInput,
+    SearchDocsInput,
 };
 use stapler_mcp_core::tools::{browser, docs, fetch, search, webcrawl};
 use stapler_mcp_native::{
@@ -203,6 +205,72 @@ async fn run_daemon() {
             move |input: BrowserSnapshotInput| {
                 let browser = browser.clone();
                 async move { browser::browser_snapshot(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_close_session",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserCloseSessionInput| {
+                let browser = browser.clone();
+                async move { browser::browser_close_session(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_tabs",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserTabsInput| {
+                let browser = browser.clone();
+                async move { browser::browser_tabs(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_hover",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserHoverInput| {
+                let browser = browser.clone();
+                async move { browser::browser_hover(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_select_option",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserSelectOptionInput| {
+                let browser = browser.clone();
+                async move { browser::browser_select_option(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_press_key",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserPressKeyInput| {
+                let browser = browser.clone();
+                async move { browser::browser_press_key(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_wait_for",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserWaitForInput| {
+                let browser = browser.clone();
+                async move { browser::browser_wait_for(&*browser, input).await }
             }
         }),
     );

@@ -173,6 +173,43 @@ pub struct NavigateResult {
     pub snapshot: AxSnapshot,
 }
 
+/// What `BrowserDriver::tabs` should do to `session_id`'s tab set.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TabAction {
+    List,
+    New { url: Option<String> },
+    Select { index: usize },
+    /// `None` closes whichever tab is currently active.
+    Close { index: Option<usize> },
+}
+
+/// One entry in a `TabsResult` listing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabInfo {
+    pub index: usize,
+    pub url: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabsResult {
+    pub tabs: Vec<TabInfo>,
+    pub active_index: usize,
+    /// Populated only for `TabAction::New`/`Select` where a fresh snapshot of
+    /// the (now-active) tab is useful; `None` for `List`/`Close`.
+    pub snapshot: Option<AxSnapshot>,
+}
+
+/// What `BrowserDriver::wait_for` polls for before returning.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WaitCondition {
+    TextAppears(String),
+    TextDisappears(String),
+    /// A fixed delay, not a poll — used when the caller just needs to give
+    /// the page time (e.g. an animation) rather than watch for text.
+    TimeMs(u64),
+}
+
 pub trait BrowserDriver {
     /// Coarse, call-level operation (navigate + read title/HTML/text/final-URL
     /// in one hop) rather than exposing CDP-message-level primitives — this is
@@ -214,6 +251,60 @@ pub trait BrowserDriver {
     async fn snapshot(
         &self,
         session_id: &SessionId,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
+
+    /// Tears down `session_id`'s browser context/tab entirely. Distinct from
+    /// `tabs`' `Close` action: this ends the whole session (all its tabs),
+    /// not just one tab within it.
+    async fn close_session(&self, session_id: &SessionId) -> Result<(), PortError>;
+
+    /// Lists, opens, switches, or closes tabs within `session_id`'s browser
+    /// context.
+    async fn tabs(
+        &self,
+        session_id: &SessionId,
+        action: TabAction,
+        timeout: Duration,
+    ) -> Result<TabsResult, PortError>;
+
+    /// Resolves `locator` against `session_id`'s current snapshot and moves
+    /// the pointer over it, without clicking — needed for hover-triggered
+    /// menus/tooltips that `click` can't reach.
+    async fn hover(
+        &self,
+        session_id: &SessionId,
+        locator: &Locator,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
+
+    /// Resolves `locator` against `session_id`'s current snapshot (must be a
+    /// `<select>`-like control) and sets its selected option(s) to `values`.
+    async fn select_option(
+        &self,
+        session_id: &SessionId,
+        locator: &Locator,
+        values: &[String],
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
+
+    /// Sends `key` (e.g. `"Enter"`, `"ArrowDown"`) to `locator` if given, or
+    /// to the page's currently focused element otherwise.
+    async fn press_key(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+        locator: Option<&Locator>,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
+
+    /// Blocks until `condition` is satisfied or `timeout` elapses, then
+    /// returns a fresh snapshot. `timeout` bounds the whole wait, not a
+    /// single poll attempt.
+    async fn wait_for(
+        &self,
+        session_id: &SessionId,
+        condition: WaitCondition,
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError>;
 }
@@ -291,10 +382,10 @@ mod tests {
         assert_eq!(snapshot.navigated_from, None);
     }
 
-    /// Task 1.1.2 AC: a test double implementing only the 5 `BrowserDriver`
+    /// Task 1.1.2 AC: a test double implementing all `BrowserDriver`
     /// methods with `todo!()` bodies must compile — confirms the trait
-    /// signatures are well-formed and don't conflict with
-    /// `navigate_and_extract`. The bodies are never invoked.
+    /// signatures are well-formed and don't conflict with each other. The
+    /// bodies are never invoked.
     struct StubBrowser;
 
     impl BrowserDriver for StubBrowser {
@@ -341,10 +432,61 @@ mod tests {
         ) -> Result<AxSnapshot, PortError> {
             todo!()
         }
+
+        async fn close_session(&self, _session_id: &SessionId) -> Result<(), PortError> {
+            todo!()
+        }
+
+        async fn tabs(
+            &self,
+            _session_id: &SessionId,
+            _action: TabAction,
+            _timeout: Duration,
+        ) -> Result<TabsResult, PortError> {
+            todo!()
+        }
+
+        async fn hover(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
+        async fn select_option(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _values: &[String],
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
+        async fn press_key(
+            &self,
+            _session_id: &SessionId,
+            _key: &str,
+            _locator: Option<&Locator>,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
+        async fn wait_for(
+            &self,
+            _session_id: &SessionId,
+            _condition: WaitCondition,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
     }
 
     #[test]
-    fn stub_browser_driver_should_compile_when_five_methods_have_todo_bodies() {
+    fn stub_browser_driver_should_compile_when_all_methods_have_todo_bodies() {
         // Merely constructing it is the assertion: if the trait signatures
         // were malformed or clashed with `navigate_and_extract`, this file
         // wouldn't compile at all.

@@ -19,10 +19,16 @@
 
 use std::time::Duration;
 
-use crate::ports::{AxNode, AxSnapshot, BrowserDriver, Locator, PortError, SessionId};
+use crate::ports::{
+    AxNode, AxSnapshot, BrowserDriver, Locator, PortError, SessionId, TabAction, TabInfo,
+    WaitCondition,
+};
 use crate::schema::{
-    AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserSnapshotInput, BrowserTypeInput,
+    AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput,
+    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
+    BrowserTabInfo, BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
+    BrowserWaitForInput,
 };
 use crate::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 
@@ -51,6 +57,14 @@ fn to_snapshot_output(snapshot: AxSnapshot) -> AxSnapshotOutput {
         url: snapshot.url,
         truncated: snapshot.truncated,
         navigated_from: snapshot.navigated_from,
+    }
+}
+
+fn to_tab_info_output(tab: TabInfo) -> BrowserTabInfo {
+    BrowserTabInfo {
+        index: tab.index,
+        url: tab.url,
+        title: tab.title,
     }
 }
 
@@ -200,6 +214,204 @@ pub async fn browser_snapshot<B: BrowserDriver>(
     })
 }
 
+/// Ends `input.session_id`'s entire browser session (all its tabs), unlike
+/// `browser_tabs`' `close` action which only closes one tab within it.
+pub async fn browser_close_session<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserCloseSessionInput,
+) -> Result<BrowserCloseSessionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let session_id = SessionId(input.session_id.clone());
+
+    browser
+        .close_session(&session_id)
+        .await
+        .map_err(|e| map_error("close", &input.session_id, e))?;
+
+    Ok(BrowserCloseSessionOutput { closed: true })
+}
+
+pub async fn browser_tabs<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserTabsInput,
+) -> Result<BrowserTabsOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let action = match input.action {
+        BrowserTabsAction::List => TabAction::List,
+        BrowserTabsAction::New => TabAction::New {
+            url: input.url.clone(),
+        },
+        BrowserTabsAction::Select => {
+            let index = input
+                .index
+                .ok_or_else(|| "index is required for the select action".to_string())?;
+            TabAction::Select { index }
+        }
+        BrowserTabsAction::Close => TabAction::Close { index: input.index },
+    };
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+
+    let result = browser
+        .tabs(&session_id, action, timeout)
+        .await
+        .map_err(|e| map_error("tabs", &input.session_id, e))?;
+
+    Ok(BrowserTabsOutput {
+        tabs: result.tabs.into_iter().map(to_tab_info_output).collect(),
+        active_index: result.active_index,
+        snapshot: result.snapshot.map(to_snapshot_output),
+    })
+}
+
+pub async fn browser_hover<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserHoverInput,
+) -> Result<BrowserActionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if input.ref_id.is_empty() {
+        return Err("refId must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let locator = Locator(input.ref_id.clone());
+
+    let snapshot = browser
+        .hover(&session_id, &locator, timeout)
+        .await
+        .map_err(|e| map_error("hover", &input.session_id, e))?;
+
+    let note = snapshot.navigated_from.as_ref().map(|_| {
+        format!(
+            "hover navigated to {}; previous element refs are now invalid",
+            snapshot.url
+        )
+    });
+
+    Ok(BrowserActionOutput {
+        snapshot: to_snapshot_output(snapshot),
+        note,
+    })
+}
+
+pub async fn browser_select_option<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserSelectOptionInput,
+) -> Result<BrowserActionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if input.ref_id.is_empty() {
+        return Err("refId must not be empty".to_string());
+    }
+    if input.values.is_empty() {
+        return Err("values must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let locator = Locator(input.ref_id.clone());
+
+    let snapshot = browser
+        .select_option(&session_id, &locator, &input.values, timeout)
+        .await
+        .map_err(|e| map_error("select", &input.session_id, e))?;
+
+    let note = snapshot.navigated_from.as_ref().map(|_| {
+        format!(
+            "select navigated to {}; previous element refs are now invalid",
+            snapshot.url
+        )
+    });
+
+    Ok(BrowserActionOutput {
+        snapshot: to_snapshot_output(snapshot),
+        note,
+    })
+}
+
+pub async fn browser_press_key<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserPressKeyInput,
+) -> Result<BrowserActionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if input.key.is_empty() {
+        return Err("key must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let locator = input.ref_id.clone().map(Locator);
+
+    let snapshot = browser
+        .press_key(&session_id, &input.key, locator.as_ref(), timeout)
+        .await
+        .map_err(|e| map_error("press key", &input.session_id, e))?;
+
+    let note = snapshot.navigated_from.as_ref().map(|_| {
+        format!(
+            "press key navigated to {}; previous element refs are now invalid",
+            snapshot.url
+        )
+    });
+
+    Ok(BrowserActionOutput {
+        snapshot: to_snapshot_output(snapshot),
+        note,
+    })
+}
+
+/// Exactly one of `text`/`textGone`/`timeMs` must be set — zero leaves the
+/// driver with nothing to wait for, and more than one is ambiguous about
+/// which condition should actually gate the return.
+pub async fn browser_wait_for<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserWaitForInput,
+) -> Result<BrowserActionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let set_count = [
+        input.text.is_some(),
+        input.text_gone.is_some(),
+        input.time_ms.is_some(),
+    ]
+    .into_iter()
+    .filter(|set| *set)
+    .count();
+    if set_count == 0 {
+        return Err("exactly one of text, textGone, or timeMs must be set".to_string());
+    }
+    if set_count > 1 {
+        return Err("only one of text, textGone, or timeMs may be set".to_string());
+    }
+    let condition = if let Some(text) = input.text.clone() {
+        WaitCondition::TextAppears(text)
+    } else if let Some(text_gone) = input.text_gone.clone() {
+        WaitCondition::TextDisappears(text_gone)
+    } else {
+        WaitCondition::TimeMs(input.time_ms.expect("time_ms checked set above"))
+    };
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+
+    let snapshot = browser
+        .wait_for(&session_id, condition, timeout)
+        .await
+        .map_err(|e| map_error("wait for", &input.session_id, e))?;
+
+    Ok(BrowserActionOutput {
+        snapshot: to_snapshot_output(snapshot),
+        note: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -212,6 +424,19 @@ mod tests {
         click_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         type_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         snapshot_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        close_session_result: RefCell<Option<Result<(), PortError>>>,
+        hover_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        select_option_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        press_key_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        wait_for_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        /// Overrides whatever `tabs()` would otherwise compute from
+        /// `tabs_state` — used to simulate driver-level failures (e.g. an
+        /// unknown session) without disturbing the in-memory tab list.
+        tabs_error: RefCell<Option<PortError>>,
+        /// In-memory tab list `tabs()` operates on, seeded with a single tab
+        /// by `new()` so `List`/`Close` have something realistic to act on.
+        tabs_state: RefCell<Vec<TabInfo>>,
+        active_tab_index: RefCell<usize>,
         calls: RefCell<Vec<&'static str>>,
     }
 
@@ -222,6 +447,18 @@ mod tests {
                 click_result: RefCell::new(None),
                 type_result: RefCell::new(None),
                 snapshot_result: RefCell::new(None),
+                close_session_result: RefCell::new(None),
+                hover_result: RefCell::new(None),
+                select_option_result: RefCell::new(None),
+                press_key_result: RefCell::new(None),
+                wait_for_result: RefCell::new(None),
+                tabs_error: RefCell::new(None),
+                tabs_state: RefCell::new(vec![TabInfo {
+                    index: 0,
+                    url: "https://example.com/".to_string(),
+                    title: "Example".to_string(),
+                }]),
+                active_tab_index: RefCell::new(0),
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -243,6 +480,42 @@ mod tests {
 
         fn with_snapshot(self, result: Result<AxSnapshot, PortError>) -> Self {
             *self.snapshot_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_close_session(self, result: Result<(), PortError>) -> Self {
+            *self.close_session_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_hover(self, result: Result<AxSnapshot, PortError>) -> Self {
+            *self.hover_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_select_option(self, result: Result<AxSnapshot, PortError>) -> Self {
+            *self.select_option_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_press_key(self, result: Result<AxSnapshot, PortError>) -> Self {
+            *self.press_key_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_wait_for(self, result: Result<AxSnapshot, PortError>) -> Self {
+            *self.wait_for_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_tabs_error(self, err: PortError) -> Self {
+            *self.tabs_error.borrow_mut() = Some(err);
+            self
+        }
+
+        fn with_tabs(self, tabs: Vec<TabInfo>) -> Self {
+            *self.tabs_state.borrow_mut() = tabs;
+            *self.active_tab_index.borrow_mut() = 0;
             self
         }
 
@@ -310,6 +583,145 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .expect("snapshot result not configured")
+        }
+
+        async fn close_session(&self, _session_id: &SessionId) -> Result<(), PortError> {
+            self.calls.borrow_mut().push("close_session");
+            self.close_session_result
+                .borrow_mut()
+                .take()
+                .expect("close_session result not configured")
+        }
+
+        async fn tabs(
+            &self,
+            _session_id: &SessionId,
+            action: crate::ports::TabAction,
+            _timeout: Duration,
+        ) -> Result<crate::ports::TabsResult, PortError> {
+            self.calls.borrow_mut().push("tabs");
+            if let Some(err) = self.tabs_error.borrow_mut().take() {
+                return Err(err);
+            }
+
+            match action {
+                TabAction::List => Ok(crate::ports::TabsResult {
+                    tabs: self.tabs_state.borrow().clone(),
+                    active_index: *self.active_tab_index.borrow(),
+                    snapshot: None,
+                }),
+                TabAction::New { url } => {
+                    let mut tabs = self.tabs_state.borrow_mut();
+                    let new_index = tabs.len();
+                    let tab_url = url.unwrap_or_default();
+                    tabs.push(TabInfo {
+                        index: new_index,
+                        url: tab_url.clone(),
+                        title: format!("Tab {new_index}"),
+                    });
+                    *self.active_tab_index.borrow_mut() = new_index;
+                    Ok(crate::ports::TabsResult {
+                        tabs: tabs.clone(),
+                        active_index: new_index,
+                        snapshot: Some(sample_snapshot(&tab_url, None)),
+                    })
+                }
+                TabAction::Select { index } => {
+                    let tabs = self.tabs_state.borrow();
+                    if index >= tabs.len() {
+                        return Err(PortError::NotFound(format!("no tab at index {index}")));
+                    }
+                    *self.active_tab_index.borrow_mut() = index;
+                    Ok(crate::ports::TabsResult {
+                        tabs: tabs.clone(),
+                        active_index: index,
+                        snapshot: Some(sample_snapshot(&tabs[index].url, None)),
+                    })
+                }
+                TabAction::Close { index } => {
+                    let mut tabs = self.tabs_state.borrow_mut();
+                    let close_index = index.unwrap_or(*self.active_tab_index.borrow());
+                    if close_index >= tabs.len() {
+                        return Err(PortError::NotFound(format!(
+                            "no tab at index {close_index}"
+                        )));
+                    }
+                    if tabs.len() == 1 {
+                        return Err(PortError::Other(
+                            "cannot close the last remaining tab".to_string(),
+                        ));
+                    }
+                    tabs.remove(close_index);
+                    for (i, tab) in tabs.iter_mut().enumerate() {
+                        tab.index = i;
+                    }
+                    let mut active = self.active_tab_index.borrow_mut();
+                    if *active >= tabs.len() {
+                        *active = tabs.len() - 1;
+                    } else if close_index < *active {
+                        *active -= 1;
+                    }
+                    Ok(crate::ports::TabsResult {
+                        tabs: tabs.clone(),
+                        active_index: *active,
+                        snapshot: None,
+                    })
+                }
+            }
+        }
+
+        async fn hover(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            self.calls.borrow_mut().push("hover");
+            self.hover_result
+                .borrow_mut()
+                .take()
+                .expect("hover result not configured")
+        }
+
+        async fn select_option(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _values: &[String],
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            self.calls.borrow_mut().push("select_option");
+            self.select_option_result
+                .borrow_mut()
+                .take()
+                .expect("select_option result not configured")
+        }
+
+        async fn press_key(
+            &self,
+            _session_id: &SessionId,
+            _key: &str,
+            _locator: Option<&Locator>,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            self.calls.borrow_mut().push("press_key");
+            self.press_key_result
+                .borrow_mut()
+                .take()
+                .expect("press_key result not configured")
+        }
+
+        async fn wait_for(
+            &self,
+            _session_id: &SessionId,
+            _condition: crate::ports::WaitCondition,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            self.calls.borrow_mut().push("wait_for");
+            self.wait_for_result
+                .borrow_mut()
+                .take()
+                .expect("wait_for result not configured")
         }
     }
 
@@ -931,5 +1343,546 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    // -- browser_close_session ------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_close_session_should_return_closed_true_when_close_succeeds() {
+        let driver = FakeBrowserDriver::new().with_close_session(Ok(()));
+
+        let output = browser_close_session(
+            &driver,
+            BrowserCloseSessionInput {
+                session_id: "sess-1".to_string(),
+            },
+        )
+        .await
+        .expect("close should succeed");
+
+        assert!(output.closed);
+    }
+
+    #[tokio::test]
+    async fn browser_close_session_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_close_session(
+            &driver,
+            BrowserCloseSessionInput {
+                session_id: String::new(),
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_close_session_should_pass_not_found_message_through_verbatim() {
+        let driver = FakeBrowserDriver::new().with_close_session(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+                .to_string(),
+        )));
+
+        let err = browser_close_session(
+            &driver,
+            BrowserCloseSessionInput {
+                session_id: "sess-9".to_string(),
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_tabs -----------------------------------------------------------
+
+    fn tabs_input(action: BrowserTabsAction) -> BrowserTabsInput {
+        BrowserTabsInput {
+            session_id: "sess-1".to_string(),
+            action,
+            index: None,
+            url: None,
+            timeout_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_list_seeded_tab_when_list_action_given() {
+        let driver = FakeBrowserDriver::new();
+
+        let output = browser_tabs(&driver, tabs_input(BrowserTabsAction::List))
+            .await
+            .expect("list should succeed");
+
+        assert_eq!(output.tabs.len(), 1);
+        assert_eq!(output.tabs[0].url, "https://example.com/");
+        assert_eq!(output.active_index, 0);
+        assert!(output.snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_append_tab_and_activate_it_when_new_action_given() {
+        let driver = FakeBrowserDriver::new();
+        let mut input = tabs_input(BrowserTabsAction::New);
+        input.url = Some("https://example.com/new".to_string());
+
+        let output = browser_tabs(&driver, input)
+            .await
+            .expect("new should succeed");
+
+        assert_eq!(output.tabs.len(), 2);
+        assert_eq!(output.tabs[1].url, "https://example.com/new");
+        assert_eq!(output.active_index, 1);
+        assert!(output.snapshot.is_some());
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_activate_selected_index_when_select_action_given() {
+        let driver = FakeBrowserDriver::new().with_tabs(vec![
+            TabInfo {
+                index: 0,
+                url: "https://example.com/a".to_string(),
+                title: "A".to_string(),
+            },
+            TabInfo {
+                index: 1,
+                url: "https://example.com/b".to_string(),
+                title: "B".to_string(),
+            },
+        ]);
+        let mut input = tabs_input(BrowserTabsAction::Select);
+        input.index = Some(1);
+
+        let output = browser_tabs(&driver, input)
+            .await
+            .expect("select should succeed");
+
+        assert_eq!(output.active_index, 1);
+        assert!(output.snapshot.is_some());
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_return_err_when_select_index_out_of_range() {
+        let driver = FakeBrowserDriver::new();
+        let mut input = tabs_input(BrowserTabsAction::Select);
+        input.index = Some(9);
+
+        let err = browser_tabs(&driver, input)
+            .await
+            .expect_err("out-of-range index should be rejected");
+
+        assert!(err.contains("no tab at index 9"), "unexpected message: {err}");
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_return_err_when_select_index_missing() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_tabs(&driver, tabs_input(BrowserTabsAction::Select))
+            .await
+            .expect_err("missing index should be rejected");
+
+        assert_eq!(err, "index is required for the select action");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_close_named_tab_when_close_action_given_with_index() {
+        let driver = FakeBrowserDriver::new().with_tabs(vec![
+            TabInfo {
+                index: 0,
+                url: "https://example.com/a".to_string(),
+                title: "A".to_string(),
+            },
+            TabInfo {
+                index: 1,
+                url: "https://example.com/b".to_string(),
+                title: "B".to_string(),
+            },
+        ]);
+        let mut input = tabs_input(BrowserTabsAction::Close);
+        input.index = Some(0);
+
+        let output = browser_tabs(&driver, input)
+            .await
+            .expect("close should succeed");
+
+        assert_eq!(output.tabs.len(), 1);
+        assert_eq!(output.tabs[0].url, "https://example.com/b");
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_return_err_when_close_index_out_of_range() {
+        let driver = FakeBrowserDriver::new();
+        let mut input = tabs_input(BrowserTabsAction::Close);
+        input.index = Some(9);
+
+        let err = browser_tabs(&driver, input)
+            .await
+            .expect_err("out-of-range index should be rejected");
+
+        assert!(err.contains("no tab at index 9"), "unexpected message: {err}");
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_return_err_when_closing_the_last_remaining_tab() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_tabs(&driver, tabs_input(BrowserTabsAction::Close))
+            .await
+            .expect_err("closing the last tab should be rejected");
+
+        assert!(
+            err.contains("cannot close the last remaining tab"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+        let mut input = tabs_input(BrowserTabsAction::List);
+        input.session_id = String::new();
+
+        let err = browser_tabs(&driver, input)
+            .await
+            .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_should_pass_not_found_message_through_verbatim_when_session_unknown() {
+        let driver = FakeBrowserDriver::new().with_tabs_error(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+                .to_string(),
+        ));
+
+        let err = browser_tabs(&driver, tabs_input(BrowserTabsAction::List))
+            .await
+            .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_hover ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_hover_should_return_action_output_when_hover_succeeds() {
+        let driver =
+            FakeBrowserDriver::new().with_hover(Ok(sample_snapshot("https://example.com/", None)));
+
+        let output = browser_hover(
+            &driver,
+            BrowserHoverInput {
+                session_id: "sess-1".to_string(),
+                ref_id: "e1".to_string(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("hover should succeed");
+
+        assert_eq!(output.snapshot.url, "https://example.com/");
+        assert_eq!(output.note, None);
+    }
+
+    #[tokio::test]
+    async fn browser_hover_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_hover(
+            &driver,
+            BrowserHoverInput {
+                session_id: String::new(),
+                ref_id: "e1".to_string(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_hover_should_return_err_when_ref_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_hover(
+            &driver,
+            BrowserHoverInput {
+                session_id: "sess-1".to_string(),
+                ref_id: String::new(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty refId should be rejected");
+
+        assert_eq!(err, "refId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_hover_should_pass_not_found_message_through_verbatim() {
+        let driver = FakeBrowserDriver::new().with_hover(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+                .to_string(),
+        )));
+
+        let err = browser_hover(
+            &driver,
+            BrowserHoverInput {
+                session_id: "sess-9".to_string(),
+                ref_id: "e1".to_string(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_select_option ---------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_select_option_should_return_action_output_when_select_succeeds() {
+        let driver = FakeBrowserDriver::new()
+            .with_select_option(Ok(sample_snapshot("https://example.com/", None)));
+
+        let output = browser_select_option(
+            &driver,
+            BrowserSelectOptionInput {
+                session_id: "sess-1".to_string(),
+                ref_id: "e1".to_string(),
+                values: vec!["opt-a".to_string()],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("select should succeed");
+
+        assert_eq!(output.snapshot.url, "https://example.com/");
+    }
+
+    #[tokio::test]
+    async fn browser_select_option_should_return_err_when_values_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_select_option(
+            &driver,
+            BrowserSelectOptionInput {
+                session_id: "sess-1".to_string(),
+                ref_id: "e1".to_string(),
+                values: vec![],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty values should be rejected");
+
+        assert_eq!(err, "values must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_select_option_should_pass_not_found_message_through_verbatim() {
+        let driver = FakeBrowserDriver::new().with_select_option(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+                .to_string(),
+        )));
+
+        let err = browser_select_option(
+            &driver,
+            BrowserSelectOptionInput {
+                session_id: "sess-9".to_string(),
+                ref_id: "e1".to_string(),
+                values: vec!["opt-a".to_string()],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_press_key --------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_press_key_should_return_action_output_when_press_succeeds() {
+        let driver = FakeBrowserDriver::new()
+            .with_press_key(Ok(sample_snapshot("https://example.com/", None)));
+
+        let output = browser_press_key(
+            &driver,
+            BrowserPressKeyInput {
+                session_id: "sess-1".to_string(),
+                key: "Enter".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("press key should succeed");
+
+        assert_eq!(output.snapshot.url, "https://example.com/");
+    }
+
+    #[tokio::test]
+    async fn browser_press_key_should_return_err_when_key_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_press_key(
+            &driver,
+            BrowserPressKeyInput {
+                session_id: "sess-1".to_string(),
+                key: String::new(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty key should be rejected");
+
+        assert_eq!(err, "key must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_press_key_should_pass_not_found_message_through_verbatim() {
+        let driver = FakeBrowserDriver::new().with_press_key(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+                .to_string(),
+        )));
+
+        let err = browser_press_key(
+            &driver,
+            BrowserPressKeyInput {
+                session_id: "sess-9".to_string(),
+                key: "Enter".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_wait_for --------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_wait_for_should_return_action_output_when_text_condition_succeeds() {
+        let driver =
+            FakeBrowserDriver::new().with_wait_for(Ok(sample_snapshot("https://example.com/", None)));
+
+        let output = browser_wait_for(
+            &driver,
+            BrowserWaitForInput {
+                session_id: "sess-1".to_string(),
+                text: Some("Loaded".to_string()),
+                text_gone: None,
+                time_ms: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("wait for should succeed");
+
+        assert_eq!(output.snapshot.url, "https://example.com/");
+    }
+
+    #[tokio::test]
+    async fn browser_wait_for_should_return_err_when_zero_conditions_set() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_wait_for(
+            &driver,
+            BrowserWaitForInput {
+                session_id: "sess-1".to_string(),
+                text: None,
+                text_gone: None,
+                time_ms: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("zero conditions should be rejected");
+
+        assert_eq!(err, "exactly one of text, textGone, or timeMs must be set");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_wait_for_should_return_err_when_multiple_conditions_set() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_wait_for(
+            &driver,
+            BrowserWaitForInput {
+                session_id: "sess-1".to_string(),
+                text: Some("Loaded".to_string()),
+                text_gone: None,
+                time_ms: Some(500),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("multiple conditions should be rejected");
+
+        assert_eq!(err, "only one of text, textGone, or timeMs may be set");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_wait_for_should_pass_not_found_message_through_verbatim() {
+        let driver = FakeBrowserDriver::new().with_wait_for(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+                .to_string(),
+        )));
+
+        let err = browser_wait_for(
+            &driver,
+            BrowserWaitForInput {
+                session_id: "sess-9".to_string(),
+                text: Some("Loaded".to_string()),
+                text_gone: None,
+                time_ms: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
     }
 }

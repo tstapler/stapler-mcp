@@ -646,3 +646,308 @@ test("jsBrowserNavigate_should_reject_new_session_when_max_sessions_reached", as
         }
     }
 });
+
+// ---------------------------------------------------------------------------
+// Issue #12: session lifecycle + everyday interaction tools — jsCloseSession,
+// jsBrowserTabs, jsBrowserHover, jsBrowserSelectOption, jsBrowserPressKey,
+// jsBrowserWaitFor. Smoke-level coverage only (per task scope): one happy
+// path per function plus the couple of error/edge branches that are cheap to
+// hand-mock (last-tab close, out-of-range tab index, wait_for timeout).
+
+function makeMockPage(overrides = {}) {
+    return {
+        url: () => "https://example.com/",
+        title: async () => "Example",
+        on: () => {},
+        locator: (selector) => ({
+            hover: async () => {},
+            selectOption: async () => {},
+            press: async () => {},
+            ...overrides.locator,
+            _selector: selector,
+        }),
+        keyboard: { press: async () => {} },
+        ariaSnapshot: async () => '- text "hi"',
+        getByText: () => ({
+            first: () => ({
+                waitFor: async () => {},
+            }),
+        }),
+        waitForTimeout: async () => {},
+        close: async () => {},
+        context: () => ({ close: async () => {}, newPage: async () => makeMockPage() }),
+        ...overrides,
+    };
+}
+
+test("jsCloseSession_should_close_context_and_remove_session_from_map", async () => {
+    const id = "sess-close-1";
+    let contextClosed = false;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({ context: () => ({ close: async () => { contextClosed = true; } }) }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    await browserGlue.jsCloseSession(id);
+
+    assert.strictEqual(contextClosed, true);
+    assert.strictEqual(browserGlue.sessions.has(id), false);
+});
+
+test("jsBrowserTabs_should_list_single_tab_by_default_when_session_never_called_tabs_before", async () => {
+    const id = "sess-tabs-list-1";
+    browserGlue.sessions.set(id, { page: makeMockPage(), lastUsed: Date.now(), blocked: undefined });
+
+    const result = await browserGlue.jsBrowserTabs(id, JSON.stringify({ kind: "list" }), 5000);
+
+    assert.strictEqual(result.tabs.length, 1);
+    assert.strictEqual(result.activeIndex, 0);
+    assert.strictEqual(result.snapshot, null);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserTabs_should_open_new_tab_navigate_and_make_it_active", async () => {
+    const id = "sess-tabs-new-1";
+    let gotoUrl;
+    const newPage = makeMockPage({
+        url: () => "https://example.com/new",
+        goto: async (url) => { gotoUrl = url; },
+    });
+    const session = {
+        page: makeMockPage({ context: () => ({ newPage: async () => newPage }) }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    };
+    browserGlue.sessions.set(id, session);
+
+    const result = await browserGlue.jsBrowserTabs(
+        id,
+        JSON.stringify({ kind: "new", url: "https://example.com/new" }),
+        5000,
+    );
+
+    assert.strictEqual(gotoUrl, "https://example.com/new");
+    assert.strictEqual(result.tabs.length, 2);
+    assert.strictEqual(result.activeIndex, 1);
+    assert.notStrictEqual(result.snapshot, null);
+    assert.strictEqual(browserGlue.sessions.get(id).page, newPage);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserTabs_should_select_tab_by_index_and_return_its_snapshot", async () => {
+    const id = "sess-tabs-select-1";
+    const pageZero = makeMockPage({ url: () => "https://example.com/zero" });
+    const pageOne = makeMockPage({ url: () => "https://example.com/one" });
+    const session = { page: pageZero, lastUsed: Date.now(), blocked: undefined };
+    browserGlue.sessions.set(id, session);
+    // Seed multi-tab state directly (as if a prior "new" action had run).
+    session.pages = [pageZero, pageOne];
+    session.activeIndex = 0;
+
+    const result = await browserGlue.jsBrowserTabs(id, JSON.stringify({ kind: "select", index: 1 }), 5000);
+
+    assert.strictEqual(result.activeIndex, 1);
+    assert.strictEqual(browserGlue.sessions.get(id).page, pageOne);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserTabs_should_reject_select_with_out_of_range_index", async () => {
+    const id = "sess-tabs-select-oob-1";
+    browserGlue.sessions.set(id, { page: makeMockPage(), lastUsed: Date.now(), blocked: undefined });
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserTabs(id, JSON.stringify({ kind: "select", index: 5 }), 5000),
+        /out of range/,
+    );
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserTabs_should_close_tab_by_index_and_shift_active_index", async () => {
+    const id = "sess-tabs-close-1";
+    const pageZero = makeMockPage({ url: () => "https://example.com/zero" });
+    const pageOne = makeMockPage({ url: () => "https://example.com/one" });
+    const session = { page: pageOne, lastUsed: Date.now(), blocked: undefined };
+    session.pages = [pageZero, pageOne];
+    session.activeIndex = 1;
+    browserGlue.sessions.set(id, session);
+
+    const result = await browserGlue.jsBrowserTabs(id, JSON.stringify({ kind: "close", index: 0 }), 5000);
+
+    assert.strictEqual(result.tabs.length, 1);
+    assert.strictEqual(result.activeIndex, 0);
+    assert.strictEqual(browserGlue.sessions.get(id).page, pageOne);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserTabs_should_reject_closing_the_only_remaining_tab", async () => {
+    const id = "sess-tabs-close-last-1";
+    browserGlue.sessions.set(id, { page: makeMockPage(), lastUsed: Date.now(), blocked: undefined });
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserTabs(id, JSON.stringify({ kind: "close", index: 0 }), 5000),
+        /close_session/,
+    );
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserHover_should_hover_located_element_and_return_snapshot", async () => {
+    const id = "sess-hover-1";
+    let hoverCalls = 0;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({ locator: (selector) => ({ hover: async () => { hoverCalls += 1; }, _selector: selector }) }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserHover(id, "e1", 5000);
+
+    assert.strictEqual(hoverCalls, 1);
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserSelectOption_should_select_values_on_located_element_and_return_snapshot", async () => {
+    const id = "sess-select-option-1";
+    let receivedValues;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            locator: () => ({ selectOption: async (values) => { receivedValues = values; } }),
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSelectOption(id, "e1", JSON.stringify(["a", "b"]), 5000);
+
+    assert.deepStrictEqual(receivedValues, ["a", "b"]);
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserPressKey_should_press_on_page_keyboard_when_no_locator_given", async () => {
+    const id = "sess-press-key-1";
+    let pressedKey;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({ keyboard: { press: async (key) => { pressedKey = key; } } }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserPressKey(id, "Enter", undefined, 5000);
+
+    assert.strictEqual(pressedKey, "Enter");
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserPressKey_should_press_on_located_element_when_locator_given", async () => {
+    const id = "sess-press-key-2";
+    let pressedKey;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({ locator: () => ({ press: async (key) => { pressedKey = key; } }) }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserPressKey(id, "Enter", "e1", 5000);
+
+    assert.strictEqual(pressedKey, "Enter");
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserWaitFor_should_wait_for_text_to_appear_and_return_snapshot", async () => {
+    const id = "sess-wait-appear-1";
+    let waitedState;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            getByText: () => ({ first: () => ({ waitFor: async ({ state }) => { waitedState = state; } }) }),
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserWaitFor(
+        id,
+        JSON.stringify({ kind: "textAppears", text: "Loaded" }),
+        5000,
+    );
+
+    assert.strictEqual(waitedState, "visible");
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserWaitFor_should_reject_with_timed_out_marker_when_text_appears_wait_rejects", async () => {
+    const id = "sess-wait-appear-timeout-1";
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            getByText: () => ({
+                first: () => ({
+                    waitFor: async () => { throw new Error("Timeout 5000ms exceeded"); },
+                }),
+            }),
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserWaitFor(id, JSON.stringify({ kind: "textAppears", text: "Loaded" }), 5000),
+        /timed out waiting for text to appear/,
+    );
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserWaitFor_should_wait_for_text_to_disappear", async () => {
+    const id = "sess-wait-disappear-1";
+    let waitedState;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            getByText: () => ({ first: () => ({ waitFor: async ({ state }) => { waitedState = state; } }) }),
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserWaitFor(
+        id,
+        JSON.stringify({ kind: "textDisappears", text: "Loading" }),
+        5000,
+    );
+
+    assert.strictEqual(waitedState, "hidden");
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserWaitFor_should_wait_a_fixed_delay_for_timeMs_condition", async () => {
+    const id = "sess-wait-time-1";
+    let waitedMs;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({ waitForTimeout: async (ms) => { waitedMs = ms; } }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserWaitFor(id, JSON.stringify({ kind: "timeMs", ms: 250 }), 5000);
+
+    assert.strictEqual(waitedMs, 250);
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});

@@ -298,8 +298,9 @@ module.exports.blockedHostMessage = blockedHostMessage;
 // call against a blocked session fails until the caller re-navigates it to a
 // safe URL (see `jsBrowserNavigate`'s session-reuse path below, which clears
 // `blocked` before issuing `page.goto`).
-function wireFrameNavigatedGuard(sessionId, session) {
-    session.page.on("framenavigated", (frame) => {
+function wireFrameNavigatedGuard(sessionId, session, page) {
+    const target = page || session.page;
+    target.on("framenavigated", (frame) => {
         // Only top-level (main-frame) navigations are in scope for the SSRF
         // guard — an iframe embedding a private-looking URL isn't the
         // session itself navigating.
@@ -335,8 +336,9 @@ module.exports.crashedMessage = crashedMessage;
 // crashes; once that happens the page is unusable, so every subsequent call
 // against this session must fail instead of hanging or throwing an opaque
 // Playwright error.
-function wireCrashListener(sessionId, session) {
-    session.page.on("crash", () => {
+function wireCrashListener(sessionId, session, page) {
+    const target = page || session.page;
+    target.on("crash", () => {
         session.crashed = crashedMessage(sessionId);
     });
 }
@@ -374,6 +376,15 @@ function evictIfCrashed(session, sessionId) {
 // first would keep a crashed session's idle clock refreshed on every failed
 // call, so it would never age past `SESSION_IDLE_TIMEOUT_MS` and never get
 // reaped, defeating the crash-detection fix's purpose.
+// Shared locator-resolution helper for every ref-targeted action
+// (click/type/hover/select_option/press_key) — a `ref` from a snapshot
+// always resolves via Playwright's `aria-ref=` pseudo-selector, so this is
+// the one place that string gets built.
+function refLocator(page, refId) {
+    return page.locator(`aria-ref=${refId}`);
+}
+module.exports.refLocator = refLocator;
+
 function requireLiveSession(sessionId) {
     const session = requireSession(sessionId);
     evictIfCrashed(session, sessionId);
@@ -543,7 +554,7 @@ module.exports.jsBrowserClick = async function (sessionId, refId, timeoutMs) {
     const session = requireLiveSession(sessionId);
     return runSerialized(session, async () => {
         const urlBefore = session.page.url();
-        const locator = session.page.locator(`aria-ref=${refId}`);
+        const locator = refLocator(session.page, refId);
         try {
             await locator.click({ timeout: timeoutMs });
         } catch (e) {
@@ -567,7 +578,7 @@ module.exports.jsBrowserType = async function (sessionId, refId, text, timeoutMs
     const session = requireLiveSession(sessionId);
     return runSerialized(session, async () => {
         const urlBefore = session.page.url();
-        const locator = session.page.locator(`aria-ref=${refId}`);
+        const locator = refLocator(session.page, refId);
         try {
             await locator.fill(text, { timeout: timeoutMs });
         } catch (e) {
@@ -589,4 +600,220 @@ module.exports.jsBrowserSnapshot = async function (sessionId, timeoutMs) {
     const session = requireLiveSession(sessionId);
     void timeoutMs; // snapshot itself has nothing to time out on; kept for a uniform signature
     return runSerialized(session, () => captureSnapshot(session.page));
+};
+
+// ---------------------------------------------------------------------------
+// Session lifecycle + everyday interaction tools (issue #12): close_session,
+// tabs, hover, select_option, press_key, wait_for. `session.page` remains
+// "the active page" throughout — every existing helper above
+// (requireLiveSession/runSerialized/wireFrameNavigatedGuard/wireCrashListener)
+// keeps working against it unchanged. `session.pages`/`session.activeIndex`
+// are added lazily by `ensureTabs` so sessions built by earlier tests/call
+// sites (which only ever set `.page`) still work without a `tabs()` call.
+
+// Backfills the multi-tab fields onto a session that has only ever had a
+// single `.page` — the shape every session starts in today. Idempotent.
+function ensureTabs(session) {
+    if (!session.pages) {
+        session.pages = [session.page];
+        session.activeIndex = 0;
+    }
+}
+
+module.exports.jsCloseSession = async function (sessionId) {
+    const session = requireSession(sessionId);
+    // Removed up front, regardless of how the close below goes — a session
+    // whose page(s) fail to close cleanly must not stay reachable by a later
+    // call against the same id.
+    sessions.delete(sessionId);
+    ensureTabs(session);
+    // Every tab in a session shares the one `BrowserContext` created for it
+    // by `jsBrowserNavigate`'s "new session" path (`browser.newPage()`
+    // implicitly makes a dedicated context) — closing that context tears
+    // down all its tabs in one call. Test doubles for other suites hand in
+    // plain mock pages with no `context()`, so fall back to closing each
+    // page individually when that's the shape we got.
+    const first = session.pages[0];
+    const context = typeof first.context === "function" ? first.context() : null;
+    if (context && typeof context.close === "function") {
+        await context.close().catch(() => {});
+    } else {
+        await Promise.all(session.pages.map((p) => p.close().catch(() => {})));
+    }
+};
+
+async function buildTabsResult(session, snapshot) {
+    const tabs = await Promise.all(
+        session.pages.map(async (p, index) => ({
+            index,
+            url: p.url(),
+            title: await p.title().catch(() => ""),
+        })),
+    );
+    return { tabs, activeIndex: session.activeIndex, snapshot: snapshot || null };
+}
+
+module.exports.jsBrowserTabs = async function (sessionId, actionJson, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    ensureTabs(session);
+    const action = JSON.parse(actionJson);
+    return runSerialized(session, async () => {
+        if (action.kind === "list") {
+            return buildTabsResult(session, null);
+        }
+
+        if (action.kind === "new") {
+            const context = session.page.context();
+            const page = await context.newPage();
+            try {
+                if (action.url) {
+                    await page.goto(action.url, { timeout: timeoutMs, waitUntil: "load" });
+                }
+                wireFrameNavigatedGuard(sessionId, session, page);
+                wireCrashListener(sessionId, session, page);
+            } catch (err) {
+                await page.close().catch(() => {});
+                throw err;
+            }
+            session.pages.push(page);
+            session.activeIndex = session.pages.length - 1;
+            session.page = page;
+            // Same SSRF-race guard as `jsBrowserNavigate`'s own `page.goto` —
+            // a new tab opened straight to a blocked host must not leak a
+            // snapshot of it either.
+            await waitForBlockedGracePeriod(session);
+            checkBlocked(session);
+            const snapshot = await captureSnapshot(session.page);
+            return buildTabsResult(session, snapshot);
+        }
+
+        if (action.kind === "select") {
+            if (action.index < 0 || action.index >= session.pages.length) {
+                throw new Error(
+                    `tab index ${action.index} out of range (session has ${session.pages.length} tab(s))`,
+                );
+            }
+            session.activeIndex = action.index;
+            session.page = session.pages[session.activeIndex];
+            const snapshot = await captureSnapshot(session.page);
+            return buildTabsResult(session, snapshot);
+        }
+
+        if (action.kind === "close") {
+            const index = action.index ?? session.activeIndex;
+            if (index < 0 || index >= session.pages.length) {
+                throw new Error(
+                    `tab index ${index} out of range (session has ${session.pages.length} tab(s))`,
+                );
+            }
+            if (session.pages.length <= 1) {
+                throw new Error(
+                    `cannot close the only remaining tab in session '${sessionId}'; call close_session to end the whole session instead`,
+                );
+            }
+            const [closed] = session.pages.splice(index, 1);
+            await closed.close().catch(() => {});
+            if (session.activeIndex >= session.pages.length) {
+                session.activeIndex = session.pages.length - 1;
+            } else if (session.activeIndex > index) {
+                session.activeIndex -= 1;
+            }
+            session.page = session.pages[session.activeIndex];
+            return buildTabsResult(session, null);
+        }
+
+        throw new Error(`unknown tabs action kind '${action.kind}'`);
+    });
+};
+
+module.exports.jsBrowserHover = async function (sessionId, refId, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    return runSerialized(session, async () => {
+        const locator = refLocator(session.page, refId);
+        try {
+            await locator.hover({ timeout: timeoutMs });
+        } catch (e) {
+            throw describeActionError(refId, e);
+        }
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        return captureSnapshot(session.page);
+    });
+};
+
+module.exports.jsBrowserSelectOption = async function (sessionId, refId, valuesJson, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    const values = JSON.parse(valuesJson);
+    return runSerialized(session, async () => {
+        const locator = refLocator(session.page, refId);
+        try {
+            await locator.selectOption(values, { timeout: timeoutMs });
+        } catch (e) {
+            throw describeActionError(refId, e);
+        }
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        return captureSnapshot(session.page);
+    });
+};
+
+module.exports.jsBrowserPressKey = async function (sessionId, key, refId, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    return runSerialized(session, async () => {
+        try {
+            if (refId) {
+                await refLocator(session.page, refId).press(key, { timeout: timeoutMs });
+            } else {
+                await session.page.keyboard.press(key);
+            }
+        } catch (e) {
+            throw refId ? describeActionError(refId, e) : e;
+        }
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        return captureSnapshot(session.page);
+    });
+};
+
+module.exports.jsBrowserWaitFor = async function (sessionId, conditionJson, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    const condition = JSON.parse(conditionJson);
+    return runSerialized(session, async () => {
+        if (condition.kind === "textAppears") {
+            try {
+                await session.page
+                    .getByText(condition.text)
+                    .first()
+                    .waitFor({ state: "visible", timeout: timeoutMs });
+            } catch (e) {
+                throw new Error(
+                    `wait_for timed out waiting for text to appear: ${JSON.stringify(condition.text)}: ${e.message}`,
+                );
+            }
+        } else if (condition.kind === "textDisappears") {
+            try {
+                await session.page
+                    .getByText(condition.text)
+                    .first()
+                    .waitFor({ state: "hidden", timeout: timeoutMs });
+            } catch (e) {
+                throw new Error(
+                    `wait_for timed out waiting for text to disappear: ${JSON.stringify(condition.text)}: ${e.message}`,
+                );
+            }
+        } else if (condition.kind === "timeMs") {
+            // A fixed delay, not a poll — mirrors `WaitCondition::TimeMs`'s
+            // own doc comment (`crates/core/src/ports.rs`): used when the
+            // caller just needs to give the page time (e.g. an animation)
+            // rather than watch for text, so `waitForTimeout` here is
+            // intentional rather than the anti-pattern it would be as a
+            // stand-in for state-based waiting.
+            await session.page.waitForTimeout(condition.ms);
+        } else {
+            throw new Error(`unknown wait_for condition kind '${condition.kind}'`);
+        }
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        return captureSnapshot(session.page);
+    });
 };
