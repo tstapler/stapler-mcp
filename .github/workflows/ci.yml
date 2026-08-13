@@ -26,6 +26,13 @@ jobs:
   # npm-distributed thin client target); crates/native and crates/cli are
   # native-only (Unix sockets, headless Chrome) and excluded from this
   # target, matching the workspace's default-members split.
+  #
+  # Then wasm-bindgen turns that .wasm into the npm/pkg/ the package actually
+  # ships, and npm test runs the real e2e suite against it — same manual
+  # steps documented in README.md's Development section. Google Chrome ships
+  # preinstalled on GitHub-hosted ubuntu runners, so `channel: "chrome"` in
+  # crates/wasm/src/glue/browser.js needs no extra browser setup here (the
+  # native job's cargo test already relies on the same fact).
   wasm:
     runs-on: ubuntu-latest
     steps:
@@ -35,3 +42,15 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p stapler-mcp-core -p stapler-mcp-wasm --target wasm32-unknown-unknown
+      # Pin to the wasm-bindgen crate version in Cargo.lock — the CLI and the
+      # `wasm-bindgen` crate version must match exactly or bindgen refuses to
+      # process the .wasm.
+      - run: cargo install wasm-bindgen-cli --version 0.2.126
+      - run: wasm-bindgen --target nodejs target/wasm32-unknown-unknown/debug/stapler_mcp_wasm.wasm --out-dir npm/pkg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+        working-directory: npm
+      - run: npm test
+        working-directory: npm
