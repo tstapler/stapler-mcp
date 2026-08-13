@@ -622,24 +622,31 @@ function ensureTabs(session) {
 
 module.exports.jsCloseSession = async function (sessionId) {
     const session = requireSession(sessionId);
-    // Removed up front, regardless of how the close below goes — a session
-    // whose page(s) fail to close cleanly must not stay reachable by a later
-    // call against the same id.
+    // Removed from the map up front so no new call can look this session up
+    // again, regardless of how the close below goes. The actual close is
+    // still queued behind `runSerialized` — mirrors the native adapter's
+    // close_session fix (acquire the session's own lock before tearing it
+    // down): without this, a call already in flight against `session.page`
+    // (queued via `runSerialized` from `jsBrowserTabs`/etc.) would have its
+    // page/context closed out from under it mid-operation instead of running
+    // to completion first.
     sessions.delete(sessionId);
-    ensureTabs(session);
-    // Every tab in a session shares the one `BrowserContext` created for it
-    // by `jsBrowserNavigate`'s "new session" path (`browser.newPage()`
-    // implicitly makes a dedicated context) — closing that context tears
-    // down all its tabs in one call. Test doubles for other suites hand in
-    // plain mock pages with no `context()`, so fall back to closing each
-    // page individually when that's the shape we got.
-    const first = session.pages[0];
-    const context = typeof first.context === "function" ? first.context() : null;
-    if (context && typeof context.close === "function") {
-        await context.close().catch(() => {});
-    } else {
-        await Promise.all(session.pages.map((p) => p.close().catch(() => {})));
-    }
+    return runSerialized(session, async () => {
+        ensureTabs(session);
+        // Every tab in a session shares the one `BrowserContext` created for
+        // it by `jsBrowserNavigate`'s "new session" path (`browser.newPage()`
+        // implicitly makes a dedicated context) — closing that context tears
+        // down all its tabs in one call. Test doubles for other suites hand
+        // in plain mock pages with no `context()`, so fall back to closing
+        // each page individually when that's the shape we got.
+        const first = session.pages[0];
+        const context = typeof first.context === "function" ? first.context() : null;
+        if (context && typeof context.close === "function") {
+            await context.close().catch(() => {});
+        } else {
+            await Promise.all(session.pages.map((p) => p.close().catch(() => {})));
+        }
+    });
 };
 
 async function buildTabsResult(session, snapshot) {
@@ -666,11 +673,16 @@ module.exports.jsBrowserTabs = async function (sessionId, actionJson, timeoutMs)
             const context = session.page.context();
             const page = await context.newPage();
             try {
+                // Wired before `goto`, same as `jsBrowserNavigate` — a
+                // same-request redirect (server- or in-page) to a blocked
+                // host during this `goto` must have a listener already
+                // attached to catch it; wiring it after `goto` resolves
+                // would miss a redirect that happened during that call.
+                wireFrameNavigatedGuard(sessionId, session, page);
+                wireCrashListener(sessionId, session, page);
                 if (action.url) {
                     await page.goto(action.url, { timeout: timeoutMs, waitUntil: "load" });
                 }
-                wireFrameNavigatedGuard(sessionId, session, page);
-                wireCrashListener(sessionId, session, page);
             } catch (err) {
                 await page.close().catch(() => {});
                 throw err;

@@ -181,7 +181,7 @@ pub async fn run_daemon() -> Result<(), JsValue> {
             let browser = browser.clone();
             move |input: BrowserTabsInput| {
                 let browser = browser.clone();
-                async move { browser_tools::browser_tabs(&*browser, input).await }
+                async move { browser_tools::browser_tabs(&*browser, input, network_policy).await }
             }
         }),
     );

@@ -226,7 +226,7 @@ async fn run_daemon() {
             let browser = browser.clone();
             move |input: BrowserTabsInput| {
                 let browser = browser.clone();
-                async move { browser::browser_tabs(&*browser, input).await }
+                async move { browser::browser_tabs(&*browser, input, network_policy).await }
             }
         }),
     );

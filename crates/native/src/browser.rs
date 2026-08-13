@@ -1054,7 +1054,6 @@ impl BrowserDriver for NativeBrowser {
                     touch_or_evict(&self.sessions, &id.0, now_millis())?;
 
                     let (
-                        page,
                         latest_refs,
                         known_refs,
                         nav_generation,
@@ -1068,7 +1067,6 @@ impl BrowserDriver for NativeBrowser {
                             .get(&id.0)
                             .expect("touch_or_evict just confirmed presence");
                         (
-                            session.active_page(),
                             session.latest_refs.clone(),
                             session.known_refs.clone(),
                             session.nav_generation.clone(),
@@ -1085,6 +1083,20 @@ impl BrowserDriver for NativeBrowser {
                     // every `.await` below, so two calls against the same
                     // `Page` never interleave CDP round-trips.
                     let _session_guard = lock.lock().await;
+
+                    // `active_page()` is read only now, under the lock: a
+                    // concurrent `tabs()` Select/Close/New that runs before
+                    // this call acquires the guard can change which tab is
+                    // active, and reading it earlier would silently
+                    // navigate a tab this call no longer means to touch.
+                    let page = {
+                        let map = self.sessions.borrow();
+                        map.get(&id.0)
+                            .expect(
+                                "this holds the session's own lock; close_session cannot have removed it",
+                            )
+                            .active_page()
+                    };
 
                     // This call's own navigation is about to supersede
                     // whatever `blocked` may have recorded from a prior
@@ -1194,22 +1206,12 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (
-                page,
-                latest_refs,
-                known_refs,
-                nav_generation,
-                next_ref_id,
-                latest_url,
-                blocked,
-                lock,
-            ) = {
+            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.active_page(),
                     session.latest_refs.clone(),
                     session.known_refs.clone(),
                     session.nav_generation.clone(),
@@ -1225,6 +1227,18 @@ impl BrowserDriver for NativeBrowser {
             if let Some(reason) = blocked.borrow().clone() {
                 return Err(PortError::NotFound(reason));
             }
+
+            // `active_page()` is read only now, under the lock — see
+            // `navigate`'s matching comment for why reading it earlier would
+            // be stale against a concurrent `tabs()` switch/close.
+            let page = {
+                let map = self.sessions.borrow();
+                map.get(&session_id.0)
+                    .expect(
+                        "this holds the session's own lock; close_session cannot have removed it",
+                    )
+                    .active_page()
+            };
 
             // Clone out of the `RefCell` first — holding a live borrow across
             // the `.await` below would trip clippy::await_holding_refcell_ref
@@ -1253,19 +1267,29 @@ impl BrowserDriver for NativeBrowser {
     }
 
     /// Unlike `reap_expired` (which closes an *idle* session found by the
-    /// background scan), this closes a session the caller names directly —
-    /// removed from `sessions` synchronously (so no other call can newly
-    /// start against it), then the removed session's own lock is acquired to
-    /// let any call already in flight finish before its tabs are closed.
+    /// background scan), this closes a session the caller names directly.
+    /// The session's own lock is acquired *before* it is removed from
+    /// `sessions` — removing it first (then locking) would let this run
+    /// concurrently with a call already in flight: that call re-checks
+    /// `sessions.get(...)` after its own internal `.await`s (e.g. `tabs()`'s
+    /// `List`/`New` branches), and finding the entry gone mid-flight panics
+    /// on the `expect("touch_or_evict just confirmed presence")`. Locking
+    /// first forces this to wait until any in-flight call has finished
+    /// (and released the guard) before the entry can be removed.
     async fn close_session(&self, session_id: &SessionId) -> Result<(), PortError> {
         touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
-        let session = self
-            .sessions
-            .borrow_mut()
-            .remove(&session_id.0)
-            .expect("touch_or_evict just confirmed presence");
-        let lock = session.lock.clone();
+        let lock = {
+            let map = self.sessions.borrow();
+            let session = map
+                .get(&session_id.0)
+                .expect("touch_or_evict just confirmed presence");
+            session.lock.clone()
+        };
         let _session_guard = lock.lock().await;
+        let session =
+            self.sessions.borrow_mut().remove(&session_id.0).expect(
+                "this holds the session's own lock, so no concurrent call can have removed it",
+            );
         session.close().await;
         Ok(())
     }
@@ -1611,22 +1635,12 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (
-                page,
-                latest_refs,
-                known_refs,
-                nav_generation,
-                next_ref_id,
-                latest_url,
-                blocked,
-                lock,
-            ) = {
+            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.active_page(),
                     session.latest_refs.clone(),
                     session.known_refs.clone(),
                     session.nav_generation.clone(),
@@ -1642,6 +1656,18 @@ impl BrowserDriver for NativeBrowser {
             if let Some(reason) = blocked.borrow().clone() {
                 return Err(PortError::NotFound(reason));
             }
+
+            // `active_page()` is read only now, under the lock — see
+            // `navigate`'s matching comment for why reading it earlier would
+            // be stale against a concurrent `tabs()` switch/close.
+            let page = {
+                let map = self.sessions.borrow();
+                map.get(&session_id.0)
+                    .expect(
+                        "this holds the session's own lock; close_session cannot have removed it",
+                    )
+                    .active_page()
+            };
 
             match condition {
                 WaitCondition::TimeMs(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
@@ -1743,22 +1769,12 @@ impl NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (
-                page,
-                latest_refs,
-                known_refs,
-                nav_generation,
-                next_ref_id,
-                latest_url,
-                blocked,
-                lock,
-            ) = {
+            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.active_page(),
                     session.latest_refs.clone(),
                     session.known_refs.clone(),
                     session.nav_generation.clone(),
@@ -1774,6 +1790,18 @@ impl NativeBrowser {
             if let Some(reason) = blocked.borrow().clone() {
                 return Err(PortError::NotFound(reason));
             }
+
+            // `active_page()` is read only now, under the lock — see
+            // `navigate`'s matching comment for why reading it earlier would
+            // be stale against a concurrent `tabs()` switch/close.
+            let page = {
+                let map = self.sessions.borrow();
+                map.get(&session_id.0)
+                    .expect(
+                        "this holds the session's own lock; close_session cannot have removed it",
+                    )
+                    .active_page()
+            };
 
             let url_before = page
                 .url()

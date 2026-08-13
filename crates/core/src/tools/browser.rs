@@ -236,15 +236,29 @@ pub async fn browser_close_session<B: BrowserDriver>(
 pub async fn browser_tabs<B: BrowserDriver>(
     browser: &B,
     input: BrowserTabsInput,
+    policy: NetworkPolicy,
 ) -> Result<BrowserTabsOutput, String> {
     if input.session_id.is_empty() {
         return Err("sessionId must not be empty".to_string());
     }
     let action = match input.action {
         BrowserTabsAction::List => TabAction::List,
-        BrowserTabsAction::New => TabAction::New {
-            url: input.url.clone(),
-        },
+        BrowserTabsAction::New => {
+            // Same preflight as `browser_navigate` (design/ux.md Error 5a):
+            // without it, a literally-known-blocked URL (private IP,
+            // metadata endpoint) would fire its real network request via
+            // the driver's `page.goto` before any block detection runs,
+            // unlike navigating an existing tab.
+            if let Some(url) = input.url.as_deref().filter(|u| !u.is_empty()) {
+                let parsed = url::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
+                if let Some(reason) = blocked_host_reason(&parsed, policy) {
+                    return Err(format!("navigate blocked: {reason}"));
+                }
+            }
+            TabAction::New {
+                url: input.url.clone(),
+            }
+        }
         BrowserTabsAction::Select => {
             let index = input
                 .index
@@ -1418,9 +1432,13 @@ mod tests {
     async fn browser_tabs_should_list_seeded_tab_when_list_action_given() {
         let driver = FakeBrowserDriver::new();
 
-        let output = browser_tabs(&driver, tabs_input(BrowserTabsAction::List))
-            .await
-            .expect("list should succeed");
+        let output = browser_tabs(
+            &driver,
+            tabs_input(BrowserTabsAction::List),
+            NetworkPolicy::Enforce,
+        )
+        .await
+        .expect("list should succeed");
 
         assert_eq!(output.tabs.len(), 1);
         assert_eq!(output.tabs[0].url, "https://example.com/");
@@ -1434,7 +1452,7 @@ mod tests {
         let mut input = tabs_input(BrowserTabsAction::New);
         input.url = Some("https://example.com/new".to_string());
 
-        let output = browser_tabs(&driver, input)
+        let output = browser_tabs(&driver, input, NetworkPolicy::Enforce)
             .await
             .expect("new should succeed");
 
@@ -1461,7 +1479,7 @@ mod tests {
         let mut input = tabs_input(BrowserTabsAction::Select);
         input.index = Some(1);
 
-        let output = browser_tabs(&driver, input)
+        let output = browser_tabs(&driver, input, NetworkPolicy::Enforce)
             .await
             .expect("select should succeed");
 
@@ -1475,7 +1493,7 @@ mod tests {
         let mut input = tabs_input(BrowserTabsAction::Select);
         input.index = Some(9);
 
-        let err = browser_tabs(&driver, input)
+        let err = browser_tabs(&driver, input, NetworkPolicy::Enforce)
             .await
             .expect_err("out-of-range index should be rejected");
 
@@ -1489,9 +1507,13 @@ mod tests {
     async fn browser_tabs_should_return_err_when_select_index_missing() {
         let driver = FakeBrowserDriver::new();
 
-        let err = browser_tabs(&driver, tabs_input(BrowserTabsAction::Select))
-            .await
-            .expect_err("missing index should be rejected");
+        let err = browser_tabs(
+            &driver,
+            tabs_input(BrowserTabsAction::Select),
+            NetworkPolicy::Enforce,
+        )
+        .await
+        .expect_err("missing index should be rejected");
 
         assert_eq!(err, "index is required for the select action");
         assert_eq!(driver.call_count(), 0);
@@ -1514,7 +1536,7 @@ mod tests {
         let mut input = tabs_input(BrowserTabsAction::Close);
         input.index = Some(0);
 
-        let output = browser_tabs(&driver, input)
+        let output = browser_tabs(&driver, input, NetworkPolicy::Enforce)
             .await
             .expect("close should succeed");
 
@@ -1528,7 +1550,7 @@ mod tests {
         let mut input = tabs_input(BrowserTabsAction::Close);
         input.index = Some(9);
 
-        let err = browser_tabs(&driver, input)
+        let err = browser_tabs(&driver, input, NetworkPolicy::Enforce)
             .await
             .expect_err("out-of-range index should be rejected");
 
@@ -1542,9 +1564,13 @@ mod tests {
     async fn browser_tabs_should_return_err_when_closing_the_last_remaining_tab() {
         let driver = FakeBrowserDriver::new();
 
-        let err = browser_tabs(&driver, tabs_input(BrowserTabsAction::Close))
-            .await
-            .expect_err("closing the last tab should be rejected");
+        let err = browser_tabs(
+            &driver,
+            tabs_input(BrowserTabsAction::Close),
+            NetworkPolicy::Enforce,
+        )
+        .await
+        .expect_err("closing the last tab should be rejected");
 
         assert!(
             err.contains("cannot close the last remaining tab"),
@@ -1558,7 +1584,7 @@ mod tests {
         let mut input = tabs_input(BrowserTabsAction::List);
         input.session_id = String::new();
 
-        let err = browser_tabs(&driver, input)
+        let err = browser_tabs(&driver, input, NetworkPolicy::Enforce)
             .await
             .expect_err("empty sessionId should be rejected");
 
@@ -1573,9 +1599,13 @@ mod tests {
                 .to_string(),
         ));
 
-        let err = browser_tabs(&driver, tabs_input(BrowserTabsAction::List))
-            .await
-            .expect_err("not-found should surface as an error");
+        let err = browser_tabs(
+            &driver,
+            tabs_input(BrowserTabsAction::List),
+            NetworkPolicy::Enforce,
+        )
+        .await
+        .expect_err("not-found should surface as an error");
 
         assert_eq!(
             err,
