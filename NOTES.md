@@ -245,6 +245,19 @@ Was [issue #8](https://github.com/tstapler/stapler-mcp/issues/8) — closed
 with the publish sub-part explicitly left undone; re-open (or file a fresh
 issue) if actual registry publishing is ever wanted.
 
+### `stapler_browser_close_all_sessions` has no caller scoping — known limitation
+
+[Issue #23](https://github.com/tstapler/stapler-mcp/issues/23) added
+`stapler_browser_list_sessions`/`stapler_browser_close_all_sessions` so a
+caller (e.g. a subagent that crashed and leaked a session) can discover and
+clean up open sessions daemon-wide. `close_all_sessions` closes *every* open
+session regardless of which caller opened it — there's no per-caller
+identity or ownership tracking in the daemon protocol to scope it further.
+Fine for this project's single-agent-per-daemon usage; a multi-tenant daemon
+serving multiple unrelated callers concurrently would need real
+authorization/ownership before exposing this tool. No action planned unless
+that usage pattern actually shows up.
+
 ## Non-goals (for now)
 
 - No Windows support — the native adapter's Unix domain sockets are

@@ -206,6 +206,24 @@ pub struct TabsResult {
     pub snapshot: Option<AxSnapshot>,
 }
 
+/// One entry in a `list_sessions` listing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub tab_count: usize,
+    /// Milliseconds since this session's last activity, mirroring
+    /// `reap_expired`'s `now.saturating_sub(s.last_used())`.
+    pub idle_ms: u64,
+    /// `true` if an in-page navigation landed this session on a host the
+    /// SSRF guard would have blocked (see `BrowserSession::blocked`) — the
+    /// session is unusable until re-navigated.
+    pub blocked: bool,
+    /// `true` if the session's page target has crashed (see
+    /// `BrowserSession::crashed`) — the session is unusable and will be
+    /// evicted on next touch.
+    pub crashed: bool,
+}
+
 /// What `BrowserDriver::wait_for` polls for before returning.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WaitCondition {
@@ -264,6 +282,10 @@ pub trait BrowserDriver {
     /// `tabs`' `Close` action: this ends the whole session (all its tabs),
     /// not just one tab within it.
     async fn close_session(&self, session_id: &SessionId) -> Result<(), PortError>;
+
+    /// Lists every currently live session, across all callers — not scoped to
+    /// one session id, unlike every other method on this trait.
+    async fn list_sessions(&self) -> Result<Vec<SessionSummary>, PortError>;
 
     /// Lists, opens, switches, or closes tabs within `session_id`'s browser
     /// context.
@@ -440,6 +462,10 @@ mod tests {
         }
 
         async fn close_session(&self, _session_id: &SessionId) -> Result<(), PortError> {
+            todo!()
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<SessionSummary>, PortError> {
             todo!()
         }
 

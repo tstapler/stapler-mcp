@@ -27,10 +27,10 @@ use rmcp::handler::server::common::schema_for_input;
 use rmcp::model::JsonObject;
 
 use stapler_mcp_core::schema::{
-    BrowserClickInput, BrowserCloseSessionInput, BrowserHoverInput, BrowserNavigateInput,
-    BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput,
-    BrowserTypeInput, BrowserWaitForInput, IndexDocsInput, ListIndexedSourcesInput,
-    RemoveIndexedSourceInput, SearchDocsInput,
+    BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput, BrowserHoverInput,
+    BrowserListSessionsInput, BrowserNavigateInput, BrowserPressKeyInput, BrowserSelectOptionInput,
+    BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput, IndexDocsInput,
+    ListIndexedSourcesInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 
 #[path = "../src/thin_client.rs"]
@@ -110,6 +110,16 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
         (
             "stapler_browser_wait_for",
             schema_for_input::<BrowserWaitForInput>().expect("BrowserWaitForInput schemars schema"),
+        ),
+        (
+            "stapler_browser_list_sessions",
+            schema_for_input::<BrowserListSessionsInput>()
+                .expect("BrowserListSessionsInput schemars schema"),
+        ),
+        (
+            "stapler_browser_close_all_sessions",
+            schema_for_input::<BrowserCloseAllSessionsInput>()
+                .expect("BrowserCloseAllSessionsInput schemars schema"),
         ),
     ];
 

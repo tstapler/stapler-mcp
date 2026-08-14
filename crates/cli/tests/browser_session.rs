@@ -1233,3 +1233,107 @@ async fn browser_tabs_hover_select_press_wait_close_round_trip() {
     .await
     .expect("shutdown call should succeed");
 }
+
+/// Issue #23 integration: `stapler_browser_list_sessions` over the real
+/// daemon reports every open session, and `stapler_browser_close_all_sessions`
+/// then closes them all — a follow-up `list_sessions` call must come back
+/// empty, confirming the daemon's session map was actually drained rather
+/// than just returning a success shape.
+#[tokio::test]
+#[ignore]
+async fn list_sessions_should_report_open_sessions_and_close_all_sessions_should_drain_them() {
+    let (_tmp, socket, sock_path) = start_daemon(false).await;
+
+    for i in 0..2 {
+        let page = format!("data:text/html,<html><body>session {i}</body></html>");
+        client::call(
+            &socket,
+            &sock_path,
+            "stapler_browser_navigate",
+            Some(json!({ "url": page })),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("navigate #{i} should succeed, got: {e}"));
+    }
+
+    let list_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_list_sessions",
+        None,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("browser_list_sessions should succeed");
+    let sessions = list_result["sessions"]
+        .as_array()
+        .expect("sessions array present");
+    assert_eq!(
+        sessions.len(),
+        2,
+        "expected 2 open sessions, got: {list_result:?}"
+    );
+    for session in sessions {
+        assert!(
+            session["sessionId"].as_str().is_some_and(|s| !s.is_empty()),
+            "expected a non-empty sessionId, got: {session:?}"
+        );
+        assert_eq!(session["blocked"].as_bool(), Some(false));
+        assert_eq!(session["crashed"].as_bool(), Some(false));
+    }
+
+    let close_all_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_close_all_sessions",
+        None,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_close_all_sessions should succeed");
+    assert_eq!(
+        close_all_result["closed"]
+            .as_array()
+            .expect("closed array present")
+            .len(),
+        2,
+        "expected both sessions closed, got: {close_all_result:?}"
+    );
+    assert_eq!(
+        close_all_result["failed"]
+            .as_array()
+            .expect("failed array present")
+            .len(),
+        0,
+        "expected no failures, got: {close_all_result:?}"
+    );
+
+    let list_after_close = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_list_sessions",
+        None,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("browser_list_sessions after close_all should succeed");
+    assert_eq!(
+        list_after_close["sessions"]
+            .as_array()
+            .expect("sessions array present")
+            .len(),
+        0,
+        "expected no sessions left after close_all_sessions, got: {list_after_close:?}"
+    );
+
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
+}
