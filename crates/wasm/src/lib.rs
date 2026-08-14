@@ -19,11 +19,12 @@ use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{EnvPort, LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
-    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
-    BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
-    DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, ReadWebsiteInput,
-    ReadWebsiteOutput,
+    BrowserCloseAllSessionsInput, BrowserCloseAllSessionsOutput, BrowserCloseSessionInput,
+    BrowserCloseSessionOutput, BrowserHoverInput, BrowserListSessionsInput,
+    BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput,
+    BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
+    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
+    FetchPageInput, FetchPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
 };
 use stapler_mcp_core::tools::{browser as browser_tools, fetch, search, webcrawl};
 
@@ -171,6 +172,28 @@ pub async fn run_daemon() -> Result<(), JsValue> {
             move |input: BrowserCloseSessionInput| {
                 let browser = browser.clone();
                 async move { browser_tools::browser_close_session(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_list_sessions",
+        json_handler({
+            let browser = browser.clone();
+            move |_input: BrowserListSessionsInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_list_sessions(&*browser).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_close_all_sessions",
+        json_handler({
+            let browser = browser.clone();
+            move |_input: BrowserCloseAllSessionsInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_close_all_sessions(&*browser).await }
             }
         }),
     );
@@ -368,6 +391,26 @@ pub fn list_tools_json() -> Result<String, JsValue> {
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
         },
         ToolDescriptor {
+            name: "stapler_browser_list_sessions",
+            description: "List every active browser session with its tab count and idle time in milliseconds.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserListSessionsInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserListSessionsOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_close_all_sessions",
+            description: "Close every active browser session, best-effort. A failure closing one session does not stop the others. Returns the ids that closed successfully and the ids that failed with their error messages.",
+            input_schema: serde_json::to_value(schemars::schema_for!(
+                BrowserCloseAllSessionsInput
+            ))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(
+                BrowserCloseAllSessionsOutput
+            ))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
             name: "stapler_browser_tabs",
             description: "List, open, switch to, or close tabs in an existing browser session, via the `action` field (list/new/select/close). `select`/`close` take a tab `index`; `new` optionally takes a `url` to navigate the new tab to. Mirrors @playwright/mcp's browser_tabs.",
             input_schema: serde_json::to_value(schemars::schema_for!(BrowserTabsInput))
@@ -416,7 +459,7 @@ mod list_tools_tests {
     use super::list_tools_json;
 
     #[test]
-    fn list_tools_json_should_contain_ten_browser_tool_descriptors_when_called() {
+    fn list_tools_json_should_contain_twelve_browser_tool_descriptors_when_called() {
         let json = list_tools_json().expect("list_tools_json should succeed");
         let tools: serde_json::Value =
             serde_json::from_str(&json).expect("list_tools_json output should be valid JSON");
@@ -433,6 +476,8 @@ mod list_tools_tests {
             "stapler_browser_type",
             "stapler_browser_snapshot",
             "stapler_browser_close_session",
+            "stapler_browser_list_sessions",
+            "stapler_browser_close_all_sessions",
             "stapler_browser_tabs",
             "stapler_browser_hover",
             "stapler_browser_select_option",
@@ -446,8 +491,8 @@ mod list_tools_tests {
 
         assert_eq!(
             matched.len(),
-            10,
-            "expected exactly 10 browser tool descriptors, found {matched:?} in {names:?}"
+            12,
+            "expected exactly 12 browser tool descriptors, found {matched:?} in {names:?}"
         );
     }
 }

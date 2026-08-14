@@ -19,7 +19,7 @@ use futures::StreamExt;
 
 use stapler_mcp_core::ports::{
     AxSnapshot, BrowserDriver, ClockPort, Locator, NavigateResult, PageExtract, PortError,
-    SessionId, SleepPort, TabAction, TabInfo, TabsResult, WaitCondition,
+    SessionId, SessionSummary, SleepPort, TabAction, TabInfo, TabsResult, WaitCondition,
 };
 use stapler_mcp_core::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 use url::Url;
@@ -1301,6 +1301,24 @@ impl BrowserDriver for NativeBrowser {
             );
         session.close().await;
         Ok(())
+    }
+
+    /// In-memory only — no `.await` and thus no TOCTOU window between reading
+    /// the map and returning it, unlike every other method on this trait.
+    async fn list_sessions(&self) -> Result<Vec<SessionSummary>, PortError> {
+        let now = now_millis();
+        Ok(self
+            .sessions
+            .borrow()
+            .iter()
+            .map(|(id, session)| SessionSummary {
+                session_id: id.clone(),
+                tab_count: session.tabs.borrow().len(),
+                idle_ms: now.saturating_sub(session.last_used()),
+                blocked: session.blocked.borrow().is_some(),
+                crashed: session.crashed.get(),
+            })
+            .collect())
     }
 
     /// Lists, opens, switches to, or closes a tab within `session_id`. Each
@@ -2733,6 +2751,10 @@ mod tests {
         }
 
         async fn close_session(&self, _session_id: &SessionId) -> Result<(), PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<SessionSummary>, PortError> {
             panic!("not exercised by this test");
         }
 

@@ -620,6 +620,21 @@ function ensureTabs(session) {
     }
 }
 
+// Issue #23: cross-session enumeration. Pure in-memory read of the
+// `sessions` map — no `page`/`context` calls, so unlike every other export
+// here it needs no `runSerialized` queueing and returns synchronously
+// wrapped in a resolved promise for a uniform async signature.
+module.exports.jsListSessions = async function () {
+    const now = Date.now();
+    return Array.from(sessions, ([sessionId, session]) => ({
+        sessionId,
+        tabCount: session.pages ? session.pages.length : 1,
+        idleMs: now - session.lastUsed,
+        blocked: Boolean(session.blocked),
+        crashed: Boolean(session.crashed),
+    }));
+};
+
 module.exports.jsCloseSession = async function (sessionId) {
     const session = requireSession(sessionId);
     // Removed from the map up front so no new call can look this session up

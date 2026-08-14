@@ -25,10 +25,11 @@ use crate::ports::{
 };
 use crate::schema::{
     AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput,
-    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
-    BrowserTabInfo, BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
-    BrowserWaitForInput,
+    BrowserCloseAllSessionsOutput, BrowserCloseSessionFailure, BrowserCloseSessionInput,
+    BrowserCloseSessionOutput, BrowserHoverInput, BrowserListSessionsOutput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSessionSummary,
+    BrowserSnapshotInput, BrowserTabInfo, BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput,
+    BrowserTypeInput, BrowserWaitForInput,
 };
 use crate::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 
@@ -233,6 +234,62 @@ pub async fn browser_close_session<B: BrowserDriver>(
     Ok(BrowserCloseSessionOutput { closed: true })
 }
 
+pub async fn browser_list_sessions<B: BrowserDriver>(
+    browser: &B,
+) -> Result<BrowserListSessionsOutput, String> {
+    let sessions = browser
+        .list_sessions()
+        .await
+        .map_err(|e| format!("list sessions: {e}"))?;
+
+    Ok(BrowserListSessionsOutput {
+        sessions: sessions
+            .into_iter()
+            .map(|s| BrowserSessionSummary {
+                session_id: s.session_id,
+                tab_count: s.tab_count,
+                idle_ms: s.idle_ms,
+                blocked: s.blocked,
+                crashed: s.crashed,
+            })
+            .collect(),
+    })
+}
+
+/// Best-effort: closes every currently live session concurrently (not one at
+/// a time — a single wedged `close_session` call must never delay every
+/// other session's close). A failure closing one session never aborts the
+/// rest — every id is attempted and its outcome (closed or
+/// failed-with-message) is reported back.
+pub async fn browser_close_all_sessions<B: BrowserDriver>(
+    browser: &B,
+) -> Result<BrowserCloseAllSessionsOutput, String> {
+    let sessions = browser
+        .list_sessions()
+        .await
+        .map_err(|e| format!("list sessions: {e}"))?;
+
+    let results = futures::future::join_all(sessions.into_iter().map(|session| async move {
+        let session_id = SessionId(session.session_id.clone());
+        (session.session_id, browser.close_session(&session_id).await)
+    }))
+    .await;
+
+    let mut closed = Vec::new();
+    let mut failed = Vec::new();
+    for (session_id, result) in results {
+        match result {
+            Ok(()) => closed.push(session_id),
+            Err(e) => {
+                let error = map_error("close", &session_id, e);
+                failed.push(BrowserCloseSessionFailure { session_id, error });
+            }
+        }
+    }
+
+    Ok(BrowserCloseAllSessionsOutput { closed, failed })
+}
+
 pub async fn browser_tabs<B: BrowserDriver>(
     browser: &B,
     input: BrowserTabsInput,
@@ -429,6 +486,7 @@ pub async fn browser_wait_for<B: BrowserDriver>(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
 
     use super::*;
     use crate::ports::PageExtract;
@@ -438,7 +496,12 @@ mod tests {
         click_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         type_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         snapshot_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
-        close_session_result: RefCell<Option<Result<(), PortError>>>,
+        /// Queue of results consumed in order, one per `close_session` call —
+        /// a queue (rather than a single `Option`, like every other
+        /// `*_result` field on this fake) so `browser_close_all_sessions`
+        /// tests can drive distinct outcomes per session id.
+        close_session_results: RefCell<VecDeque<Result<(), PortError>>>,
+        list_sessions_result: RefCell<Option<Result<Vec<crate::ports::SessionSummary>, PortError>>>,
         hover_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         select_option_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         press_key_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
@@ -461,7 +524,8 @@ mod tests {
                 click_result: RefCell::new(None),
                 type_result: RefCell::new(None),
                 snapshot_result: RefCell::new(None),
-                close_session_result: RefCell::new(None),
+                close_session_results: RefCell::new(VecDeque::new()),
+                list_sessions_result: RefCell::new(None),
                 hover_result: RefCell::new(None),
                 select_option_result: RefCell::new(None),
                 press_key_result: RefCell::new(None),
@@ -498,7 +562,15 @@ mod tests {
         }
 
         fn with_close_session(self, result: Result<(), PortError>) -> Self {
-            *self.close_session_result.borrow_mut() = Some(result);
+            self.close_session_results.borrow_mut().push_back(result);
+            self
+        }
+
+        fn with_list_sessions(
+            self,
+            result: Result<Vec<crate::ports::SessionSummary>, PortError>,
+        ) -> Self {
+            *self.list_sessions_result.borrow_mut() = Some(result);
             self
         }
 
@@ -601,10 +673,18 @@ mod tests {
 
         async fn close_session(&self, _session_id: &SessionId) -> Result<(), PortError> {
             self.calls.borrow_mut().push("close_session");
-            self.close_session_result
+            self.close_session_results
+                .borrow_mut()
+                .pop_front()
+                .expect("close_session result not configured")
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<crate::ports::SessionSummary>, PortError> {
+            self.calls.borrow_mut().push("list_sessions");
+            self.list_sessions_result
                 .borrow_mut()
                 .take()
-                .expect("close_session result not configured")
+                .expect("list_sessions result not configured")
         }
 
         async fn tabs(
@@ -1414,6 +1494,137 @@ mod tests {
             err,
             "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
         );
+    }
+
+    // -- browser_list_sessions ---------------------------------------------
+
+    #[tokio::test]
+    async fn browser_list_sessions_should_return_sessions_when_sessions_exist() {
+        let driver =
+            FakeBrowserDriver::new().with_list_sessions(Ok(vec![crate::ports::SessionSummary {
+                session_id: "sess-1".to_string(),
+                tab_count: 2,
+                idle_ms: 1_500,
+                blocked: false,
+                crashed: false,
+            }]));
+
+        let output = browser_list_sessions(&driver)
+            .await
+            .expect("list_sessions should succeed");
+
+        assert_eq!(output.sessions.len(), 1);
+        assert_eq!(output.sessions[0].session_id, "sess-1");
+        assert_eq!(output.sessions[0].tab_count, 2);
+        assert_eq!(output.sessions[0].idle_ms, 1_500);
+        assert!(!output.sessions[0].blocked);
+        assert!(!output.sessions[0].crashed);
+    }
+
+    #[tokio::test]
+    async fn browser_list_sessions_should_surface_blocked_and_crashed_flags() {
+        let driver =
+            FakeBrowserDriver::new().with_list_sessions(Ok(vec![crate::ports::SessionSummary {
+                session_id: "sess-1".to_string(),
+                tab_count: 1,
+                idle_ms: 0,
+                blocked: true,
+                crashed: true,
+            }]));
+
+        let output = browser_list_sessions(&driver)
+            .await
+            .expect("list_sessions should succeed");
+
+        assert!(output.sessions[0].blocked);
+        assert!(output.sessions[0].crashed);
+    }
+
+    #[tokio::test]
+    async fn browser_list_sessions_should_propagate_error_when_driver_fails() {
+        let driver =
+            FakeBrowserDriver::new().with_list_sessions(Err(PortError::Other("boom".to_string())));
+
+        let err = browser_list_sessions(&driver)
+            .await
+            .expect_err("driver failure should surface as an error");
+
+        assert_eq!(err, "list sessions: boom");
+    }
+
+    #[tokio::test]
+    async fn browser_list_sessions_should_return_empty_when_no_sessions_exist() {
+        let driver = FakeBrowserDriver::new().with_list_sessions(Ok(vec![]));
+
+        let output = browser_list_sessions(&driver)
+            .await
+            .expect("list_sessions should succeed");
+
+        assert!(output.sessions.is_empty());
+    }
+
+    // -- browser_close_all_sessions -----------------------------------------
+
+    #[tokio::test]
+    async fn browser_close_all_sessions_should_report_closed_and_failed_when_one_of_each() {
+        let driver = FakeBrowserDriver::new()
+            .with_list_sessions(Ok(vec![
+                crate::ports::SessionSummary {
+                    session_id: "sess-1".to_string(),
+                    tab_count: 1,
+                    idle_ms: 0,
+                    blocked: false,
+                    crashed: false,
+                },
+                crate::ports::SessionSummary {
+                    session_id: "sess-2".to_string(),
+                    tab_count: 1,
+                    idle_ms: 0,
+                    blocked: false,
+                    crashed: false,
+                },
+            ]))
+            .with_close_session(Ok(()))
+            .with_close_session(Err(PortError::NotFound(
+                "no active browser session named 'sess-2'; call stapler_browser_navigate to start a new session"
+                    .to_string(),
+            )));
+
+        let output = browser_close_all_sessions(&driver)
+            .await
+            .expect("close_all_sessions should succeed");
+
+        assert_eq!(output.closed, vec!["sess-1".to_string()]);
+        assert_eq!(output.failed.len(), 1);
+        assert_eq!(output.failed[0].session_id, "sess-2");
+        assert_eq!(
+            output.failed[0].error,
+            "no active browser session named 'sess-2'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_close_all_sessions_should_return_empty_when_no_sessions_exist() {
+        let driver = FakeBrowserDriver::new().with_list_sessions(Ok(vec![]));
+
+        let output = browser_close_all_sessions(&driver)
+            .await
+            .expect("close_all_sessions should succeed");
+
+        assert!(output.closed.is_empty());
+        assert!(output.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_close_all_sessions_should_propagate_error_when_list_sessions_fails() {
+        let driver =
+            FakeBrowserDriver::new().with_list_sessions(Err(PortError::Other("boom".to_string())));
+
+        let err = browser_close_all_sessions(&driver)
+            .await
+            .expect_err("driver failure should surface as an error");
+
+        assert_eq!(err, "list sessions: boom");
     }
 
     // -- browser_tabs -----------------------------------------------------------

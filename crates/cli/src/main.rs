@@ -8,11 +8,11 @@ use stapler_mcp_core::daemon::{json_handler, Daemon};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
-    BraveSearchInput, BrowserClickInput, BrowserCloseSessionInput, BrowserHoverInput,
-    BrowserNavigateInput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
-    BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput,
-    IndexDocsInput, ListIndexedSourcesInput, ReadWebsiteInput, RemoveIndexedSourceInput,
-    SearchDocsInput,
+    BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
+    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserPressKeyInput,
+    BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
+    BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
+    ListIndexedSourcesInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 use stapler_mcp_core::tools::{browser, docs, fetch, search, webcrawl};
 use stapler_mcp_native::{
@@ -216,6 +216,28 @@ async fn run_daemon() {
             move |input: BrowserCloseSessionInput| {
                 let browser = browser.clone();
                 async move { browser::browser_close_session(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_list_sessions",
+        json_handler({
+            let browser = browser.clone();
+            move |_input: BrowserListSessionsInput| {
+                let browser = browser.clone();
+                async move { browser::browser_list_sessions(&*browser).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_close_all_sessions",
+        json_handler({
+            let browser = browser.clone();
+            move |_input: BrowserCloseAllSessionsInput| {
+                let browser = browser.clone();
+                async move { browser::browser_close_all_sessions(&*browser).await }
             }
         }),
     );

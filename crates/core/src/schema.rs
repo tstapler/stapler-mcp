@@ -448,6 +448,51 @@ pub struct BrowserWaitForInput {
     pub timeout_seconds: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserListSessionsInput {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSessionSummary {
+    pub session_id: String,
+    pub tab_count: usize,
+    /// Milliseconds since this session's last activity.
+    pub idle_ms: u64,
+    /// `true` if the session is stuck on a blocked host and needs
+    /// re-navigating before it's usable again.
+    pub blocked: bool,
+    /// `true` if the session's underlying page has crashed and the session
+    /// is no longer usable.
+    pub crashed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserListSessionsOutput {
+    pub sessions: Vec<BrowserSessionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCloseAllSessionsInput {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCloseSessionFailure {
+    pub session_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCloseAllSessionsOutput {
+    /// Session ids that were closed successfully.
+    pub closed: Vec<String>,
+    /// Session ids that failed to close, paired with the error message.
+    pub failed: Vec<BrowserCloseSessionFailure>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,5 +934,71 @@ mod tests {
         assert!(!json.contains("textGone"));
         assert!(json.contains("\"timeMs\":500"));
         assert!(!json.contains("timeoutSeconds"));
+    }
+
+    #[test]
+    fn should_serialize_empty_object_when_browser_list_sessions_input_given() {
+        let input = BrowserListSessionsInput {};
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn should_serialize_camel_case_when_browser_list_sessions_output_given() {
+        let output = BrowserListSessionsOutput {
+            sessions: vec![BrowserSessionSummary {
+                session_id: "sess-1".into(),
+                tab_count: 2,
+                idle_ms: 1_500,
+                blocked: false,
+                crashed: false,
+            }],
+        };
+
+        let value = serde_json::to_value(&output).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sessions": [{
+                    "sessionId": "sess-1",
+                    "tabCount": 2,
+                    "idleMs": 1_500,
+                    "blocked": false,
+                    "crashed": false,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn should_serialize_empty_object_when_browser_close_all_sessions_input_given() {
+        let input = BrowserCloseAllSessionsInput {};
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn should_serialize_camel_case_when_browser_close_all_sessions_output_given() {
+        let output = BrowserCloseAllSessionsOutput {
+            closed: vec!["sess-1".into()],
+            failed: vec![BrowserCloseSessionFailure {
+                session_id: "sess-2".into(),
+                error: "session sess-2 not found".into(),
+            }],
+        };
+
+        let value = serde_json::to_value(&output).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "closed": ["sess-1"],
+                "failed": [{
+                    "sessionId": "sess-2",
+                    "error": "session sess-2 not found",
+                }],
+            })
+        );
     }
 }

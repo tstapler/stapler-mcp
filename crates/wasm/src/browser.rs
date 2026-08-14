@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use stapler_mcp_core::ports::{
     AxNode, AxSnapshot, BrowserDriver, Locator, NavigateResult, PageExtract, PortError, SessionId,
-    TabAction, TabInfo, TabsResult, WaitCondition,
+    SessionSummary, TabAction, TabInfo, TabsResult, WaitCondition,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -37,6 +37,8 @@ extern "C" {
 
     #[wasm_bindgen(js_name = jsCloseSession)]
     fn js_close_session(session_id: &str) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsListSessions)]
+    fn js_list_sessions() -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsBrowserTabs)]
     fn js_browser_tabs(session_id: &str, action_json: &str, timeout_ms: f64) -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsBrowserHover)]
@@ -235,6 +237,17 @@ fn map_js_error(message: String) -> PortError {
     }
 }
 
+/// Mirrors `browser.js`'s `jsListSessions` plain-object shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsSessionSummary {
+    session_id: String,
+    tab_count: usize,
+    idle_ms: u64,
+    blocked: bool,
+    crashed: bool,
+}
+
 fn js_reject_to_port_error(e: JsValue) -> PortError {
     map_js_error(js_err_to_string(&e))
 }
@@ -351,6 +364,25 @@ impl BrowserDriver for WasmBrowser {
             .await
             .map_err(js_reject_to_port_error)?;
         Ok(())
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionSummary>, PortError> {
+        let result = JsFuture::from(js_list_sessions())
+            .await
+            .map_err(js_reject_to_port_error)?;
+
+        let parsed: Vec<JsSessionSummary> =
+            serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))?;
+        Ok(parsed
+            .into_iter()
+            .map(|s| SessionSummary {
+                session_id: s.session_id,
+                tab_count: s.tab_count,
+                idle_ms: s.idle_ms,
+                blocked: s.blocked,
+                crashed: s.crashed,
+            })
+            .collect())
     }
 
     async fn tabs(

@@ -14,13 +14,14 @@ use stapler_mcp_core::client::{self, EnsureOptions};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
-    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
-    BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
-    DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, IndexDocsInput,
-    IndexDocsOutput, ListIndexedSourcesInput, ListIndexedSourcesOutput, ReadWebsiteInput,
-    ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
-    SearchDocsOutput,
+    BrowserCloseAllSessionsInput, BrowserCloseAllSessionsOutput, BrowserCloseSessionInput,
+    BrowserCloseSessionOutput, BrowserHoverInput, BrowserListSessionsInput,
+    BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput,
+    BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
+    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
+    FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
+    ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput,
+    RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
 };
 use stapler_mcp_native::{
     NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
@@ -191,6 +192,32 @@ impl ThinClient {
         params: Parameters<BrowserCloseSessionInput>,
     ) -> Result<Json<BrowserCloseSessionOutput>, String> {
         call_daemon("stapler_browser_close_session", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_list_sessions",
+        description = "List every active browser session with its tab count and idle time in milliseconds."
+    )]
+    async fn browser_list_sessions(
+        &self,
+        params: Parameters<BrowserListSessionsInput>,
+    ) -> Result<Json<BrowserListSessionsOutput>, String> {
+        call_daemon("stapler_browser_list_sessions", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_close_all_sessions",
+        description = "Close every active browser session, best-effort. A failure closing one session does not stop the others. Returns the ids that closed successfully and the ids that failed with their error messages."
+    )]
+    async fn browser_close_all_sessions(
+        &self,
+        params: Parameters<BrowserCloseAllSessionsInput>,
+    ) -> Result<Json<BrowserCloseAllSessionsOutput>, String> {
+        call_daemon("stapler_browser_close_all_sessions", params.0)
             .await
             .map(Json)
     }

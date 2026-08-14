@@ -100,6 +100,8 @@ verbatim — never hand-authored twice.
 | `stapler_browser_select_option` | Select one or more options in a `<select>` element identified by a snapshot `ref`. |
 | `stapler_browser_press_key` | Press a single keyboard key, optionally focusing an element by `ref` first. |
 | `stapler_browser_wait_for` | Wait until given text appears/disappears and/or a minimum time elapses before returning the next snapshot. |
+| `stapler_browser_list_sessions` | List all open sessions daemon-wide (session id, tab count, idle time in milliseconds, and `blocked`/`crashed` diagnostic flags) — useful for finding sessions leaked by a crashed subagent. |
+| `stapler_browser_close_all_sessions` | Close every open session daemon-wide and report which succeeded/failed. Closes are attempted concurrently so one wedged session doesn't block the rest. **No per-caller scoping**: this closes sessions daemon-wide regardless of which caller opened them — safe for a single-agent daemon, but a multi-tenant daemon would need real authorization before exposing it. |
 
 All tools are verified end-to-end against real dependencies (a real headless
 Chrome, a real mock/live HTTP server) rather than mocked ports — on both
