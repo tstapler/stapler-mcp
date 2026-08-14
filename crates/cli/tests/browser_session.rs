@@ -1337,3 +1337,63 @@ async fn list_sessions_should_report_open_sessions_and_close_all_sessions_should
     .await
     .expect("shutdown call should succeed");
 }
+
+/// Issue #20: `Accessibility.getFullAXTree` stops at frame boundaries, so a
+/// same-origin `<iframe>`'s content used to come back as a childless
+/// `Iframe`-role node even though its document has its own accessibility
+/// tree. `crates/native/src/ax.rs`'s `fetch_frame_tree` fixes this by
+/// resolving each `Iframe` node's child frame via `DOM.describeNode` and
+/// recursively splicing in that frame's `getFullAXTree` result. Verifies the
+/// fix end to end over the real daemon/CDP path: a `data:` page with a
+/// same-origin `srcdoc` iframe must surface the iframe's button in the
+/// top-level snapshot, not just the top-level button.
+#[tokio::test]
+#[ignore]
+async fn snapshot_should_include_iframe_content_when_same_origin_iframe_present() {
+    let (_tmp, socket, sock_path) = start_daemon(false).await;
+
+    let page = "data:text/html,\
+        <html><body>\
+        <button>top-button</button>\
+        <iframe srcdoc=\"%3Cbutton%3Eiframe-button%3C%2Fbutton%3E\"></iframe>\
+        </body></html>";
+
+    let navigate_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_navigate",
+        Some(json!({ "url": page })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_navigate should succeed");
+
+    fn contains_button_named(node: &serde_json::Value, name: &str) -> bool {
+        if node["role"].as_str() == Some("button") && node["name"].as_str() == Some(name) {
+            return true;
+        }
+        node["children"]
+            .as_array()
+            .is_some_and(|children| children.iter().any(|c| contains_button_named(c, name)))
+    }
+
+    let root = &navigate_result["snapshot"]["root"];
+    assert!(
+        contains_button_named(root, "top-button"),
+        "expected top-level button in snapshot, got: {navigate_result:?}"
+    );
+    assert!(
+        contains_button_named(root, "iframe-button"),
+        "expected same-origin iframe's button to be traversed into the snapshot, got: {navigate_result:?}"
+    );
+
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
+}

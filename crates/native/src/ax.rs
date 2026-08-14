@@ -17,10 +17,17 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use chromiumoxide::cdp::browser_protocol::accessibility::{AxValue, GetFullAxTreeParams};
-use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
+use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, DescribeNodeParams};
+use chromiumoxide::cdp::browser_protocol::page::FrameId;
 use chromiumoxide::Page;
+use futures::future::BoxFuture;
 
 use stapler_mcp_core::ports::{AxNode, AxSnapshot, PortError};
+
+/// Depth limit on same-process `<iframe>` recursion (issue #20). Guards
+/// against pathological/self-referential iframe nesting; a frame beyond this
+/// depth is left as a childless `Iframe` leaf rather than recursed into.
+const MAX_FRAME_DEPTH: usize = 5;
 
 /// Upper bound on how many non-root nodes a single `AxSnapshot` may contain
 /// before `build_tree` stops descending and sets `AxSnapshot.truncated`
@@ -100,36 +107,104 @@ pub async fn capture_snapshot(
         .mainframe()
         .await
         .map_err(|e| PortError::Other(e.to_string()))?;
-    let params = match frame_id {
-        Some(id) => GetFullAxTreeParams::builder().frame_id(id).build(),
-        None => GetFullAxTreeParams::default(),
-    };
-    let resp = page
-        .execute(params)
-        .await
-        .map_err(|e| PortError::Other(e.to_string()))?;
     let url = page
         .url()
         .await
         .map_err(|e| PortError::Other(e.to_string()))?
         .unwrap_or_default();
 
-    let raw: Vec<RawAxNode> = resp
-        .result
-        .nodes
-        .iter()
-        .map(|n| RawAxNode {
-            node_id: n.node_id.inner().to_string(),
-            parent_id: n.parent_id.as_ref().map(|p| p.inner().to_string()),
-            ignored: n.ignored,
-            role: n.role.as_ref().and_then(ax_value_to_string),
-            name: n.name.as_ref().and_then(ax_value_to_string),
-            value: n.value.as_ref().and_then(ax_value_to_string),
-            backend_node_id: n.backend_dom_node_id.as_ref().map(|id| *id.inner()),
-        })
-        .collect();
+    let raw = fetch_frame_tree(page, frame_id, 0).await?;
 
     Ok(build_tree(&raw, next_ref_id, url, previous_refs))
+}
+
+/// Fetches one frame's AX tree via `Accessibility.getFullAXTree`, then
+/// recursively fetches and splices in the AX tree of every same-process
+/// child `<iframe>` it finds, since `getFullAXTree` itself stops at frame
+/// boundaries — an `Iframe`-role node comes back with no children even
+/// though its document has its own accessibility tree (issue #20; confirmed
+/// empirically that shadow DOM content is *already* included in a single
+/// call, so only iframe traversal needed fixing).
+///
+/// A raw `AXNodeId` is only unique within the frame that produced it, so
+/// every node id (and parent id) is prefixed with its owning frame's id
+/// before nodes from different frames are flattened into one `Vec` for
+/// `build_tree`. Depth-limited by `MAX_FRAME_DEPTH`. A child frame that
+/// fails to resolve — cross-origin (a different renderer process, per
+/// site-isolation, that this CDP session can't traverse into), closed
+/// mid-capture, or lacking a content document — is left as a childless
+/// `Iframe` leaf rather than failing the whole capture.
+fn fetch_frame_tree(
+    page: &Page,
+    frame_id: Option<FrameId>,
+    depth: usize,
+) -> BoxFuture<'_, Result<Vec<RawAxNode>, PortError>> {
+    Box::pin(async move {
+        let params = match frame_id.clone() {
+            Some(id) => GetFullAxTreeParams::builder().frame_id(id).build(),
+            None => GetFullAxTreeParams::default(),
+        };
+        let resp = page
+            .execute(params)
+            .await
+            .map_err(|e| PortError::Other(e.to_string()))?;
+
+        let frame_key = frame_id.as_ref().map(|f| f.inner().as_str()).unwrap_or("");
+        let prefix = |id: &str| format!("{frame_key}:{id}");
+
+        let mut raw: Vec<RawAxNode> = resp
+            .result
+            .nodes
+            .iter()
+            .map(|n| RawAxNode {
+                node_id: prefix(n.node_id.inner()),
+                parent_id: n.parent_id.as_ref().map(|p| prefix(p.inner())),
+                ignored: n.ignored,
+                role: n.role.as_ref().and_then(ax_value_to_string),
+                name: n.name.as_ref().and_then(ax_value_to_string),
+                value: n.value.as_ref().and_then(ax_value_to_string),
+                backend_node_id: n.backend_dom_node_id.as_ref().map(|id| *id.inner()),
+            })
+            .collect();
+
+        if depth >= MAX_FRAME_DEPTH {
+            return Ok(raw);
+        }
+
+        let iframe_nodes: Vec<(String, i64)> = raw
+            .iter()
+            .filter(|n| n.role.as_deref() == Some("Iframe"))
+            .filter_map(|n| n.backend_node_id.map(|b| (n.node_id.clone(), b)))
+            .collect();
+
+        for (iframe_node_id, backend_id) in iframe_nodes {
+            let describe = match page
+                .execute(
+                    DescribeNodeParams::builder()
+                        .backend_node_id(BackendNodeId::new(backend_id))
+                        .build(),
+                )
+                .await
+            {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let Some(child_frame_id) = describe.result.node.frame_id.clone() else {
+                continue;
+            };
+            let mut child_nodes =
+                match fetch_frame_tree(page, Some(child_frame_id), depth + 1).await {
+                    Ok(nodes) => nodes,
+                    Err(_) => continue,
+                };
+            if let Some(child_root) = child_nodes.iter_mut().find(|n| n.parent_id.is_none()) {
+                child_root.parent_id = Some(iframe_node_id);
+            }
+            raw.extend(child_nodes);
+        }
+
+        Ok(raw)
+    })
 }
 
 /// Best-effort extraction of a plain string out of an `AXValue`'s `optional
