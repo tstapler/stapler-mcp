@@ -5,19 +5,21 @@ use std::time::Duration;
 
 use chromiumoxide::cdp::browser_protocol::accessibility::{EnableParams, GetPartialAxTreeParams};
 use chromiumoxide::cdp::browser_protocol::dom::{
-    BackendNodeId, DescribeNodeParams, ResolveNodeParams,
+    BackendNodeId, DescribeNodeParams, GetContentQuadsParams, ResolveNodeParams,
 };
+use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
 use chromiumoxide::cdp::browser_protocol::page::{
     EventFrameNavigated, EventFrameRequestedNavigation,
 };
 use chromiumoxide::cdp::browser_protocol::target::EventTargetCrashed;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
-use chromiumoxide::{Browser, BrowserConfig, Page};
+use chromiumoxide::layout::Point;
+use chromiumoxide::{keys, Browser, BrowserConfig, Page};
 use futures::StreamExt;
 
 use stapler_mcp_core::ports::{
     AxSnapshot, BrowserDriver, ClockPort, Locator, NavigateResult, PageExtract, PortError,
-    SessionId, SleepPort,
+    SessionId, SleepPort, TabAction, TabInfo, TabsResult, WaitCondition,
 };
 use stapler_mcp_core::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 use url::Url;
@@ -98,7 +100,16 @@ trait CloseableSession: SessionState {
 /// A single persistent browser tab, keyed by `SessionId` in
 /// `NativeBrowser::sessions`.
 struct BrowserSession {
-    page: Page,
+    /// Every tab open in this session, in open order. Index 0 is the tab
+    /// created by the `navigate` call that started the session; further
+    /// entries are appended by `tabs(TabAction::New)` and removed by
+    /// `tabs(TabAction::Close)`. Never empty while the session is alive —
+    /// closing the last tab must go through `close_session` instead (see
+    /// `NativeBrowser::tabs`).
+    tabs: RefCell<Vec<Page>>,
+    /// Index into `tabs` of the tab every other `BrowserDriver` method
+    /// (`click`/`type_text`/`snapshot`/`hover`/...) operates against.
+    active_tab: Cell<usize>,
     /// Millis-since-epoch of the start of the most recent
     /// `navigate`/`click`/`type_text`/`snapshot` call against this session —
     /// bumped synchronously, before any `.await`, so an in-flight call is
@@ -152,6 +163,15 @@ struct BrowserSession {
     lock: Rc<tokio::sync::Mutex<()>>,
 }
 
+impl BrowserSession {
+    /// The tab every `BrowserDriver` method (other than `tabs` itself)
+    /// operates against.
+    fn active_page(&self) -> Page {
+        let tabs = self.tabs.borrow();
+        tabs[self.active_tab.get()].clone()
+    }
+}
+
 impl SessionState for BrowserSession {
     fn last_used(&self) -> u64 {
         self.last_used.get()
@@ -179,8 +199,11 @@ impl CloseableSession for BrowserSession {
         // A crashed target's `Page` is never routed through this path (see
         // `touch_or_evict`'s crash branch, which evicts without closing) —
         // only a live-but-idle session reaches here, so `close()` erroring
-        // is a best-effort cleanup, not a signal worth propagating.
-        let _ = self.page.close().await;
+        // is a best-effort cleanup, not a signal worth propagating. Every
+        // tab the session ever opened is closed, not just the active one.
+        for page in self.tabs.into_inner() {
+            let _ = page.close().await;
+        }
     }
 }
 
@@ -591,6 +614,123 @@ async fn dispatch_type(
     .await
 }
 
+async fn dispatch_select_option(
+    page: &Page,
+    backend_node_id: BackendNodeId,
+    values: &[String],
+) -> Result<(), PortError> {
+    let values_json: Vec<serde_json::Value> = values
+        .iter()
+        .cloned()
+        .map(serde_json::Value::String)
+        .collect();
+    invoke_on_node(
+        page,
+        backend_node_id,
+        "select_option",
+        "function(values) { \
+         for (const opt of this.options) { opt.selected = values.includes(opt.value); } \
+         this.dispatchEvent(new Event('input', {bubbles: true})); \
+         this.dispatchEvent(new Event('change', {bubbles: true})); }",
+        vec![serde_json::Value::Array(values_json)],
+    )
+    .await
+}
+
+/// Moves the mouse to the center of `backend_node_id`'s content box (real CDP
+/// `Input.dispatchMouseEvent`, not a synthetic DOM event) so page CSS
+/// `:hover` rules and JS `mouseenter`/`mouseover` listeners actually fire —
+/// mirrors `chromiumoxide::Element::hover()`'s own implementation, which
+/// can't be reused directly since `Element` can't be constructed from a bare
+/// `BackendNodeId` (its constructor is crate-private).
+async fn dispatch_hover(page: &Page, backend_node_id: BackendNodeId) -> Result<(), PortError> {
+    let quads = page
+        .execute(
+            GetContentQuadsParams::builder()
+                .backend_node_id(backend_node_id)
+                .build(),
+        )
+        .await
+        .map_err(|e| PortError::Other(e.to_string()))?;
+    let quad = quads
+        .result
+        .quads
+        .into_iter()
+        .find(|q| q.inner().len() == 8)
+        .ok_or_else(|| {
+            PortError::Other("element has no visible content box to hover over".to_string())
+        })?;
+    let corners = quad.inner();
+    let cx = (corners[0] + corners[2] + corners[4] + corners[6]) / 4.0;
+    let cy = (corners[1] + corners[3] + corners[5] + corners[7]) / 4.0;
+    page.move_mouse(Point::new(cx, cy))
+        .await
+        .map_err(|e| PortError::Other(e.to_string()))?;
+    Ok(())
+}
+
+/// Sends a `key`/`code`/`keyCode` triple looked up from the standard US
+/// keyboard layout as a `keyDown`+`keyUp` pair via `Input.dispatchKeyEvent` —
+/// reimplements `chromiumoxide`'s own (crate-private) `PageInner::press_key`
+/// using only its public `chromiumoxide::keys::get_key_definition` API,
+/// since neither `Page` nor `Element` expose `press_key` publicly. If
+/// `backend_node_id` is given, the target node is focused first so keyboard
+/// events land on it — `Input.dispatchKeyEvent` always targets whatever
+/// element currently has focus, not a specific node.
+async fn dispatch_key_event(
+    page: &Page,
+    key: &str,
+    backend_node_id: Option<BackendNodeId>,
+) -> Result<(), PortError> {
+    if let Some(id) = backend_node_id {
+        invoke_on_node(
+            page,
+            id,
+            "press_key",
+            "function() { this.focus(); }",
+            vec![],
+        )
+        .await?;
+    }
+
+    let key_definition = keys::get_key_definition(key)
+        .ok_or_else(|| PortError::Other(format!("unknown key '{key}'")))?;
+
+    let mut cmd = DispatchKeyEventParams::builder();
+    let key_down_event_type = if let Some(txt) = key_definition.text {
+        cmd = cmd.text(txt);
+        DispatchKeyEventType::KeyDown
+    } else if key_definition.key.len() == 1 {
+        cmd = cmd.text(key_definition.key);
+        DispatchKeyEventType::KeyDown
+    } else {
+        DispatchKeyEventType::RawKeyDown
+    };
+    cmd = cmd
+        .r#type(DispatchKeyEventType::KeyDown)
+        .key(key_definition.key)
+        .code(key_definition.code)
+        .windows_virtual_key_code(key_definition.key_code)
+        .native_virtual_key_code(key_definition.key_code);
+
+    page.execute(
+        cmd.clone()
+            .r#type(key_down_event_type)
+            .build()
+            .map_err(PortError::Other)?,
+    )
+    .await
+    .map_err(|e| PortError::Other(e.to_string()))?;
+    page.execute(
+        cmd.r#type(DispatchKeyEventType::KeyUp)
+            .build()
+            .map_err(PortError::Other)?,
+    )
+    .await
+    .map_err(|e| PortError::Other(e.to_string()))?;
+    Ok(())
+}
+
 /// Pure logic behind the `Page.frameNavigated` listener's SSRF re-check
 /// (Task 3.4.2): parses `frame_url`, runs it through the same
 /// `blocked_host_reason` guard `navigate`'s own pre-flight check uses, and
@@ -860,7 +1000,8 @@ impl BrowserDriver for NativeBrowser {
                         // documented path: re-navigate this sessionId to a
                         // safe URL.
                         let session = BrowserSession {
-                            page,
+                            tabs: RefCell::new(vec![page]),
+                            active_tab: Cell::new(0),
                             last_used: Cell::new(now_millis()),
                             latest_refs,
                             known_refs,
@@ -889,7 +1030,8 @@ impl BrowserDriver for NativeBrowser {
                     );
 
                     let session = BrowserSession {
-                        page,
+                        tabs: RefCell::new(vec![page]),
+                        active_tab: Cell::new(0),
                         last_used: Cell::new(now_millis()),
                         latest_refs,
                         known_refs,
@@ -912,7 +1054,6 @@ impl BrowserDriver for NativeBrowser {
                     touch_or_evict(&self.sessions, &id.0, now_millis())?;
 
                     let (
-                        page,
                         latest_refs,
                         known_refs,
                         nav_generation,
@@ -926,7 +1067,6 @@ impl BrowserDriver for NativeBrowser {
                             .get(&id.0)
                             .expect("touch_or_evict just confirmed presence");
                         (
-                            session.page.clone(),
                             session.latest_refs.clone(),
                             session.known_refs.clone(),
                             session.nav_generation.clone(),
@@ -943,6 +1083,28 @@ impl BrowserDriver for NativeBrowser {
                     // every `.await` below, so two calls against the same
                     // `Page` never interleave CDP round-trips.
                     let _session_guard = lock.lock().await;
+
+                    // `active_page()` is read only now, under the lock: a
+                    // concurrent `tabs()` Select/Close/New that runs before
+                    // this call acquires the guard can change which tab is
+                    // active, and reading it earlier would silently
+                    // navigate a tab this call no longer means to touch.
+                    //
+                    // Holding the lock does NOT guarantee the session is
+                    // still present: `close_session` acquires the same lock
+                    // and removes the session from the map *before*
+                    // awaiting `session.close()`, so a call that was parked
+                    // on `lock.lock().await` can win the lock only after
+                    // `close_session` has already deleted the entry. Treat
+                    // that as the caller closed the session out from under
+                    // this call, not as an invariant violation.
+                    let page = {
+                        let map = self.sessions.borrow();
+                        match map.get(&id.0) {
+                            Some(session) => session.active_page(),
+                            None => return Err(PortError::NotFound(not_found_message(&id.0))),
+                        }
+                    };
 
                     // This call's own navigation is about to supersede
                     // whatever `blocked` may have recorded from a prior
@@ -1018,7 +1180,7 @@ impl BrowserDriver for NativeBrowser {
         locator: &Locator,
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError> {
-        self.dispatch_action(session_id, locator, timeout, Action::Click)
+        self.dispatch_action(session_id, Some(locator), timeout, Action::Click)
             .await
     }
 
@@ -1030,8 +1192,13 @@ impl BrowserDriver for NativeBrowser {
         text: &str,
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError> {
-        self.dispatch_action(session_id, locator, timeout, Action::Type(text.to_string()))
-            .await
+        self.dispatch_action(
+            session_id,
+            Some(locator),
+            timeout,
+            Action::Type(text.to_string()),
+        )
+        .await
     }
 
     /// Read-only: captures and installs a fresh AX tree without dispatching
@@ -1047,22 +1214,12 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (
-                page,
-                latest_refs,
-                known_refs,
-                nav_generation,
-                next_ref_id,
-                latest_url,
-                blocked,
-                lock,
-            ) = {
+            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.page.clone(),
                     session.latest_refs.clone(),
                     session.known_refs.clone(),
                     session.nav_generation.clone(),
@@ -1078,6 +1235,19 @@ impl BrowserDriver for NativeBrowser {
             if let Some(reason) = blocked.borrow().clone() {
                 return Err(PortError::NotFound(reason));
             }
+
+            // `active_page()` is read only now, under the lock — see
+            // `navigate`'s matching comment for why reading it earlier would
+            // be stale against a concurrent `tabs()` switch/close, and for
+            // why the session can still be gone here despite holding the
+            // lock (a racing `close_session` may have won it first).
+            let page = {
+                let map = self.sessions.borrow();
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
+            };
 
             // Clone out of the `RefCell` first — holding a live borrow across
             // the `.await` below would trip clippy::await_holding_refcell_ref
@@ -1104,45 +1274,413 @@ impl BrowserDriver for NativeBrowser {
             .await
             .map_err(|_| PortError::Timeout)?
     }
-}
 
-/// What `dispatch_action` does to the resolved node.
-enum Action {
-    Click,
-    Type(String),
-}
+    /// Unlike `reap_expired` (which closes an *idle* session found by the
+    /// background scan), this closes a session the caller names directly.
+    /// The session's own lock is acquired *before* it is removed from
+    /// `sessions` — removing it first (then locking) would let this run
+    /// concurrently with a call already in flight: that call re-checks
+    /// `sessions.get(...)` after its own internal `.await`s (e.g. `tabs()`'s
+    /// `List`/`New` branches), and finding the entry gone mid-flight panics
+    /// on the `expect("touch_or_evict just confirmed presence")`. Locking
+    /// first forces this to wait until any in-flight call has finished
+    /// (and released the guard) before the entry can be removed.
+    async fn close_session(&self, session_id: &SessionId) -> Result<(), PortError> {
+        touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+        let lock = {
+            let map = self.sessions.borrow();
+            let session = map
+                .get(&session_id.0)
+                .expect("touch_or_evict just confirmed presence");
+            session.lock.clone()
+        };
+        let _session_guard = lock.lock().await;
+        let session =
+            self.sessions.borrow_mut().remove(&session_id.0).expect(
+                "this holds the session's own lock, so no concurrent call can have removed it",
+            );
+        session.close().await;
+        Ok(())
+    }
 
-impl NativeBrowser {
-    /// Shared body of `click`/`type_text` (Tasks 3.3.1 + 3.3.2): session
-    /// lookup, locator resolution, liveness re-check, dispatch, an SSRF
-    /// grace-period poll, then a fresh AX capture with `navigated_from` set
-    /// if the dispatch itself caused a (non-blocked) navigation.
-    async fn dispatch_action(
+    /// Lists, opens, switches to, or closes a tab within `session_id`. Each
+    /// action re-checks `blocked` on entry like every other `BrowserDriver`
+    /// method; `New`/`Select` additionally capture a fresh `AxSnapshot` of
+    /// the tab that becomes active (per `TabsResult::snapshot`'s doc comment)
+    /// while `List`/`Close` return `snapshot: None`.
+    async fn tabs(
+        &self,
+        session_id: &SessionId,
+        action: TabAction,
+        timeout: Duration,
+    ) -> Result<TabsResult, PortError> {
+        let fut = async {
+            touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+
+            let (lock, blocked) = {
+                let map = self.sessions.borrow();
+                let session = map
+                    .get(&session_id.0)
+                    .expect("touch_or_evict just confirmed presence");
+                (session.lock.clone(), session.blocked.clone())
+            };
+            let _session_guard = lock.lock().await;
+
+            if let Some(reason) = blocked.borrow().clone() {
+                return Err(PortError::NotFound(reason));
+            }
+
+            match action {
+                TabAction::List => {
+                    // First map access after acquiring `_session_guard` above:
+                    // holding the lock does NOT guarantee the session is still
+                    // present, because `close_session` removes it from the map
+                    // *before* awaiting `session.close()` while holding the
+                    // same lock — see `navigate`'s matching comment. Once this
+                    // access succeeds, later accesses within this arm are safe
+                    // since `close_session` can't run while this call holds
+                    // the guard.
+                    let tabs_snapshot = {
+                        let map = self.sessions.borrow();
+                        match map.get(&session_id.0) {
+                            Some(session) => session.tabs.borrow().clone(),
+                            None => {
+                                return Err(PortError::NotFound(not_found_message(&session_id.0)))
+                            }
+                        }
+                    };
+                    let tabs = list_tab_infos(&tabs_snapshot).await?;
+                    let active_index = {
+                        let map = self.sessions.borrow();
+                        map.get(&session_id.0)
+                            .expect("presence confirmed above under the same guard")
+                            .active_tab
+                            .get()
+                    };
+                    if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                        session.last_used.set(now_millis());
+                    }
+                    Ok(TabsResult {
+                        tabs,
+                        active_index,
+                        snapshot: None,
+                    })
+                }
+                TabAction::New { url } => {
+                    let page = self
+                        .browser
+                        .new_page("about:blank")
+                        .await
+                        .map_err(|e| PortError::Other(e.to_string()))?;
+
+                    // Everything below can fail before `page` is registered in
+                    // `session.tabs`; on any of those failures the CDP target
+                    // must be closed explicitly or it leaks for the process's
+                    // lifetime (pages don't close themselves on `Drop`).
+                    if let Err(err) = async {
+                        page.execute(EnableParams::default())
+                            .await
+                            .map_err(|e| PortError::Other(e.to_string()))?;
+
+                        // First map access after acquiring `_session_guard`
+                        // above — see `navigate`'s matching comment on why
+                        // holding the lock doesn't guarantee the session is
+                        // still present.
+                        let (blocked, crashed) = {
+                            let map = self.sessions.borrow();
+                            match map.get(&session_id.0) {
+                                Some(session) => (session.blocked.clone(), session.crashed.clone()),
+                                None => {
+                                    return Err(PortError::NotFound(not_found_message(
+                                        &session_id.0,
+                                    )))
+                                }
+                            }
+                        };
+                        spawn_session_listeners(
+                            &page,
+                            session_id.0.clone(),
+                            blocked.clone(),
+                            crashed,
+                        )
+                        .await;
+
+                        if let Some(target_url) = &url {
+                            page.goto(target_url)
+                                .await
+                                .map_err(|e| PortError::Other(e.to_string()))?;
+                            page.wait_for_navigation()
+                                .await
+                                .map_err(|e| PortError::Other(e.to_string()))?;
+                        }
+
+                        if let Some(reason) = poll_blocked_grace_period(&blocked).await {
+                            return Err(PortError::NotFound(reason));
+                        }
+                        Ok(())
+                    }
+                    .await
+                    {
+                        let _ = page.close().await;
+                        return Err(err);
+                    }
+
+                    let (next_ref_id, latest_refs, known_refs, latest_url, nav_generation) = {
+                        let map = self.sessions.borrow();
+                        let session = map
+                            .get(&session_id.0)
+                            .expect("presence confirmed above under the same guard");
+                        session.tabs.borrow_mut().push(page.clone());
+                        let new_index = session.tabs.borrow().len() - 1;
+                        session.active_tab.set(new_index);
+                        session.nav_generation.set(session.nav_generation.get() + 1);
+                        (
+                            session.next_ref_id.clone(),
+                            session.latest_refs.clone(),
+                            session.known_refs.clone(),
+                            session.latest_url.clone(),
+                            session.nav_generation.clone(),
+                        )
+                    };
+
+                    // A brand-new tab, so (like `navigate`'s real-navigation
+                    // branches) there are no refs from a prior document that
+                    // could still apply.
+                    let capture = wait_and_capture(&page, &next_ref_id, &HashMap::new()).await?;
+                    let snapshot = install_snapshot(
+                        &latest_refs,
+                        &known_refs,
+                        &latest_url,
+                        nav_generation.get(),
+                        capture,
+                    );
+
+                    let (tabs_snapshot, active_index) = {
+                        let map = self.sessions.borrow();
+                        let session = map
+                            .get(&session_id.0)
+                            .expect("presence confirmed above under the same guard");
+                        let result = (session.tabs.borrow().clone(), session.active_tab.get());
+                        result
+                    };
+                    let tabs = list_tab_infos(&tabs_snapshot).await?;
+
+                    if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                        session.last_used.set(now_millis());
+                    }
+
+                    Ok(TabsResult {
+                        tabs,
+                        active_index,
+                        snapshot: Some(snapshot),
+                    })
+                }
+                TabAction::Select { index } => {
+                    // First map access after acquiring `_session_guard`
+                    // above — see `navigate`'s matching comment on why
+                    // holding the lock doesn't guarantee the session is
+                    // still present.
+                    let (page, next_ref_id, latest_refs, known_refs, latest_url, nav_generation) = {
+                        let map = self.sessions.borrow();
+                        let session = match map.get(&session_id.0) {
+                            Some(session) => session,
+                            None => {
+                                return Err(PortError::NotFound(not_found_message(&session_id.0)))
+                            }
+                        };
+                        let tabs = session.tabs.borrow();
+                        if index >= tabs.len() {
+                            return Err(PortError::NotFound(format!(
+                                "tab index {index} out of range (session has {} tab(s))",
+                                tabs.len()
+                            )));
+                        }
+                        session.active_tab.set(index);
+                        (
+                            tabs[index].clone(),
+                            session.next_ref_id.clone(),
+                            session.latest_refs.clone(),
+                            session.known_refs.clone(),
+                            session.latest_url.clone(),
+                            session.nav_generation.clone(),
+                        )
+                    };
+
+                    // Selecting a tab doesn't navigate it, so refs already
+                    // issued for it are still valid — reuse them the same way
+                    // `snapshot()` does rather than treating this like a real
+                    // navigation.
+                    let previous_refs = latest_refs.borrow().clone();
+                    let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
+                    let snapshot = install_snapshot(
+                        &latest_refs,
+                        &known_refs,
+                        &latest_url,
+                        nav_generation.get(),
+                        capture,
+                    );
+
+                    let tabs_snapshot = {
+                        let map = self.sessions.borrow();
+                        let snapshot = map
+                            .get(&session_id.0)
+                            .expect("presence confirmed above under the same guard")
+                            .tabs
+                            .borrow()
+                            .clone();
+                        snapshot
+                    };
+                    let tabs = list_tab_infos(&tabs_snapshot).await?;
+
+                    if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                        session.last_used.set(now_millis());
+                    }
+
+                    Ok(TabsResult {
+                        tabs,
+                        active_index: index,
+                        snapshot: Some(snapshot),
+                    })
+                }
+                TabAction::Close { index } => {
+                    // First map access after acquiring `_session_guard`
+                    // above — see `navigate`'s matching comment on why
+                    // holding the lock doesn't guarantee the session is
+                    // still present.
+                    let (page_to_close, new_active) = {
+                        let map = self.sessions.borrow();
+                        let session = match map.get(&session_id.0) {
+                            Some(session) => session,
+                            None => {
+                                return Err(PortError::NotFound(not_found_message(&session_id.0)))
+                            }
+                        };
+                        let mut tabs = session.tabs.borrow_mut();
+                        let target = index.unwrap_or_else(|| session.active_tab.get());
+                        if target >= tabs.len() {
+                            return Err(PortError::NotFound(format!(
+                                "tab index {target} out of range (session has {} tab(s))",
+                                tabs.len()
+                            )));
+                        }
+                        if tabs.len() == 1 {
+                            return Err(PortError::Other(
+                                "cannot close a session's last tab; call \
+                                 stapler_browser_close_session to close the whole session instead"
+                                    .to_string(),
+                            ));
+                        }
+                        let removed = tabs.remove(target);
+                        let active = session.active_tab.get();
+                        let new_active = match target.cmp(&active) {
+                            std::cmp::Ordering::Less => active - 1,
+                            std::cmp::Ordering::Equal => target.min(tabs.len() - 1),
+                            std::cmp::Ordering::Greater => active,
+                        };
+                        session.active_tab.set(new_active);
+                        (removed, new_active)
+                    };
+                    let _ = page_to_close.close().await;
+
+                    let tabs_snapshot = {
+                        let map = self.sessions.borrow();
+                        let snapshot = map
+                            .get(&session_id.0)
+                            .expect("presence confirmed above under the same guard")
+                            .tabs
+                            .borrow()
+                            .clone();
+                        snapshot
+                    };
+                    let tabs = list_tab_infos(&tabs_snapshot).await?;
+
+                    if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                        session.last_used.set(now_millis());
+                    }
+
+                    Ok(TabsResult {
+                        tabs,
+                        active_index: new_active,
+                        snapshot: None,
+                    })
+                }
+            }
+        };
+
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| PortError::Timeout)?
+    }
+
+    /// See `click`'s doc comment — same session/lock/locator-resolution/
+    /// dispatch discipline via `dispatch_action`, just moving the pointer
+    /// instead of clicking.
+    async fn hover(
         &self,
         session_id: &SessionId,
         locator: &Locator,
         timeout: Duration,
-        action: Action,
+    ) -> Result<AxSnapshot, PortError> {
+        self.dispatch_action(session_id, Some(locator), timeout, Action::Hover)
+            .await
+    }
+
+    /// See `click`'s doc comment.
+    async fn select_option(
+        &self,
+        session_id: &SessionId,
+        locator: &Locator,
+        values: &[String],
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError> {
+        self.dispatch_action(
+            session_id,
+            Some(locator),
+            timeout,
+            Action::SelectOption(values.to_vec()),
+        )
+        .await
+    }
+
+    /// See `click`'s doc comment. `locator: None` routes through
+    /// `dispatch_action` with no resolved node, so the key event is
+    /// dispatched to whatever element the page itself currently has focused.
+    async fn press_key(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+        locator: Option<&Locator>,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError> {
+        self.dispatch_action(
+            session_id,
+            locator,
+            timeout,
+            Action::PressKey(key.to_string()),
+        )
+        .await
+    }
+
+    /// Blocks until `condition` is satisfied, then captures a fresh
+    /// `AxSnapshot` the same way `snapshot()` does. The whole wait — not a
+    /// single poll attempt — is bounded by the outer `tokio::time::timeout`;
+    /// `TextAppears`/`TextDisappears` poll every 100ms with no timeout logic
+    /// of their own.
+    async fn wait_for(
+        &self,
+        session_id: &SessionId,
+        condition: WaitCondition,
+        timeout: Duration,
     ) -> Result<AxSnapshot, PortError> {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (
-                page,
-                latest_refs,
-                known_refs,
-                nav_generation,
-                next_ref_id,
-                latest_url,
-                blocked,
-                lock,
-            ) = {
+            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.page.clone(),
                     session.latest_refs.clone(),
                     session.known_refs.clone(),
                     session.nav_generation.clone(),
@@ -1159,23 +1697,204 @@ impl NativeBrowser {
                 return Err(PortError::NotFound(reason));
             }
 
+            // `active_page()` is read only now, under the lock — see
+            // `navigate`'s matching comment for why reading it earlier would
+            // be stale against a concurrent `tabs()` switch/close, and for
+            // why the session can still be gone here despite holding the
+            // lock (a racing `close_session` may have won it first).
+            let page = {
+                let map = self.sessions.borrow();
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
+            };
+
+            match condition {
+                WaitCondition::TimeMs(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                WaitCondition::TextAppears(text) => wait_for_text(&page, &text, true).await?,
+                WaitCondition::TextDisappears(text) => wait_for_text(&page, &text, false).await?,
+            }
+
+            if let Some(reason) = poll_blocked_grace_period(&blocked).await {
+                return Err(PortError::NotFound(reason));
+            }
+
+            let previous_refs = latest_refs.borrow().clone();
+            let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
+            let snapshot = install_snapshot(
+                &latest_refs,
+                &known_refs,
+                &latest_url,
+                nav_generation.get(),
+                capture,
+            );
+
+            if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                session.last_used.set(now_millis());
+            }
+
+            Ok(snapshot)
+        };
+
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| PortError::Timeout)?
+    }
+}
+
+/// Builds one `TabInfo` per page in `tabs`, in order — used by every
+/// `tabs()` action to report the resulting tab list.
+async fn list_tab_infos(tabs: &[Page]) -> Result<Vec<TabInfo>, PortError> {
+    let mut infos = Vec::with_capacity(tabs.len());
+    for (index, page) in tabs.iter().enumerate() {
+        let url = page
+            .url()
+            .await
+            .map_err(|e| PortError::Other(e.to_string()))?
+            .unwrap_or_default();
+        let title: String = page
+            .evaluate("document.title")
+            .await
+            .map_err(|e| PortError::Other(e.to_string()))?
+            .into_value()
+            .map_err(|e| PortError::Other(e.to_string()))?;
+        infos.push(TabInfo { index, url, title });
+    }
+    Ok(infos)
+}
+
+/// Polls `document.body.innerText` every 100ms until it contains
+/// (`want_present: true`) or stops containing (`false`) `text`. Deliberately
+/// has no timeout of its own — `wait_for`'s outer `tokio::time::timeout`
+/// bounds the whole wait, per `WaitCondition`'s doc comment.
+async fn wait_for_text(page: &Page, text: &str, want_present: bool) -> Result<(), PortError> {
+    loop {
+        let body_text: String = page
+            .evaluate("document.body ? document.body.innerText : ''")
+            .await
+            .map_err(|e| PortError::Other(e.to_string()))?
+            .into_value()
+            .map_err(|e| PortError::Other(e.to_string()))?;
+        if body_text.contains(text) == want_present {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// What `dispatch_action` does to the resolved node (or, for `PressKey` with
+/// no locator, the page's currently focused element).
+enum Action {
+    Click,
+    Type(String),
+    Hover,
+    SelectOption(Vec<String>),
+    /// `PressKey` is the only variant that can run with `locator: None` in
+    /// `dispatch_action` — every other variant requires a resolved node.
+    PressKey(String),
+}
+
+impl NativeBrowser {
+    /// Shared body of `click`/`type_text` (Tasks 3.3.1 + 3.3.2): session
+    /// lookup, locator resolution, liveness re-check, dispatch, an SSRF
+    /// grace-period poll, then a fresh AX capture with `navigated_from` set
+    /// if the dispatch itself caused a (non-blocked) navigation.
+    async fn dispatch_action(
+        &self,
+        session_id: &SessionId,
+        locator: Option<&Locator>,
+        timeout: Duration,
+        action: Action,
+    ) -> Result<AxSnapshot, PortError> {
+        let fut = async {
+            touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+
+            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+                let map = self.sessions.borrow();
+                let session = map
+                    .get(&session_id.0)
+                    .expect("touch_or_evict just confirmed presence");
+                (
+                    session.latest_refs.clone(),
+                    session.known_refs.clone(),
+                    session.nav_generation.clone(),
+                    session.next_ref_id.clone(),
+                    session.latest_url.clone(),
+                    session.blocked.clone(),
+                    session.lock.clone(),
+                )
+            };
+
+            let _session_guard = lock.lock().await;
+
+            if let Some(reason) = blocked.borrow().clone() {
+                return Err(PortError::NotFound(reason));
+            }
+
+            // `active_page()` is read only now, under the lock — see
+            // `navigate`'s matching comment for why reading it earlier would
+            // be stale against a concurrent `tabs()` switch/close, and for
+            // why the session can still be gone here despite holding the
+            // lock (a racing `close_session` may have won it first).
+            let page = {
+                let map = self.sessions.borrow();
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
+            };
+
             let url_before = page
                 .url()
                 .await
                 .map_err(|e| PortError::Other(e.to_string()))?
                 .unwrap_or_else(|| latest_url.borrow().clone());
 
-            let (backend_node_id, expected_role) = {
-                let refs = latest_refs.borrow();
-                let known = known_refs.borrow();
-                resolve_locator_impl(&refs, &known, nav_generation.get(), locator, &url_before)?
+            let backend_node_id = if let Some(locator) = locator {
+                let (backend_node_id, expected_role) = {
+                    let refs = latest_refs.borrow();
+                    let known = known_refs.borrow();
+                    resolve_locator_impl(&refs, &known, nav_generation.get(), locator, &url_before)?
+                };
+                verify_node_live(&page, backend_node_id, &expected_role, locator).await?;
+                Some(backend_node_id)
+            } else {
+                None
             };
 
-            verify_node_live(&page, backend_node_id, &expected_role, locator).await?;
-
             match &action {
-                Action::Click => dispatch_click(&page, backend_node_id).await?,
-                Action::Type(text) => dispatch_type(&page, backend_node_id, text).await?,
+                Action::Click => {
+                    dispatch_click(
+                        &page,
+                        backend_node_id.expect("Action::Click always resolves a locator"),
+                    )
+                    .await?
+                }
+                Action::Type(text) => {
+                    dispatch_type(
+                        &page,
+                        backend_node_id.expect("Action::Type always resolves a locator"),
+                        text,
+                    )
+                    .await?
+                }
+                Action::Hover => {
+                    dispatch_hover(
+                        &page,
+                        backend_node_id.expect("Action::Hover always resolves a locator"),
+                    )
+                    .await?
+                }
+                Action::SelectOption(values) => {
+                    dispatch_select_option(
+                        &page,
+                        backend_node_id.expect("Action::SelectOption always resolves a locator"),
+                        values,
+                    )
+                    .await?
+                }
+                Action::PressKey(key) => dispatch_key_event(&page, key, backend_node_id).await?,
             }
 
             // Grace period: give the `Page.frameNavigated` listener a chance
@@ -2011,6 +2730,57 @@ mod tests {
         ) -> Result<AxSnapshot, PortError> {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
             Ok(fake_ax_snapshot())
+        }
+
+        async fn close_session(&self, _session_id: &SessionId) -> Result<(), PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn tabs(
+            &self,
+            _session_id: &SessionId,
+            _action: TabAction,
+            _timeout: Duration,
+        ) -> Result<TabsResult, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn hover(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn select_option(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _values: &[String],
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn press_key(
+            &self,
+            _session_id: &SessionId,
+            _key: &str,
+            _locator: Option<&Locator>,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn wait_for(
+            &self,
+            _session_id: &SessionId,
+            _condition: WaitCondition,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            panic!("not exercised by this test");
         }
     }
 

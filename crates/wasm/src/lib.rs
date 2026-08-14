@@ -19,7 +19,9 @@ use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{EnvPort, LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
-    BrowserNavigateInput, BrowserNavigateOutput, BrowserSnapshotInput, BrowserTypeInput,
+    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
+    BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
     DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, ReadWebsiteInput,
     ReadWebsiteOutput,
 };
@@ -162,6 +164,72 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         }),
     );
 
+    daemon.register(
+        "stapler_browser_close_session",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserCloseSessionInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_close_session(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_tabs",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserTabsInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_tabs(&*browser, input, network_policy).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_hover",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserHoverInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_hover(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_select_option",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserSelectOptionInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_select_option(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_press_key",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserPressKeyInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_press_key(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_wait_for",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserWaitForInput| {
+                let browser = browser.clone();
+                async move { browser_tools::browser_wait_for(&*browser, input).await }
+            }
+        }),
+    );
+
     let socket = socket::WasmSocketFactory;
     let run_result = daemon.run(&socket, &sock_path).await;
     // Always close the browser on the way out, even on error — otherwise the
@@ -291,6 +359,54 @@ pub fn list_tools_json() -> Result<String, JsValue> {
             output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
         },
+        ToolDescriptor {
+            name: "stapler_browser_close_session",
+            description: "Close an existing browser session and release its resources. Idempotent-in-effect: closing an already-closed session still reports success.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserCloseSessionInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserCloseSessionOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_tabs",
+            description: "List, open, switch to, or close tabs in an existing browser session, via the `action` field (list/new/select/close). `select`/`close` take a tab `index`; `new` optionally takes a `url` to navigate the new tab to. Mirrors @playwright/mcp's browser_tabs.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserTabsInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserTabsOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_hover",
+            description: "Hover the pointer over an element (identified by a ref from a previous snapshot) in an existing browser session and return the resulting accessibility-tree snapshot.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserHoverInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_select_option",
+            description: "Select one or more options in a <select> element (identified by a ref from a previous snapshot) in an existing browser session and return the resulting accessibility-tree snapshot.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserSelectOptionInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_press_key",
+            description: "Press a keyboard key (optionally focusing an element first via a ref from a previous snapshot) in an existing browser session and return the resulting accessibility-tree snapshot.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserPressKeyInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "stapler_browser_wait_for",
+            description: "Wait in an existing browser session until given text appears, given text disappears, and/or a minimum time elapses, then return the resulting accessibility-tree snapshot.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserWaitForInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
     ];
     serde_json::to_string(&tools).map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -300,7 +416,7 @@ mod list_tools_tests {
     use super::list_tools_json;
 
     #[test]
-    fn list_tools_json_should_contain_four_browser_tool_descriptors_when_called() {
+    fn list_tools_json_should_contain_ten_browser_tool_descriptors_when_called() {
         let json = list_tools_json().expect("list_tools_json should succeed");
         let tools: serde_json::Value =
             serde_json::from_str(&json).expect("list_tools_json output should be valid JSON");
@@ -316,6 +432,12 @@ mod list_tools_tests {
             "stapler_browser_click",
             "stapler_browser_type",
             "stapler_browser_snapshot",
+            "stapler_browser_close_session",
+            "stapler_browser_tabs",
+            "stapler_browser_hover",
+            "stapler_browser_select_option",
+            "stapler_browser_press_key",
+            "stapler_browser_wait_for",
         ];
         let matched: Vec<&&str> = browser_tool_names
             .iter()
@@ -324,8 +446,8 @@ mod list_tools_tests {
 
         assert_eq!(
             matched.len(),
-            4,
-            "expected exactly 4 browser tool descriptors, found {matched:?} in {names:?}"
+            10,
+            "expected exactly 10 browser tool descriptors, found {matched:?} in {names:?}"
         );
     }
 }

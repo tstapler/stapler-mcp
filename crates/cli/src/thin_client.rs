@@ -13,10 +13,14 @@ use serde::Serialize;
 use stapler_mcp_core::client::{self, EnsureOptions};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::schema::{
-    BraveSearchInput, BraveSearchOutput, DownloadWebsiteInput, DownloadWebsiteOutput,
-    FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
-    ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput,
-    RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
+    BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
+    BrowserCloseSessionInput, BrowserCloseSessionOutput, BrowserHoverInput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput,
+    BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
+    DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, IndexDocsInput,
+    IndexDocsOutput, ListIndexedSourcesInput, ListIndexedSourcesOutput, ReadWebsiteInput,
+    ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
+    SearchDocsOutput,
 };
 use stapler_mcp_native::{
     NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
@@ -124,6 +128,136 @@ impl ThinClient {
         params: Parameters<DownloadWebsiteInput>,
     ) -> Result<Json<DownloadWebsiteOutput>, String> {
         call_daemon("download_website", params.0).await.map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_navigate",
+        description = "Navigate to a URL in a real browser session (creating a new session if sessionId is omitted, or reusing an existing one), returning the resolved session id, the final URL after any redirects, and an accessibility-tree snapshot of the resulting page. Part of the playwright-mcp-style browser automation tools backed by the shared daemon's browser pool."
+    )]
+    async fn browser_navigate(
+        &self,
+        params: Parameters<BrowserNavigateInput>,
+    ) -> Result<Json<BrowserNavigateOutput>, String> {
+        call_daemon("stapler_browser_navigate", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_click",
+        description = "Click an element in an existing browser session, identified by a `ref` from a previous snapshot, and return the accessibility-tree snapshot of the page after the click."
+    )]
+    async fn browser_click(
+        &self,
+        params: Parameters<BrowserClickInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_click", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_type",
+        description = "Type text into an element in an existing browser session, identified by a `ref` from a previous snapshot, and return the accessibility-tree snapshot of the page after typing."
+    )]
+    async fn browser_type(
+        &self,
+        params: Parameters<BrowserTypeInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_type", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_snapshot",
+        description = "Capture a fresh accessibility-tree snapshot of an existing browser session's current page, without performing any action."
+    )]
+    async fn browser_snapshot(
+        &self,
+        params: Parameters<BrowserSnapshotInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_snapshot", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_close_session",
+        description = "Close an existing browser session and release its resources (the underlying browser tab/context). Safe to call even if the session is already gone."
+    )]
+    async fn browser_close_session(
+        &self,
+        params: Parameters<BrowserCloseSessionInput>,
+    ) -> Result<Json<BrowserCloseSessionOutput>, String> {
+        call_daemon("stapler_browser_close_session", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_tabs",
+        description = "Manage tabs within an existing browser session via the `action` field: `list` returns every open tab with its index/url/title; `new` opens a tab (optionally navigating it to `url`) and switches to it; `select` switches the active tab to the given `index`; `close` closes the tab at `index` (or the active tab if omitted). Returns the current tab list, the active index, and a snapshot of the now-active page. Mirrors @playwright/mcp's browser_tabs."
+    )]
+    async fn browser_tabs(
+        &self,
+        params: Parameters<BrowserTabsInput>,
+    ) -> Result<Json<BrowserTabsOutput>, String> {
+        call_daemon("stapler_browser_tabs", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_hover",
+        description = "Move the mouse pointer over an element in an existing browser session, identified by a `ref` from a previous snapshot (useful for triggering hover-revealed UI), and return the accessibility-tree snapshot of the page afterward."
+    )]
+    async fn browser_hover(
+        &self,
+        params: Parameters<BrowserHoverInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_hover", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_select_option",
+        description = "Select one or more options in a <select> element in an existing browser session, identified by a `ref` from a previous snapshot, and return the accessibility-tree snapshot of the page after selecting."
+    )]
+    async fn browser_select_option(
+        &self,
+        params: Parameters<BrowserSelectOptionInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_select_option", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_press_key",
+        description = "Press a single keyboard key (e.g. \"Enter\", \"Escape\", \"ArrowDown\") in an existing browser session, optionally focusing an element first via a `ref` from a previous snapshot, and return the accessibility-tree snapshot of the page afterward."
+    )]
+    async fn browser_press_key(
+        &self,
+        params: Parameters<BrowserPressKeyInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_press_key", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_wait_for",
+        description = "Wait in an existing browser session until specified `text` appears, `textGone` disappears, and/or at least `timeMs` elapses, then return the accessibility-tree snapshot of the page at that point. Useful for waiting out async page updates before the next action."
+    )]
+    async fn browser_wait_for(
+        &self,
+        params: Parameters<BrowserWaitForInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_wait_for", params.0)
+            .await
+            .map(Json)
     }
 
     #[tool(

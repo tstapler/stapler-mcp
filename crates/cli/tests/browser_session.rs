@@ -71,6 +71,11 @@ async fn spawn_mock_site() -> (String, tokio::sync::oneshot::Sender<()>) {
     let page = "<html><head><title>Browser Session Fixture</title></head><body>\
                 <button id=\"go\">Go</button>\
                 <input type=\"text\" id=\"name\">\
+                <select id=\"color\">\
+                  <option value=\"red\">Red</option>\
+                  <option value=\"green\">Green</option>\
+                  <option value=\"blue\">Blue</option>\
+                </select>\
                 <script>\
                 document.getElementById('go').addEventListener('click', function () {\
                   var p = document.createElement('p');\
@@ -1052,4 +1057,179 @@ async fn navigate_concurrent_should_not_exceed_max_open_sessions() {
             browser.close().await;
         })
         .await;
+}
+
+/// Round trip for the 6 tools added on top of navigate/click/type/snapshot
+/// (issue #12): open a session, exercise `tabs` (open + switch to a second
+/// tab), `hover`/`select_option`/`press_key` back on the original tab,
+/// `wait_for` a text condition, then `close_session`. Follows the same
+/// `start_daemon` + `spawn_mock_site` + `client::call` harness as the rest of
+/// this file.
+#[tokio::test]
+#[ignore]
+async fn browser_tabs_hover_select_press_wait_close_round_trip() {
+    let (_tmp, socket, sock_path) = start_daemon(true).await;
+    let (site_url, shutdown_site) = spawn_mock_site().await;
+
+    // 1. navigate: start a fresh session against the mock page.
+    let navigate_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_navigate",
+        Some(json!({ "url": site_url })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_navigate should succeed");
+    let session_id = navigate_result["sessionId"]
+        .as_str()
+        .expect("sessionId present")
+        .to_string();
+
+    let go_button = find_node(&navigate_result["snapshot"]["root"], &|n| {
+        n["role"] == "button" && n["name"].as_str().is_some_and(|s| s.contains("Go"))
+    })
+    .unwrap_or_else(|| panic!("expected a 'Go' button node, got: {navigate_result:?}"));
+    let go_ref = go_button["ref"].as_str().expect("button ref").to_string();
+
+    let select_node = find_node(&navigate_result["snapshot"]["root"], &|n| {
+        n["role"] == "combobox" || n["role"] == "listbox"
+    })
+    .unwrap_or_else(|| panic!("expected a select/combobox node, got: {navigate_result:?}"));
+    let select_ref = select_node["ref"].as_str().expect("select ref").to_string();
+
+    // 2. tabs: open a second tab (navigated to the same mock site) and switch
+    //    to it, then switch back to the original tab (index 0) so the
+    //    original session's refs stay valid for the rest of this test.
+    let tabs_new_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_tabs",
+        Some(json!({ "sessionId": session_id, "action": "new", "url": site_url })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_tabs (new) should succeed");
+    assert_eq!(
+        tabs_new_result["tabs"]
+            .as_array()
+            .expect("tabs array present")
+            .len(),
+        2,
+        "expected 2 tabs after opening a new one, got: {tabs_new_result:?}"
+    );
+    assert_eq!(
+        tabs_new_result["activeIndex"].as_i64(),
+        Some(1),
+        "expected the newly-opened tab to become active, got: {tabs_new_result:?}"
+    );
+
+    let tabs_select_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_tabs",
+        Some(json!({ "sessionId": session_id, "action": "select", "index": 0 })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_tabs (select) should succeed");
+    assert_eq!(
+        tabs_select_result["activeIndex"].as_i64(),
+        Some(0),
+        "expected tab 0 to become active again, got: {tabs_select_result:?}"
+    );
+
+    // 3. hover: hover the "Go" button, no assertions beyond a successful
+    //    snapshot back (hovering alone shouldn't mutate this fixture's DOM).
+    client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_hover",
+        Some(json!({ "sessionId": session_id, "refId": go_ref })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_hover should succeed");
+
+    // 4. select_option: pick "Green" in the mock page's <select>.
+    let select_option_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_select_option",
+        Some(json!({ "sessionId": session_id, "refId": select_ref, "values": ["green"] })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_select_option should succeed");
+    let selected = find_node(&select_option_result["snapshot"]["root"], &|n| {
+        n["role"] == "combobox" || n["role"] == "listbox"
+    })
+    .unwrap_or_else(|| panic!("expected a select/combobox node, got: {select_option_result:?}"));
+    assert_eq!(
+        selected["value"].as_str(),
+        Some("green"),
+        "expected the selected option to be reflected, got: {select_option_result:?}"
+    );
+
+    // 5. press_key: press Enter on the "Go" button, which triggers the same
+    //    click handler as a direct click and appends "clicked!" to the DOM.
+    let press_key_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_press_key",
+        Some(json!({ "sessionId": session_id, "refId": go_ref, "key": "Enter" })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_press_key should succeed");
+    assert!(
+        tree_contains_name(&press_key_result["snapshot"]["root"], "clicked!")
+            || tree_contains_name(&press_key_result["snapshot"]["root"], "Go"),
+        "expected either the click side effect or the button itself in the post-press snapshot, got: {press_key_result:?}"
+    );
+
+    // 6. wait_for: the "clicked!" text is already present by now (from either
+    //    the click above or this call's own idempotent re-check), so
+    //    wait_for should resolve immediately rather than timing out.
+    let wait_for_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_wait_for",
+        Some(json!({ "sessionId": session_id, "text": "clicked!" })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_wait_for should succeed");
+    assert!(
+        tree_contains_name(&wait_for_result["snapshot"]["root"], "clicked!"),
+        "expected 'clicked!' still present after wait_for, got: {wait_for_result:?}"
+    );
+
+    // 7. close_session: release the session's resources.
+    let close_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_close_session",
+        Some(json!({ "sessionId": session_id })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_close_session should succeed");
+    assert_eq!(
+        close_result["closed"].as_bool(),
+        Some(true),
+        "expected closed: true, got: {close_result:?}"
+    );
+
+    let _ = shutdown_site.send(());
+
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
 }

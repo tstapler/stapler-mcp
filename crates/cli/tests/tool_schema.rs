@@ -27,7 +27,10 @@ use rmcp::handler::server::common::schema_for_input;
 use rmcp::model::JsonObject;
 
 use stapler_mcp_core::schema::{
-    IndexDocsInput, ListIndexedSourcesInput, RemoveIndexedSourceInput, SearchDocsInput,
+    BrowserClickInput, BrowserCloseSessionInput, BrowserHoverInput, BrowserNavigateInput,
+    BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput,
+    BrowserTypeInput, BrowserWaitForInput, IndexDocsInput, ListIndexedSourcesInput,
+    RemoveIndexedSourceInput, SearchDocsInput,
 };
 
 #[path = "../src/thin_client.rs"]
@@ -62,6 +65,51 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
             "stapler_remove_indexed_source",
             schema_for_input::<RemoveIndexedSourceInput>()
                 .expect("RemoveIndexedSourceInput schemars schema"),
+        ),
+        (
+            "stapler_browser_navigate",
+            schema_for_input::<BrowserNavigateInput>()
+                .expect("BrowserNavigateInput schemars schema"),
+        ),
+        (
+            "stapler_browser_click",
+            schema_for_input::<BrowserClickInput>().expect("BrowserClickInput schemars schema"),
+        ),
+        (
+            "stapler_browser_type",
+            schema_for_input::<BrowserTypeInput>().expect("BrowserTypeInput schemars schema"),
+        ),
+        (
+            "stapler_browser_snapshot",
+            schema_for_input::<BrowserSnapshotInput>()
+                .expect("BrowserSnapshotInput schemars schema"),
+        ),
+        (
+            "stapler_browser_close_session",
+            schema_for_input::<BrowserCloseSessionInput>()
+                .expect("BrowserCloseSessionInput schemars schema"),
+        ),
+        (
+            "stapler_browser_tabs",
+            schema_for_input::<BrowserTabsInput>().expect("BrowserTabsInput schemars schema"),
+        ),
+        (
+            "stapler_browser_hover",
+            schema_for_input::<BrowserHoverInput>().expect("BrowserHoverInput schemars schema"),
+        ),
+        (
+            "stapler_browser_select_option",
+            schema_for_input::<BrowserSelectOptionInput>()
+                .expect("BrowserSelectOptionInput schemars schema"),
+        ),
+        (
+            "stapler_browser_press_key",
+            schema_for_input::<BrowserPressKeyInput>()
+                .expect("BrowserPressKeyInput schemars schema"),
+        ),
+        (
+            "stapler_browser_wait_for",
+            schema_for_input::<BrowserWaitForInput>().expect("BrowserWaitForInput schemars schema"),
         ),
     ];
 
