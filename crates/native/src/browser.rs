@@ -1089,13 +1089,21 @@ impl BrowserDriver for NativeBrowser {
                     // this call acquires the guard can change which tab is
                     // active, and reading it earlier would silently
                     // navigate a tab this call no longer means to touch.
+                    //
+                    // Holding the lock does NOT guarantee the session is
+                    // still present: `close_session` acquires the same lock
+                    // and removes the session from the map *before*
+                    // awaiting `session.close()`, so a call that was parked
+                    // on `lock.lock().await` can win the lock only after
+                    // `close_session` has already deleted the entry. Treat
+                    // that as the caller closed the session out from under
+                    // this call, not as an invariant violation.
                     let page = {
                         let map = self.sessions.borrow();
-                        map.get(&id.0)
-                            .expect(
-                                "this holds the session's own lock; close_session cannot have removed it",
-                            )
-                            .active_page()
+                        match map.get(&id.0) {
+                            Some(session) => session.active_page(),
+                            None => return Err(PortError::NotFound(not_found_message(&id.0))),
+                        }
                     };
 
                     // This call's own navigation is about to supersede
@@ -1230,14 +1238,15 @@ impl BrowserDriver for NativeBrowser {
 
             // `active_page()` is read only now, under the lock — see
             // `navigate`'s matching comment for why reading it earlier would
-            // be stale against a concurrent `tabs()` switch/close.
+            // be stale against a concurrent `tabs()` switch/close, and for
+            // why the session can still be gone here despite holding the
+            // lock (a racing `close_session` may have won it first).
             let page = {
                 let map = self.sessions.borrow();
-                map.get(&session_id.0)
-                    .expect(
-                        "this holds the session's own lock; close_session cannot have removed it",
-                    )
-                    .active_page()
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
             };
 
             // Clone out of the `RefCell` first — holding a live borrow across
@@ -1323,19 +1332,28 @@ impl BrowserDriver for NativeBrowser {
 
             match action {
                 TabAction::List => {
+                    // First map access after acquiring `_session_guard` above:
+                    // holding the lock does NOT guarantee the session is still
+                    // present, because `close_session` removes it from the map
+                    // *before* awaiting `session.close()` while holding the
+                    // same lock — see `navigate`'s matching comment. Once this
+                    // access succeeds, later accesses within this arm are safe
+                    // since `close_session` can't run while this call holds
+                    // the guard.
                     let tabs_snapshot = {
                         let map = self.sessions.borrow();
-                        let session = map
-                            .get(&session_id.0)
-                            .expect("touch_or_evict just confirmed presence");
-                        let snapshot = session.tabs.borrow().clone();
-                        snapshot
+                        match map.get(&session_id.0) {
+                            Some(session) => session.tabs.borrow().clone(),
+                            None => {
+                                return Err(PortError::NotFound(not_found_message(&session_id.0)))
+                            }
+                        }
                     };
                     let tabs = list_tab_infos(&tabs_snapshot).await?;
                     let active_index = {
                         let map = self.sessions.borrow();
                         map.get(&session_id.0)
-                            .expect("touch_or_evict just confirmed presence")
+                            .expect("presence confirmed above under the same guard")
                             .active_tab
                             .get()
                     };
@@ -1364,12 +1382,20 @@ impl BrowserDriver for NativeBrowser {
                             .await
                             .map_err(|e| PortError::Other(e.to_string()))?;
 
+                        // First map access after acquiring `_session_guard`
+                        // above — see `navigate`'s matching comment on why
+                        // holding the lock doesn't guarantee the session is
+                        // still present.
                         let (blocked, crashed) = {
                             let map = self.sessions.borrow();
-                            let session = map
-                                .get(&session_id.0)
-                                .expect("touch_or_evict just confirmed presence");
-                            (session.blocked.clone(), session.crashed.clone())
+                            match map.get(&session_id.0) {
+                                Some(session) => (session.blocked.clone(), session.crashed.clone()),
+                                None => {
+                                    return Err(PortError::NotFound(not_found_message(
+                                        &session_id.0,
+                                    )))
+                                }
+                            }
                         };
                         spawn_session_listeners(
                             &page,
@@ -1403,7 +1429,7 @@ impl BrowserDriver for NativeBrowser {
                         let map = self.sessions.borrow();
                         let session = map
                             .get(&session_id.0)
-                            .expect("touch_or_evict just confirmed presence");
+                            .expect("presence confirmed above under the same guard");
                         session.tabs.borrow_mut().push(page.clone());
                         let new_index = session.tabs.borrow().len() - 1;
                         session.active_tab.set(new_index);
@@ -1433,7 +1459,7 @@ impl BrowserDriver for NativeBrowser {
                         let map = self.sessions.borrow();
                         let session = map
                             .get(&session_id.0)
-                            .expect("touch_or_evict just confirmed presence");
+                            .expect("presence confirmed above under the same guard");
                         let result = (session.tabs.borrow().clone(), session.active_tab.get());
                         result
                     };
@@ -1450,11 +1476,18 @@ impl BrowserDriver for NativeBrowser {
                     })
                 }
                 TabAction::Select { index } => {
+                    // First map access after acquiring `_session_guard`
+                    // above — see `navigate`'s matching comment on why
+                    // holding the lock doesn't guarantee the session is
+                    // still present.
                     let (page, next_ref_id, latest_refs, known_refs, latest_url, nav_generation) = {
                         let map = self.sessions.borrow();
-                        let session = map
-                            .get(&session_id.0)
-                            .expect("touch_or_evict just confirmed presence");
+                        let session = match map.get(&session_id.0) {
+                            Some(session) => session,
+                            None => {
+                                return Err(PortError::NotFound(not_found_message(&session_id.0)))
+                            }
+                        };
                         let tabs = session.tabs.borrow();
                         if index >= tabs.len() {
                             return Err(PortError::NotFound(format!(
@@ -1491,7 +1524,7 @@ impl BrowserDriver for NativeBrowser {
                         let map = self.sessions.borrow();
                         let snapshot = map
                             .get(&session_id.0)
-                            .expect("touch_or_evict just confirmed presence")
+                            .expect("presence confirmed above under the same guard")
                             .tabs
                             .borrow()
                             .clone();
@@ -1510,11 +1543,18 @@ impl BrowserDriver for NativeBrowser {
                     })
                 }
                 TabAction::Close { index } => {
+                    // First map access after acquiring `_session_guard`
+                    // above — see `navigate`'s matching comment on why
+                    // holding the lock doesn't guarantee the session is
+                    // still present.
                     let (page_to_close, new_active) = {
                         let map = self.sessions.borrow();
-                        let session = map
-                            .get(&session_id.0)
-                            .expect("touch_or_evict just confirmed presence");
+                        let session = match map.get(&session_id.0) {
+                            Some(session) => session,
+                            None => {
+                                return Err(PortError::NotFound(not_found_message(&session_id.0)))
+                            }
+                        };
                         let mut tabs = session.tabs.borrow_mut();
                         let target = index.unwrap_or_else(|| session.active_tab.get());
                         if target >= tabs.len() {
@@ -1546,7 +1586,7 @@ impl BrowserDriver for NativeBrowser {
                         let map = self.sessions.borrow();
                         let snapshot = map
                             .get(&session_id.0)
-                            .expect("touch_or_evict just confirmed presence")
+                            .expect("presence confirmed above under the same guard")
                             .tabs
                             .borrow()
                             .clone();
@@ -1659,14 +1699,15 @@ impl BrowserDriver for NativeBrowser {
 
             // `active_page()` is read only now, under the lock — see
             // `navigate`'s matching comment for why reading it earlier would
-            // be stale against a concurrent `tabs()` switch/close.
+            // be stale against a concurrent `tabs()` switch/close, and for
+            // why the session can still be gone here despite holding the
+            // lock (a racing `close_session` may have won it first).
             let page = {
                 let map = self.sessions.borrow();
-                map.get(&session_id.0)
-                    .expect(
-                        "this holds the session's own lock; close_session cannot have removed it",
-                    )
-                    .active_page()
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
             };
 
             match condition {
@@ -1793,14 +1834,15 @@ impl NativeBrowser {
 
             // `active_page()` is read only now, under the lock — see
             // `navigate`'s matching comment for why reading it earlier would
-            // be stale against a concurrent `tabs()` switch/close.
+            // be stale against a concurrent `tabs()` switch/close, and for
+            // why the session can still be gone here despite holding the
+            // lock (a racing `close_session` may have won it first).
             let page = {
                 let map = self.sessions.borrow();
-                map.get(&session_id.0)
-                    .expect(
-                        "this holds the session's own lock; close_session cannot have removed it",
-                    )
-                    .active_page()
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
             };
 
             let url_before = page
