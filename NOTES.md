@@ -188,6 +188,26 @@ choices) came out of a dedicated planning pass and is summarized in
     `npm/test/browser_glue.test.js` (21/21 passing, up from 14/14 before the
     adversarial-review fixes).
 
+### AX-tree snapshot: same-process iframe traversal — fixed
+
+`ax.rs`'s single `Accessibility.getFullAXTree` call already included open
+shadow DOM content automatically, but stopped at frame boundaries — an
+`Iframe`-role node came back childless even for a same-origin iframe with its
+own accessibility tree. There's no `pierce`-style param on
+`getFullAXTree` to fix this directly (confirmed empirically, contrary to
+[issue #20](https://github.com/tstapler/stapler-mcp/issues/20)'s original
+proposal). Fixed instead via `DOM.describeNode(backend_node_id)` on each
+`Iframe` node to resolve its child frame's `FrameId`, then recursively
+calling `getFullAXTree(frame_id)` and splicing the result in as that node's
+children (`fetch_frame_tree`, depth-limited to 5 to guard against
+pathological nesting; node ids prefixed per-frame since raw `AXNodeId`s are
+only unique within one frame). Cross-origin iframes run in a different
+renderer process this CDP session can't reach — `describeNode`/
+`getFullAXTree` on them simply fail, left as a childless `Iframe` leaf rather
+than failing the whole capture. Verified against real Chrome in
+`crates/cli/tests/browser_session.rs`'s
+`snapshot_should_include_iframe_content_when_same_origin_iframe_present`.
+
 ## Deferred
 
 One item below is narrow enough that it's tracked as a GitHub issue rather
