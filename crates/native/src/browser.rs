@@ -526,18 +526,14 @@ async fn wait_and_capture(
     ax::capture_snapshot(page, next_ref_id, previous_refs).await
 }
 
-/// Resolves `backend_node_id` to a live `RemoteObject`/`objectId` (`DOM
-/// .resolveNode`) and invokes `js_fn` on it via `Runtime.callFunctionOn`,
-/// bypassing `chromiumoxide::Element` entirely (its constructor is
-/// crate-private). `js_fn` must be a JS function-expression string; `this`
-/// inside it is the resolved DOM node.
-async fn invoke_on_node(
+/// Resolves `backend_node_id` to a live `RemoteObject`/`objectId` via `DOM
+/// .resolveNode` — shared by `invoke_on_node` (fire-and-forget dispatch) and
+/// `check_actionable` (returns a value), both of which otherwise duplicate
+/// this exact lookup.
+async fn resolve_object_id(
     page: &Page,
     backend_node_id: BackendNodeId,
-    action_name: &str,
-    js_fn: &str,
-    args: Vec<serde_json::Value>,
-) -> Result<(), PortError> {
+) -> Result<chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId, PortError> {
     let resolved = page
         .execute(
             ResolveNodeParams::builder()
@@ -546,11 +542,25 @@ async fn invoke_on_node(
         )
         .await
         .map_err(|e| PortError::Other(e.to_string()))?;
-    let object_id = resolved
+    resolved
         .result
         .object
         .object_id
-        .ok_or_else(|| PortError::Other("resolved node has no remote object id".to_string()))?;
+        .ok_or_else(|| PortError::Other("resolved node has no remote object id".to_string()))
+}
+
+/// Invokes `js_fn` on `backend_node_id`'s resolved `RemoteObject` via
+/// `Runtime.callFunctionOn`, bypassing `chromiumoxide::Element` entirely (its
+/// constructor is crate-private). `js_fn` must be a JS function-expression
+/// string; `this` inside it is the resolved DOM node.
+async fn invoke_on_node(
+    page: &Page,
+    backend_node_id: BackendNodeId,
+    action_name: &str,
+    js_fn: &str,
+    args: Vec<serde_json::Value>,
+) -> Result<(), PortError> {
+    let object_id = resolve_object_id(page, backend_node_id).await?;
 
     let call_args: Vec<CallArgument> = args
         .into_iter()
@@ -586,7 +596,141 @@ async fn invoke_on_node(
     Ok(())
 }
 
+/// Backoff schedule for `retry_until_actionable`, ms between attempts —
+/// mirrors Playwright's own `_retryAction` schedule
+/// (`packages/playwright-core/src/tools/backend/dom.ts`), so native and wasm
+/// give click/type roughly the same amount of real time to settle. The first
+/// `0` means the first check runs immediately, no wait.
+const ACTIONABILITY_BACKOFF_MS: [u64; 5] = [0, 20, 100, 100, 500];
+
+struct ActionabilityCheck {
+    ok: bool,
+    /// Only meaningful when `!ok` — human-readable reason for the last
+    /// attempt's failure, folded into `PortError::NotActionable` if every
+    /// attempt in `ACTIONABILITY_BACKOFF_MS` is exhausted.
+    reason: Option<String>,
+}
+
+/// Injected visible/enabled/stable/unobscured check (Task: native
+/// actionability parity), run via `Runtime.callFunctionOn` with `this` bound
+/// to the resolved node:
+/// - visible: non-zero content box, not `display:none`/`visibility:hidden`/
+///   `opacity:0`
+/// - enabled: not `.disabled`, not `aria-disabled="true"`
+/// - stable: `getBoundingClientRect()` unchanged across two consecutive
+///   `requestAnimationFrame` callbacks (mirrors Playwright's
+///   `checkElementStates`'s stability poll)
+/// - unobscured: `document.elementFromPoint()` at the element's own center
+///   resolves to the element itself or a descendant, not a covering overlay
+///
+/// One call checks all four rather than four round trips; the caller
+/// (`retry_until_actionable`) re-invokes this whole function on backoff
+/// rather than polling stability internally, matching how Playwright's own
+/// retry loop re-runs its full actionability check each attempt.
+const ACTIONABILITY_CHECK_JS: &str = "async function() {
+  function state(el) {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    const visible = rect.width > 0 && rect.height > 0 &&
+      style.visibility !== 'hidden' && style.display !== 'none' &&
+      parseFloat(style.opacity) !== 0;
+    const enabled = el.disabled !== true && el.getAttribute('aria-disabled') !== 'true';
+    return { rect, visible, enabled };
+  }
+  const before = state(this);
+  if (!before.visible) return { ok: false, reason: 'not visible' };
+  if (!before.enabled) return { ok: false, reason: 'disabled' };
+  await new Promise(r => requestAnimationFrame(r));
+  await new Promise(r => requestAnimationFrame(r));
+  const after = state(this);
+  if (!after.visible) return { ok: false, reason: 'not visible' };
+  if (!after.enabled) return { ok: false, reason: 'disabled' };
+  const stable = after.rect.x === before.rect.x && after.rect.y === before.rect.y &&
+    after.rect.width === before.rect.width && after.rect.height === before.rect.height;
+  if (!stable) return { ok: false, reason: 'not stable (still moving or resizing)' };
+  const cx = after.rect.left + after.rect.width / 2;
+  const cy = after.rect.top + after.rect.height / 2;
+  const doc = this.ownerDocument || document;
+  const hit = doc.elementFromPoint(cx, cy);
+  if (!hit || (hit !== this && !this.contains(hit))) {
+    return { ok: false, reason: 'covered by another element' };
+  }
+  return { ok: true, reason: null };
+}";
+
+async fn check_actionable(
+    page: &Page,
+    backend_node_id: BackendNodeId,
+) -> Result<ActionabilityCheck, PortError> {
+    let object_id = resolve_object_id(page, backend_node_id).await?;
+
+    let params = CallFunctionOnParams::builder()
+        .object_id(object_id)
+        .function_declaration(ACTIONABILITY_CHECK_JS)
+        .await_promise(true)
+        .return_by_value(true)
+        .build()
+        .map_err(PortError::Other)?;
+
+    let response = page
+        .execute(params)
+        .await
+        .map_err(|e| PortError::Other(e.to_string()))?;
+
+    if let Some(exception) = &response.result.exception_details {
+        return Err(PortError::Other(format!(
+            "actionability check raised an exception on the page (exception id {})",
+            exception.exception_id
+        )));
+    }
+
+    let value = response
+        .result
+        .result
+        .value
+        .ok_or_else(|| PortError::Other("actionability check returned no value".to_string()))?;
+    Ok(ActionabilityCheck {
+        ok: value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        reason: value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Polls `check` on `ACTIONABILITY_BACKOFF_MS`'s schedule, returning as soon
+/// as one attempt reports `ok: true`. `check` is a closure rather than a
+/// hardcoded call so this retry/backoff logic — the actual bug this feature
+/// fixes — can be unit tested with a fake check that doesn't need a live
+/// `Page` (see `tests::retry_until_actionable_*`). Bounded overall by the
+/// per-action `timeout` already wrapping every `dispatch_action` caller, so
+/// a short caller-supplied timeout still wins over this schedule's ~720ms.
+async fn retry_until_actionable<F, Fut>(mut check: F) -> Result<(), PortError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ActionabilityCheck, PortError>>,
+{
+    let mut last_reason: Option<String> = None;
+    for &delay_ms in ACTIONABILITY_BACKOFF_MS.iter() {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        let result = check().await?;
+        if result.ok {
+            return Ok(());
+        }
+        last_reason = result.reason;
+    }
+    Err(PortError::NotActionable(last_reason.unwrap_or_else(|| {
+        "element did not become actionable".to_string()
+    })))
+}
+
 async fn dispatch_click(page: &Page, backend_node_id: BackendNodeId) -> Result<(), PortError> {
+    retry_until_actionable(|| check_actionable(page, backend_node_id)).await?;
     invoke_on_node(
         page,
         backend_node_id,
@@ -602,6 +746,7 @@ async fn dispatch_type(
     backend_node_id: BackendNodeId,
     text: &str,
 ) -> Result<(), PortError> {
+    retry_until_actionable(|| check_actionable(page, backend_node_id)).await?;
     invoke_on_node(
         page,
         backend_node_id,
@@ -2656,6 +2801,99 @@ mod tests {
         assert_eq!(snapshot.navigated_from, None);
         assert!(!blocked.borrow().is_some());
         assert!(!crashed.get());
+    }
+
+    // ---- Issue #19: native click/type actionability retry/backoff ----
+    //
+    // `check_actionable`'s CDP round trip needs a live `Page` (exercised only
+    // by the `#[ignore]`d real-Chrome integration tests), so what's
+    // unit-testable offline is `retry_until_actionable`'s own control flow —
+    // it's generic over the check exactly so a fake, call-counting check can
+    // stand in here.
+
+    #[tokio::test]
+    async fn retry_until_actionable_should_succeed_immediately_when_first_check_ok() {
+        let calls = StdCell::new(0);
+        let result = retry_until_actionable(|| {
+            calls.set(calls.get() + 1);
+            async {
+                Ok(ActionabilityCheck {
+                    ok: true,
+                    reason: None,
+                })
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            calls.get(),
+            1,
+            "must not retry once the first check succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_until_actionable_should_succeed_after_becoming_actionable_partway_through() {
+        let calls = StdCell::new(0);
+        let result = retry_until_actionable(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                Ok(ActionabilityCheck {
+                    ok: n >= 3,
+                    reason: (n < 3).then(|| "not visible".to_string()),
+                })
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_until_actionable_should_exhaust_backoff_and_return_not_actionable() {
+        let calls = StdCell::new(0);
+        let result = retry_until_actionable(|| {
+            calls.set(calls.get() + 1);
+            async {
+                Ok(ActionabilityCheck {
+                    ok: false,
+                    reason: Some("covered by another element".to_string()),
+                })
+            }
+        })
+        .await;
+        assert_eq!(
+            calls.get(),
+            ACTIONABILITY_BACKOFF_MS.len(),
+            "must attempt exactly once per backoff schedule entry, no more"
+        );
+        match result {
+            Err(PortError::NotActionable(reason)) => {
+                assert_eq!(reason, "covered by another element")
+            }
+            other => panic!("expected PortError::NotActionable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_until_actionable_should_propagate_check_error_without_retrying() {
+        let calls = StdCell::new(0);
+        let result = retry_until_actionable(|| {
+            calls.set(calls.get() + 1);
+            async {
+                Err(PortError::NotFound(
+                    "element for ref 'r1' changed".to_string(),
+                ))
+            }
+        })
+        .await;
+        assert_eq!(
+            calls.get(),
+            1,
+            "a hard error (e.g. node went stale) must short-circuit, not retry as if just not-yet-actionable"
+        );
+        assert!(matches!(result, Err(PortError::NotFound(_))));
     }
 
     // ---- Epic 6 / Story 6.1: reaper eviction through the public tool API

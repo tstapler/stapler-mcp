@@ -27,6 +27,12 @@ pub enum PortError {
     /// reusing the same crashed session id would just crash again, so this
     /// tells the caller the specific id it holds is now dead.
     SessionCrashed(String),
+    /// A resolved element failed a `click`/`type` actionability check
+    /// (hidden, disabled, still animating, or covered by another element)
+    /// after exhausting the retry/backoff window. Distinct from `NotFound`:
+    /// the ref itself is still valid, so the caller's fix is to wait/inspect
+    /// the page, not to re-snapshot for a fresh ref.
+    NotActionable(String),
 }
 
 impl std::fmt::Display for PortError {
@@ -37,6 +43,7 @@ impl std::fmt::Display for PortError {
             PortError::Other(e) => write!(f, "{e}"),
             PortError::NotFound(e) => write!(f, "not found: {e}"),
             PortError::SessionCrashed(e) => write!(f, "session crashed: {e}"),
+            PortError::NotActionable(e) => write!(f, "not actionable: {e}"),
         }
     }
 }
