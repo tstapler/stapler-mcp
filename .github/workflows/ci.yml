@@ -9,7 +9,7 @@ jobs:
   native:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -36,7 +36,7 @@ jobs:
   wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -47,7 +47,7 @@ jobs:
       # process the .wasm.
       - run: cargo install wasm-bindgen-cli --version 0.2.126
       - run: wasm-bindgen --target nodejs target/wasm32-unknown-unknown/debug/stapler_mcp_wasm.wasm --out-dir npm/pkg
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "20"
       - run: npm ci
