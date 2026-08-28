@@ -9,11 +9,12 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 };
 use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
 use chromiumoxide::cdp::browser_protocol::page::{
-    EventFrameNavigated, EventFrameRequestedNavigation,
+    CaptureScreenshotFormat, EventFrameNavigated, EventFrameRequestedNavigation,
 };
 use chromiumoxide::cdp::browser_protocol::target::EventTargetCrashed;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::layout::Point;
+use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{keys, Browser, BrowserConfig, Page};
 use futures::StreamExt;
 
@@ -1904,6 +1905,169 @@ impl BrowserDriver for NativeBrowser {
             .await
             .map_err(|_| PortError::Timeout)?
     }
+
+    /// See `snapshot`'s doc comment for the session lookup/lock/blocked
+    /// discipline this mirrors — a screenshot doesn't mutate the page or
+    /// invalidate refs, so (unlike `dispatch_action`) there's no
+    /// `navigated_from`/AX-recapture step afterward.
+    async fn screenshot(
+        &self,
+        session_id: &SessionId,
+        full_page: bool,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, PortError> {
+        let fut = async {
+            touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+
+            let (blocked, lock) = {
+                let map = self.sessions.borrow();
+                let session = map
+                    .get(&session_id.0)
+                    .expect("touch_or_evict just confirmed presence");
+                (session.blocked.clone(), session.lock.clone())
+            };
+
+            let _session_guard = lock.lock().await;
+
+            if let Some(reason) = blocked.borrow().clone() {
+                return Err(PortError::NotFound(reason));
+            }
+
+            let page = {
+                let map = self.sessions.borrow();
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
+            };
+
+            let params = ScreenshotParams::builder()
+                .format(CaptureScreenshotFormat::Png)
+                .full_page(full_page)
+                .build();
+            let png = page
+                .screenshot(params)
+                .await
+                .map_err(|e| PortError::Other(e.to_string()))?;
+
+            if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                session.last_used.set(now_millis());
+            }
+
+            Ok(png)
+        };
+
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| PortError::Timeout)?
+    }
+
+    /// See `snapshot`'s doc comment for the session lookup/lock/blocked
+    /// discipline. `locator: Some(_)` resolves and re-verifies the node the
+    /// same way `dispatch_action` does, then invokes `function` via
+    /// `Runtime.callFunctionOn` with the node as `this`; `locator: None` runs
+    /// `function` at page scope via `Page::evaluate`, which auto-detects
+    /// expression vs. function syntax (same call this file already makes for
+    /// `document.title`/`innerText`).
+    async fn evaluate(
+        &self,
+        session_id: &SessionId,
+        function: &str,
+        locator: Option<&Locator>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PortError> {
+        let fut = async {
+            touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+
+            let (latest_refs, known_refs, nav_generation, latest_url, blocked, lock) = {
+                let map = self.sessions.borrow();
+                let session = map
+                    .get(&session_id.0)
+                    .expect("touch_or_evict just confirmed presence");
+                (
+                    session.latest_refs.clone(),
+                    session.known_refs.clone(),
+                    session.nav_generation.clone(),
+                    session.latest_url.clone(),
+                    session.blocked.clone(),
+                    session.lock.clone(),
+                )
+            };
+
+            let _session_guard = lock.lock().await;
+
+            if let Some(reason) = blocked.borrow().clone() {
+                return Err(PortError::NotFound(reason));
+            }
+
+            let page = {
+                let map = self.sessions.borrow();
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
+            };
+
+            let value = if let Some(locator) = locator {
+                let url_before = page
+                    .url()
+                    .await
+                    .map_err(|e| PortError::Other(e.to_string()))?
+                    .unwrap_or_else(|| latest_url.borrow().clone());
+                let (backend_node_id, expected_role) = {
+                    let refs = latest_refs.borrow();
+                    let known = known_refs.borrow();
+                    resolve_locator_impl(&refs, &known, nav_generation.get(), locator, &url_before)?
+                };
+                verify_node_live(&page, backend_node_id, &expected_role, locator).await?;
+
+                let object_id = resolve_object_id(&page, backend_node_id).await?;
+                let params = CallFunctionOnParams::builder()
+                    .object_id(object_id)
+                    .function_declaration(function)
+                    .await_promise(true)
+                    .return_by_value(true)
+                    .build()
+                    .map_err(PortError::Other)?;
+                let response = page
+                    .execute(params)
+                    .await
+                    .map_err(|e| PortError::Other(e.to_string()))?;
+
+                if let Some(exception) = &response.result.exception_details {
+                    let detail = exception
+                        .exception
+                        .as_ref()
+                        .and_then(|e| e.description.clone())
+                        .unwrap_or_else(|| exception.text.clone());
+                    return Err(PortError::Other(format!(
+                        "evaluate raised an exception on the page: {detail}"
+                    )));
+                }
+                response
+                    .result
+                    .result
+                    .value
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                let result = page
+                    .evaluate(function)
+                    .await
+                    .map_err(|e| PortError::Other(e.to_string()))?;
+                result.value().cloned().unwrap_or(serde_json::Value::Null)
+            };
+
+            if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                session.last_used.set(now_millis());
+            }
+
+            Ok(value)
+        };
+
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| PortError::Timeout)?
+    }
 }
 
 /// Builds one `TabInfo` per page in `tabs`, in order — used by every
@@ -3040,6 +3204,25 @@ mod tests {
             _condition: WaitCondition,
             _timeout: Duration,
         ) -> Result<AxSnapshot, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn screenshot(
+            &self,
+            _session_id: &SessionId,
+            _full_page: bool,
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn evaluate(
+            &self,
+            _session_id: &SessionId,
+            _function: &str,
+            _locator: Option<&Locator>,
+            _timeout: Duration,
+        ) -> Result<serde_json::Value, PortError> {
             panic!("not exercised by this test");
         }
     }

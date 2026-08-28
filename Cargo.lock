@@ -3574,6 +3574,7 @@ dependencies = [
 name = "stapler-mcp-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dom_query",
  "dom_smoothie",
  "form_urlencoded",

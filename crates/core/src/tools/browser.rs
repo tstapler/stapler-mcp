@@ -19,17 +19,20 @@
 
 use std::time::Duration;
 
+use base64::Engine;
+
 use crate::ports::{
-    AxNode, AxSnapshot, BrowserDriver, Locator, PortError, SessionId, TabAction, TabInfo,
-    WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, FileStore, Locator, PortError, SessionId, TabAction,
+    TabInfo, WaitCondition,
 };
 use crate::schema::{
     AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput,
     BrowserCloseAllSessionsOutput, BrowserCloseSessionFailure, BrowserCloseSessionInput,
-    BrowserCloseSessionOutput, BrowserHoverInput, BrowserListSessionsOutput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserSelectOptionInput, BrowserSessionSummary,
-    BrowserSnapshotInput, BrowserTabInfo, BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput,
-    BrowserTypeInput, BrowserWaitForInput,
+    BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
+    BrowserFormFieldType, BrowserHoverInput, BrowserListSessionsOutput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserScreenshotInput, BrowserScreenshotOutput,
+    BrowserSelectOptionInput, BrowserSessionSummary, BrowserSnapshotInput, BrowserTabInfo,
+    BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
 };
 use crate::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 
@@ -483,6 +486,129 @@ pub async fn browser_wait_for<B: BrowserDriver>(
     })
 }
 
+pub async fn browser_screenshot<B: BrowserDriver, F: FileStore>(
+    browser: &B,
+    fs: &F,
+    input: BrowserScreenshotInput,
+) -> Result<BrowserScreenshotOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let full_page = input.full_page.unwrap_or(false);
+
+    let png = browser
+        .screenshot(&session_id, full_page, timeout)
+        .await
+        .map_err(|e| map_error("screenshot", &input.session_id, e))?;
+
+    let mut out = BrowserScreenshotOutput {
+        data_base64: None,
+        saved_to: None,
+        mime_type: "image/png".to_string(),
+    };
+
+    // Same save-xor-inline tradeoff as `fetch_page`'s `savePath`: a large
+    // screenshot doesn't need to also be inlined as base64 into the tool
+    // response once it's written to disk.
+    if let Some(save_path) = input.save_path {
+        fs.write_file(&save_path, &png)
+            .await
+            .map_err(|e| e.to_string())?;
+        out.saved_to = Some(save_path);
+    } else {
+        out.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(&png));
+    }
+
+    Ok(out)
+}
+
+pub async fn browser_evaluate<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserEvaluateInput,
+) -> Result<BrowserEvaluateOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if input.function.is_empty() {
+        return Err("function must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let locator = input.ref_id.clone().map(Locator);
+
+    let result = browser
+        .evaluate(&session_id, &input.function, locator.as_ref(), timeout)
+        .await
+        .map_err(|e| map_error("evaluate", &input.session_id, e))?;
+
+    Ok(BrowserEvaluateOutput { result })
+}
+
+/// Batch convenience over calling `stapler_browser_type`/
+/// `stapler_browser_select_option` once per field — not a single atomic
+/// driver call. Fields are filled in order; if one fails, earlier fields
+/// remain filled and the error names which field failed.
+pub async fn browser_fill_form<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserFillFormInput,
+) -> Result<BrowserActionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if input.fields.is_empty() {
+        return Err("fields must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+
+    let mut snapshot = None;
+    for field in &input.fields {
+        if field.ref_id.is_empty() {
+            return Err("refId must not be empty".to_string());
+        }
+        let locator = Locator(field.ref_id.clone());
+        let result = match field.r#type {
+            BrowserFormFieldType::Textbox => {
+                browser
+                    .type_text(&session_id, &locator, &field.value, timeout)
+                    .await
+            }
+            BrowserFormFieldType::Combobox => {
+                browser
+                    .select_option(
+                        &session_id,
+                        &locator,
+                        std::slice::from_ref(&field.value),
+                        timeout,
+                    )
+                    .await
+            }
+        };
+        snapshot = Some(result.map_err(|e| {
+            map_error(
+                &format!("fill form field '{}'", field.ref_id),
+                &input.session_id,
+                e,
+            )
+        })?);
+    }
+
+    let snapshot = snapshot.expect("fields is non-empty, checked above");
+    let note = snapshot.navigated_from.as_ref().map(|_| {
+        format!(
+            "fill form navigated to {}; previous element refs are now invalid",
+            snapshot.url
+        )
+    });
+
+    Ok(BrowserActionOutput {
+        snapshot: to_snapshot_output(snapshot),
+        note,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -490,6 +616,7 @@ mod tests {
 
     use super::*;
     use crate::ports::PageExtract;
+    use crate::schema::BrowserFormField;
 
     struct FakeBrowserDriver {
         navigate_result: RefCell<Option<Result<crate::ports::NavigateResult, PortError>>>,
@@ -506,6 +633,8 @@ mod tests {
         select_option_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         press_key_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         wait_for_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        screenshot_result: RefCell<Option<Result<Vec<u8>, PortError>>>,
+        evaluate_result: RefCell<Option<Result<serde_json::Value, PortError>>>,
         /// Overrides whatever `tabs()` would otherwise compute from
         /// `tabs_state` — used to simulate driver-level failures (e.g. an
         /// unknown session) without disturbing the in-memory tab list.
@@ -530,6 +659,8 @@ mod tests {
                 select_option_result: RefCell::new(None),
                 press_key_result: RefCell::new(None),
                 wait_for_result: RefCell::new(None),
+                screenshot_result: RefCell::new(None),
+                evaluate_result: RefCell::new(None),
                 tabs_error: RefCell::new(None),
                 tabs_state: RefCell::new(vec![TabInfo {
                     index: 0,
@@ -591,6 +722,16 @@ mod tests {
 
         fn with_wait_for(self, result: Result<AxSnapshot, PortError>) -> Self {
             *self.wait_for_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_screenshot(self, result: Result<Vec<u8>, PortError>) -> Self {
+            *self.screenshot_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_evaluate(self, result: Result<serde_json::Value, PortError>) -> Self {
+            *self.evaluate_result.borrow_mut() = Some(result);
             self
         }
 
@@ -816,6 +957,33 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .expect("wait_for result not configured")
+        }
+
+        async fn screenshot(
+            &self,
+            _session_id: &SessionId,
+            _full_page: bool,
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, PortError> {
+            self.calls.borrow_mut().push("screenshot");
+            self.screenshot_result
+                .borrow_mut()
+                .take()
+                .expect("screenshot result not configured")
+        }
+
+        async fn evaluate(
+            &self,
+            _session_id: &SessionId,
+            _function: &str,
+            _locator: Option<&Locator>,
+            _timeout: Duration,
+        ) -> Result<serde_json::Value, PortError> {
+            self.calls.borrow_mut().push("evaluate");
+            self.evaluate_result
+                .borrow_mut()
+                .take()
+                .expect("evaluate result not configured")
         }
     }
 
@@ -2131,5 +2299,329 @@ mod tests {
             err,
             "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
         );
+    }
+
+    // -- browser_screenshot ------------------------------------------------------
+
+    /// Captures the last `write_file` call's path/bytes — `browser_screenshot`
+    /// only ever calls `write_file`, never `read_file`/`delete_file`, so
+    /// that's all this needs (unlike `docs.rs`'s fuller `InMemoryFileStore`).
+    struct FakeFileStore {
+        last_write: RefCell<Option<(String, Vec<u8>)>>,
+    }
+
+    impl FakeFileStore {
+        fn new() -> Self {
+            FakeFileStore {
+                last_write: RefCell::new(None),
+            }
+        }
+    }
+
+    impl crate::ports::FileStore for FakeFileStore {
+        async fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), PortError> {
+            *self.last_write.borrow_mut() = Some((path.to_string(), bytes.to_vec()));
+            Ok(())
+        }
+
+        async fn read_file(&self, _path: &str) -> Result<Option<Vec<u8>>, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn delete_file(&self, _path: &str) -> Result<(), PortError> {
+            panic!("not exercised by this test");
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+        let fs = FakeFileStore::new();
+
+        let err = browser_screenshot(
+            &driver,
+            &fs,
+            BrowserScreenshotInput {
+                session_id: String::new(),
+                full_page: None,
+                save_path: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_should_return_base64_data_when_save_path_omitted() {
+        let driver = FakeBrowserDriver::new().with_screenshot(Ok(vec![1, 2, 3, 4]));
+        let fs = FakeFileStore::new();
+
+        let output = browser_screenshot(
+            &driver,
+            &fs,
+            BrowserScreenshotInput {
+                session_id: "sess-1".to_string(),
+                full_page: None,
+                save_path: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("screenshot should succeed");
+
+        assert_eq!(output.data_base64.as_deref(), Some("AQIDBA=="));
+        assert_eq!(output.saved_to, None);
+        assert_eq!(output.mime_type, "image/png");
+        assert!(fs.last_write.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_should_save_to_file_and_omit_data_when_save_path_given() {
+        let driver = FakeBrowserDriver::new().with_screenshot(Ok(vec![9, 9, 9]));
+        let fs = FakeFileStore::new();
+
+        let output = browser_screenshot(
+            &driver,
+            &fs,
+            BrowserScreenshotInput {
+                session_id: "sess-1".to_string(),
+                full_page: Some(true),
+                save_path: Some("/tmp/shot.png".to_string()),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("screenshot should succeed");
+
+        assert_eq!(output.data_base64, None);
+        assert_eq!(output.saved_to.as_deref(), Some("/tmp/shot.png"));
+        assert_eq!(
+            *fs.last_write.borrow(),
+            Some(("/tmp/shot.png".to_string(), vec![9, 9, 9]))
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_screenshot(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+        let fs = FakeFileStore::new();
+
+        let err = browser_screenshot(
+            &driver,
+            &fs,
+            BrowserScreenshotInput {
+                session_id: "sess-9".to_string(),
+                full_page: None,
+                save_path: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_evaluate ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_evaluate_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_evaluate(
+            &driver,
+            BrowserEvaluateInput {
+                session_id: String::new(),
+                function: "() => 1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_evaluate_should_return_err_when_function_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_evaluate(
+            &driver,
+            BrowserEvaluateInput {
+                session_id: "sess-1".to_string(),
+                function: String::new(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty function should be rejected");
+
+        assert_eq!(err, "function must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_evaluate_should_return_driver_result_as_output() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Ok(serde_json::json!({"n": 42})));
+
+        let output = browser_evaluate(
+            &driver,
+            BrowserEvaluateInput {
+                session_id: "sess-1".to_string(),
+                function: "() => ({n: 42})".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("evaluate should succeed");
+
+        assert_eq!(output.result, serde_json::json!({"n": 42}));
+    }
+
+    #[tokio::test]
+    async fn browser_evaluate_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+
+        let err = browser_evaluate(
+            &driver,
+            BrowserEvaluateInput {
+                session_id: "sess-9".to_string(),
+                function: "() => 1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_fill_form ---------------------------------------------------------
+
+    fn form_field(ref_id: &str, kind: BrowserFormFieldType, value: &str) -> BrowserFormField {
+        BrowserFormField {
+            ref_id: ref_id.to_string(),
+            r#type: kind,
+            value: value.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_fill_form_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_fill_form(
+            &driver,
+            BrowserFillFormInput {
+                session_id: String::new(),
+                fields: vec![form_field("e1", BrowserFormFieldType::Textbox, "hi")],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_fill_form_should_return_err_when_fields_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_fill_form(
+            &driver,
+            BrowserFillFormInput {
+                session_id: "sess-1".to_string(),
+                fields: vec![],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty fields should be rejected");
+
+        assert_eq!(err, "fields must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_fill_form_should_return_err_when_a_field_ref_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_fill_form(
+            &driver,
+            BrowserFillFormInput {
+                session_id: "sess-1".to_string(),
+                fields: vec![form_field("", BrowserFormFieldType::Textbox, "hi")],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty refId should be rejected");
+
+        assert_eq!(err, "refId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_fill_form_should_call_type_text_and_select_option_for_mixed_fields() {
+        let driver = FakeBrowserDriver::new()
+            .with_type(Ok(sample_snapshot("https://example.com/", None)))
+            .with_select_option(Ok(sample_snapshot("https://example.com/", None)));
+
+        let output = browser_fill_form(
+            &driver,
+            BrowserFillFormInput {
+                session_id: "sess-1".to_string(),
+                fields: vec![
+                    form_field("e1", BrowserFormFieldType::Textbox, "hello"),
+                    form_field("e2", BrowserFormFieldType::Combobox, "opt-a"),
+                ],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("fill form should succeed");
+
+        assert_eq!(*driver.calls.borrow(), vec!["type_text", "select_option"]);
+        assert_eq!(output.snapshot.url, "https://example.com/");
+    }
+
+    #[tokio::test]
+    async fn browser_fill_form_should_wrap_field_error_with_ref_id() {
+        let driver = FakeBrowserDriver::new().with_type(Err(PortError::Timeout));
+
+        let err = browser_fill_form(
+            &driver,
+            BrowserFillFormInput {
+                session_id: "sess-1".to_string(),
+                fields: vec![form_field("e1", BrowserFormFieldType::Textbox, "hello")],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("timeout should surface as an error");
+
+        assert_eq!(err, "fill form field 'e1' sess-1: timed out");
     }
 }

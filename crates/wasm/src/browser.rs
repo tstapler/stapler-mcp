@@ -63,6 +63,16 @@ extern "C" {
         condition_json: &str,
         timeout_ms: f64,
     ) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsBrowserScreenshot)]
+    fn js_browser_screenshot(session_id: &str, full_page: bool, timeout_ms: f64)
+        -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsBrowserEvaluate)]
+    fn js_browser_evaluate(
+        session_id: &str,
+        function: &str,
+        ref_id: Option<String>,
+        timeout_ms: f64,
+    ) -> js_sys::Promise;
 }
 
 pub struct WasmBrowser;
@@ -501,6 +511,48 @@ impl BrowserDriver for WasmBrowser {
         let parsed: JsAxSnapshot =
             serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))?;
         Ok(parsed.into())
+    }
+
+    /// Unlike every other method here, the resolved value is read via
+    /// `js_sys::Uint8Array` rather than `serde_wasm_bindgen` — `browser.js`'s
+    /// `jsBrowserScreenshot` resolves with the raw `Buffer` Playwright's
+    /// `page.screenshot()` returns, and a `Buffer` (a `Uint8Array` subclass)
+    /// has no JSON shape for `serde_wasm_bindgen` to walk.
+    async fn screenshot(
+        &self,
+        session_id: &SessionId,
+        full_page: bool,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, PortError> {
+        let result = JsFuture::from(js_browser_screenshot(
+            &session_id.0,
+            full_page,
+            timeout.as_millis() as f64,
+        ))
+        .await
+        .map_err(js_reject_to_port_error)?;
+
+        Ok(js_sys::Uint8Array::new(&result).to_vec())
+    }
+
+    async fn evaluate(
+        &self,
+        session_id: &SessionId,
+        function: &str,
+        locator: Option<&Locator>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PortError> {
+        let ref_id = locator.map(|l| l.0.clone());
+        let result = JsFuture::from(js_browser_evaluate(
+            &session_id.0,
+            function,
+            ref_id,
+            timeout.as_millis() as f64,
+        ))
+        .await
+        .map_err(js_reject_to_port_error)?;
+
+        serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))
     }
 }
 
