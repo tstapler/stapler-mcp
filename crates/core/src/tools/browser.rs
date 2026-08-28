@@ -22,16 +22,18 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::ports::{
-    AxNode, AxSnapshot, BrowserDriver, FileStore, Locator, PortError, SessionId, TabAction,
-    TabInfo, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, FileStore, HistoryAction, Locator, PortError, SessionId,
+    TabAction, TabInfo, WaitCondition,
 };
 use crate::schema::{
     AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput,
     BrowserCloseAllSessionsOutput, BrowserCloseSessionFailure, BrowserCloseSessionInput,
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
-    BrowserFormFieldType, BrowserHoverInput, BrowserListSessionsOutput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserScreenshotInput, BrowserScreenshotOutput,
-    BrowserSelectOptionInput, BrowserSessionSummary, BrowserSnapshotInput, BrowserTabInfo,
+    BrowserFindInput, BrowserFindMatch, BrowserFindOutput, BrowserFormFieldType,
+    BrowserHistoryAction, BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsOutput,
+    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
+    BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
+    BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabInfo,
     BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
 };
 use crate::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
@@ -585,6 +587,11 @@ pub async fn browser_fill_form<B: BrowserDriver>(
                     )
                     .await
             }
+            BrowserFormFieldType::Checkbox => {
+                let checked = parse_checked_value(&field.value)
+                    .map_err(|e| format!("field '{}': {e}", field.ref_id))?;
+                set_checked(browser, &session_id, &locator, checked, timeout).await
+            }
         };
         snapshot = Some(result.map_err(|e| {
             map_error(
@@ -607,6 +614,198 @@ pub async fn browser_fill_form<B: BrowserDriver>(
         snapshot: to_snapshot_output(snapshot),
         note,
     })
+}
+
+fn parse_checked_value(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "checkbox value must be \"true\" or \"false\", got \"{other}\""
+        )),
+    }
+}
+
+/// Reads `locator`'s current checked state via `evaluate` (checking `.checked`
+/// for a native `<input type=checkbox/radio>` or `aria-checked` for a
+/// custom-element checkbox role), then only dispatches a `click` if that
+/// differs from `checked` — composing two existing `BrowserDriver` calls
+/// rather than needing a new adapter-level primitive, since clicking an
+/// already-`checked` checkbox would toggle it *off*. Returns a fresh
+/// `snapshot()` when no click was needed, so the caller always gets a
+/// current snapshot either way.
+async fn set_checked<B: BrowserDriver>(
+    browser: &B,
+    session_id: &SessionId,
+    locator: &Locator,
+    checked: bool,
+    timeout: Duration,
+) -> Result<AxSnapshot, PortError> {
+    const CHECKED_STATE_JS: &str =
+        "(el) => el.checked === true || el.getAttribute('aria-checked') === 'true'";
+
+    let current = browser
+        .evaluate(session_id, CHECKED_STATE_JS, Some(locator), timeout)
+        .await?;
+    let already_checked = current.as_bool().unwrap_or(false);
+
+    if already_checked == checked {
+        browser.snapshot(session_id, timeout).await
+    } else {
+        browser.click(session_id, locator, timeout).await
+    }
+}
+
+pub async fn browser_set_checked<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserSetCheckedInput,
+) -> Result<BrowserActionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if input.ref_id.is_empty() {
+        return Err("refId must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let locator = Locator(input.ref_id.clone());
+
+    let snapshot = set_checked(browser, &session_id, &locator, input.checked, timeout)
+        .await
+        .map_err(|e| map_error("set checked", &input.session_id, e))?;
+
+    Ok(BrowserActionOutput {
+        snapshot: to_snapshot_output(snapshot),
+        note: None,
+    })
+}
+
+pub async fn browser_history<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserHistoryInput,
+) -> Result<BrowserActionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let action = match input.action {
+        BrowserHistoryAction::Back => HistoryAction::Back,
+        BrowserHistoryAction::Forward => HistoryAction::Forward,
+        BrowserHistoryAction::Reload => HistoryAction::Reload,
+    };
+
+    let snapshot = browser
+        .history(&session_id, action, timeout)
+        .await
+        .map_err(|e| map_error("history", &input.session_id, e))?;
+
+    let note = snapshot.navigated_from.as_ref().map(|_| {
+        format!(
+            "history navigated to {}; previous element refs are now invalid",
+            snapshot.url
+        )
+    });
+
+    Ok(BrowserActionOutput {
+        snapshot: to_snapshot_output(snapshot),
+        note,
+    })
+}
+
+pub async fn browser_resize<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserResizeInput,
+) -> Result<BrowserActionOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if input.width == 0 || input.height == 0 {
+        return Err("width and height must both be greater than 0".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+
+    let snapshot = browser
+        .resize(&session_id, input.width, input.height, timeout)
+        .await
+        .map_err(|e| map_error("resize", &input.session_id, e))?;
+
+    Ok(BrowserActionOutput {
+        snapshot: to_snapshot_output(snapshot),
+        note: None,
+    })
+}
+
+/// Caps how many matches are returned in one call — a broad query against a
+/// large page shouldn't dump most of the tree back, defeating the point of
+/// `find` being cheaper than a full `snapshot`.
+const MAX_FIND_MATCHES: usize = 20;
+
+pub async fn browser_find<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserFindInput,
+) -> Result<BrowserFindOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if input.query.is_empty() {
+        return Err("query must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+
+    let snapshot = browser
+        .snapshot(&session_id, timeout)
+        .await
+        .map_err(|e| map_error("find", &input.session_id, e))?;
+
+    let query_lower = input.query.to_lowercase();
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    collect_find_matches(
+        &snapshot.root,
+        &query_lower,
+        "",
+        &mut matches,
+        &mut truncated,
+    );
+
+    Ok(BrowserFindOutput { matches, truncated })
+}
+
+/// Walks the whole tree (not stopping at `MAX_FIND_MATCHES`) so `truncated`
+/// accurately reflects whether more matches exist beyond the cap, matching
+/// how `AxSnapshotOutput::truncated` is reported elsewhere in this file.
+fn collect_find_matches(
+    node: &AxNode,
+    query_lower: &str,
+    parent_path: &str,
+    matches: &mut Vec<BrowserFindMatch>,
+    truncated: &mut bool,
+) {
+    let path = if parent_path.is_empty() {
+        node.role.clone()
+    } else {
+        format!("{parent_path} > {}", node.role)
+    };
+
+    if node.name.to_lowercase().contains(query_lower) {
+        if matches.len() >= MAX_FIND_MATCHES {
+            *truncated = true;
+        } else {
+            matches.push(BrowserFindMatch {
+                node_ref: node.node_ref.clone(),
+                role: node.role.clone(),
+                name: node.name.clone(),
+                path: path.clone(),
+            });
+        }
+    }
+
+    for child in &node.children {
+        collect_find_matches(child, query_lower, &path, matches, truncated);
+    }
 }
 
 #[cfg(test)]
@@ -635,6 +834,8 @@ mod tests {
         wait_for_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         screenshot_result: RefCell<Option<Result<Vec<u8>, PortError>>>,
         evaluate_result: RefCell<Option<Result<serde_json::Value, PortError>>>,
+        history_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        resize_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         /// Overrides whatever `tabs()` would otherwise compute from
         /// `tabs_state` — used to simulate driver-level failures (e.g. an
         /// unknown session) without disturbing the in-memory tab list.
@@ -661,6 +862,8 @@ mod tests {
                 wait_for_result: RefCell::new(None),
                 screenshot_result: RefCell::new(None),
                 evaluate_result: RefCell::new(None),
+                history_result: RefCell::new(None),
+                resize_result: RefCell::new(None),
                 tabs_error: RefCell::new(None),
                 tabs_state: RefCell::new(vec![TabInfo {
                     index: 0,
@@ -732,6 +935,16 @@ mod tests {
 
         fn with_evaluate(self, result: Result<serde_json::Value, PortError>) -> Self {
             *self.evaluate_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_history(self, result: Result<AxSnapshot, PortError>) -> Self {
+            *self.history_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_resize(self, result: Result<AxSnapshot, PortError>) -> Self {
+            *self.resize_result.borrow_mut() = Some(result);
             self
         }
 
@@ -984,6 +1197,33 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .expect("evaluate result not configured")
+        }
+
+        async fn history(
+            &self,
+            _session_id: &SessionId,
+            _action: crate::ports::HistoryAction,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            self.calls.borrow_mut().push("history");
+            self.history_result
+                .borrow_mut()
+                .take()
+                .expect("history result not configured")
+        }
+
+        async fn resize(
+            &self,
+            _session_id: &SessionId,
+            _width: u32,
+            _height: u32,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            self.calls.borrow_mut().push("resize");
+            self.resize_result
+                .borrow_mut()
+                .take()
+                .expect("resize result not configured")
         }
     }
 
@@ -2623,5 +2863,461 @@ mod tests {
         .expect_err("timeout should surface as an error");
 
         assert_eq!(err, "fill form field 'e1' sess-1: timed out");
+    }
+
+    // -- browser_set_checked ---------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_set_checked_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_set_checked(
+            &driver,
+            BrowserSetCheckedInput {
+                session_id: String::new(),
+                ref_id: "e1".to_string(),
+                checked: true,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_set_checked_should_return_err_when_ref_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_set_checked(
+            &driver,
+            BrowserSetCheckedInput {
+                session_id: "sess-1".to_string(),
+                ref_id: String::new(),
+                checked: true,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty refId should be rejected");
+
+        assert_eq!(err, "refId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_set_checked_should_click_when_current_state_differs() {
+        let driver = FakeBrowserDriver::new()
+            .with_evaluate(Ok(serde_json::json!(false)))
+            .with_click(Ok(sample_snapshot("https://example.com/", None)));
+
+        browser_set_checked(
+            &driver,
+            BrowserSetCheckedInput {
+                session_id: "sess-1".to_string(),
+                ref_id: "e1".to_string(),
+                checked: true,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("set_checked should succeed");
+
+        assert_eq!(*driver.calls.borrow(), vec!["evaluate", "click"]);
+    }
+
+    #[tokio::test]
+    async fn browser_set_checked_should_not_click_when_current_state_already_matches() {
+        let driver = FakeBrowserDriver::new()
+            .with_evaluate(Ok(serde_json::json!(true)))
+            .with_snapshot(Ok(sample_snapshot("https://example.com/", None)));
+
+        browser_set_checked(
+            &driver,
+            BrowserSetCheckedInput {
+                session_id: "sess-1".to_string(),
+                ref_id: "e1".to_string(),
+                checked: true,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("set_checked should succeed");
+
+        assert_eq!(*driver.calls.borrow(), vec!["evaluate", "snapshot"]);
+    }
+
+    #[tokio::test]
+    async fn browser_set_checked_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+
+        let err = browser_set_checked(
+            &driver,
+            BrowserSetCheckedInput {
+                session_id: "sess-9".to_string(),
+                ref_id: "e1".to_string(),
+                checked: true,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_fill_form (checkbox) --------------------------------------------
+
+    #[tokio::test]
+    async fn browser_fill_form_should_return_err_when_checkbox_value_is_not_true_or_false() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_fill_form(
+            &driver,
+            BrowserFillFormInput {
+                session_id: "sess-1".to_string(),
+                fields: vec![form_field("e1", BrowserFormFieldType::Checkbox, "yes")],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("non-boolean checkbox value should be rejected");
+
+        assert_eq!(
+            err,
+            "field 'e1': checkbox value must be \"true\" or \"false\", got \"yes\""
+        );
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_fill_form_should_set_checkbox_via_evaluate_and_click() {
+        let driver = FakeBrowserDriver::new()
+            .with_evaluate(Ok(serde_json::json!(false)))
+            .with_click(Ok(sample_snapshot("https://example.com/", None)));
+
+        let output = browser_fill_form(
+            &driver,
+            BrowserFillFormInput {
+                session_id: "sess-1".to_string(),
+                fields: vec![form_field("e1", BrowserFormFieldType::Checkbox, "true")],
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("fill form should succeed");
+
+        assert_eq!(*driver.calls.borrow(), vec!["evaluate", "click"]);
+        assert_eq!(output.snapshot.url, "https://example.com/");
+    }
+
+    // -- browser_history ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_history_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_history(
+            &driver,
+            BrowserHistoryInput {
+                session_id: String::new(),
+                action: BrowserHistoryAction::Back,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_history_should_set_note_when_history_action_navigates() {
+        let driver = FakeBrowserDriver::new().with_history(Ok(sample_snapshot(
+            "https://example.com/previous",
+            Some("https://example.com/current"),
+        )));
+
+        let output = browser_history(
+            &driver,
+            BrowserHistoryInput {
+                session_id: "sess-1".to_string(),
+                action: BrowserHistoryAction::Back,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("history should succeed");
+
+        assert_eq!(
+            output.note,
+            Some(
+                "history navigated to https://example.com/previous; previous element refs are now invalid"
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_history_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_history(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+
+        let err = browser_history(
+            &driver,
+            BrowserHistoryInput {
+                session_id: "sess-9".to_string(),
+                action: BrowserHistoryAction::Reload,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_resize ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_resize_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_resize(
+            &driver,
+            BrowserResizeInput {
+                session_id: String::new(),
+                width: 1024,
+                height: 768,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_resize_should_return_err_when_width_or_height_is_zero() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_resize(
+            &driver,
+            BrowserResizeInput {
+                session_id: "sess-1".to_string(),
+                width: 0,
+                height: 768,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("zero width should be rejected");
+
+        assert_eq!(err, "width and height must both be greater than 0");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_resize_should_return_action_output_when_resize_succeeds() {
+        let driver =
+            FakeBrowserDriver::new().with_resize(Ok(sample_snapshot("https://example.com/", None)));
+
+        let output = browser_resize(
+            &driver,
+            BrowserResizeInput {
+                session_id: "sess-1".to_string(),
+                width: 1024,
+                height: 768,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("resize should succeed");
+
+        assert_eq!(output.snapshot.url, "https://example.com/");
+        assert_eq!(output.note, None);
+    }
+
+    #[tokio::test]
+    async fn browser_resize_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_resize(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+
+        let err = browser_resize(
+            &driver,
+            BrowserResizeInput {
+                session_id: "sess-9".to_string(),
+                width: 1024,
+                height: 768,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_find ---------------------------------------------------------------
+
+    fn node(role: &str, name: &str, node_ref: &str, children: Vec<AxNode>) -> AxNode {
+        AxNode {
+            node_ref: node_ref.to_string(),
+            role: role.to_string(),
+            name: name.to_string(),
+            value: None,
+            children,
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_find_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_find(
+            &driver,
+            BrowserFindInput {
+                session_id: String::new(),
+                query: "submit".to_string(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_find_should_return_err_when_query_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_find(
+            &driver,
+            BrowserFindInput {
+                session_id: "sess-1".to_string(),
+                query: String::new(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty query should be rejected");
+
+        assert_eq!(err, "query must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_find_should_return_matching_nodes_case_insensitively_with_path() {
+        let tree = node(
+            "generic",
+            "",
+            "e1",
+            vec![node(
+                "list",
+                "",
+                "e2",
+                vec![node(
+                    "listitem",
+                    "",
+                    "e3",
+                    vec![node("link", "Submit Order", "e4", vec![])],
+                )],
+            )],
+        );
+        let snapshot = AxSnapshot {
+            root: tree,
+            url: "https://example.com/".to_string(),
+            truncated: false,
+            navigated_from: None,
+        };
+        let driver = FakeBrowserDriver::new().with_snapshot(Ok(snapshot));
+
+        let output = browser_find(
+            &driver,
+            BrowserFindInput {
+                session_id: "sess-1".to_string(),
+                query: "submit".to_string(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("find should succeed");
+
+        assert_eq!(output.matches.len(), 1);
+        assert_eq!(output.matches[0].node_ref, "e4");
+        assert_eq!(output.matches[0].name, "Submit Order");
+        assert_eq!(output.matches[0].path, "generic > list > listitem > link");
+        assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn browser_find_should_truncate_and_set_truncated_true_when_matches_exceed_cap() {
+        let children: Vec<AxNode> = (0..(MAX_FIND_MATCHES + 5))
+            .map(|i| node("button", "Click me", &format!("e{i}"), vec![]))
+            .collect();
+        let snapshot = AxSnapshot {
+            root: node("generic", "", "root", children),
+            url: "https://example.com/".to_string(),
+            truncated: false,
+            navigated_from: None,
+        };
+        let driver = FakeBrowserDriver::new().with_snapshot(Ok(snapshot));
+
+        let output = browser_find(
+            &driver,
+            BrowserFindInput {
+                session_id: "sess-1".to_string(),
+                query: "click".to_string(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("find should succeed");
+
+        assert_eq!(output.matches.len(), MAX_FIND_MATCHES);
+        assert!(output.truncated);
+    }
+
+    #[tokio::test]
+    async fn browser_find_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_snapshot(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+
+        let err = browser_find(
+            &driver,
+            BrowserFindInput {
+                session_id: "sess-9".to_string(),
+                query: "submit".to_string(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
     }
 }

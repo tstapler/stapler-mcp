@@ -7,9 +7,11 @@ use chromiumoxide::cdp::browser_protocol::accessibility::{EnableParams, GetParti
 use chromiumoxide::cdp::browser_protocol::dom::{
     BackendNodeId, DescribeNodeParams, GetContentQuadsParams, ResolveNodeParams,
 };
+use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, EventFrameNavigated, EventFrameRequestedNavigation,
+    GetNavigationHistoryParams, NavigateToHistoryEntryParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::EventTargetCrashed;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
@@ -19,8 +21,8 @@ use chromiumoxide::{keys, Browser, BrowserConfig, Page};
 use futures::StreamExt;
 
 use stapler_mcp_core::ports::{
-    AxSnapshot, BrowserDriver, ClockPort, Locator, NavigateResult, PageExtract, PortError,
-    SessionId, SessionSummary, SleepPort, TabAction, TabInfo, TabsResult, WaitCondition,
+    AxSnapshot, BrowserDriver, ClockPort, HistoryAction, Locator, NavigateResult, PageExtract,
+    PortError, SessionId, SessionSummary, SleepPort, TabAction, TabInfo, TabsResult, WaitCondition,
 };
 use stapler_mcp_core::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 use url::Url;
@@ -874,6 +876,39 @@ async fn dispatch_key_event(
     )
     .await
     .map_err(|e| PortError::Other(e.to_string()))?;
+    Ok(())
+}
+
+/// Moves `page` by `delta` entries in its own navigation history (`-1` =
+/// back, `1` = forward) via `Page.getNavigationHistory` +
+/// `Page.navigateToHistoryEntry`, erroring if that would go past either end.
+/// `dispatch_action`'s own grace-period poll + AX recapture (run by its
+/// caller right after this returns) covers the same SSRF/`navigated_from`
+/// handling `Page::reload`'s built-in `wait_for_navigation` gets for free
+/// below.
+async fn go_history(page: &Page, delta: i64) -> Result<(), PortError> {
+    let history = page
+        .execute(GetNavigationHistoryParams::default())
+        .await
+        .map_err(|e| PortError::Other(e.to_string()))?;
+    let target = history.result.current_index + delta;
+    if target < 0 || target as usize >= history.result.entries.len() {
+        let (direction, entry) = if delta < 0 {
+            ("back", "previous")
+        } else {
+            ("forward", "next")
+        };
+        return Err(PortError::Other(format!(
+            "cannot go {direction}: no {entry} entry in this session's history"
+        )));
+    }
+    let entry_id = history.result.entries[target as usize].id;
+    page.execute(NavigateToHistoryEntryParams::new(entry_id))
+        .await
+        .map_err(|e| PortError::Other(e.to_string()))?;
+    page.wait_for_navigation()
+        .await
+        .map_err(|e| PortError::Other(e.to_string()))?;
     Ok(())
 }
 
@@ -2068,6 +2103,105 @@ impl BrowserDriver for NativeBrowser {
             .await
             .map_err(|_| PortError::Timeout)?
     }
+
+    /// Delegates to `dispatch_action` (the same session/lock/blocked/
+    /// grace-period/`navigated_from` discipline `click`/`type_text`/`hover`
+    /// already go through) with no resolved locator — back/forward/reload
+    /// act on the whole page, not one element — so a same-call redirect to a
+    /// blocked host during a history navigation is caught by the exact guard
+    /// every other navigation-causing call already relies on.
+    async fn history(
+        &self,
+        session_id: &SessionId,
+        action: HistoryAction,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError> {
+        let internal = match action {
+            HistoryAction::Back => Action::HistoryBack,
+            HistoryAction::Forward => Action::HistoryForward,
+            HistoryAction::Reload => Action::Reload,
+        };
+        self.dispatch_action(session_id, None, timeout, internal)
+            .await
+    }
+
+    /// See `snapshot`'s doc comment for the session lookup/lock/blocked
+    /// discipline this mirrors. A resize doesn't itself cause a navigation,
+    /// so (unlike `dispatch_action`) there's no grace-period poll or
+    /// `navigated_from` — just a fresh AX capture afterward, since a resize
+    /// can change what's visible/laid out.
+    async fn resize(
+        &self,
+        session_id: &SessionId,
+        width: u32,
+        height: u32,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError> {
+        let fut = async {
+            touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+
+            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+                let map = self.sessions.borrow();
+                let session = map
+                    .get(&session_id.0)
+                    .expect("touch_or_evict just confirmed presence");
+                (
+                    session.latest_refs.clone(),
+                    session.known_refs.clone(),
+                    session.nav_generation.clone(),
+                    session.next_ref_id.clone(),
+                    session.latest_url.clone(),
+                    session.blocked.clone(),
+                    session.lock.clone(),
+                )
+            };
+
+            let _session_guard = lock.lock().await;
+
+            if let Some(reason) = blocked.borrow().clone() {
+                return Err(PortError::NotFound(reason));
+            }
+
+            let page = {
+                let map = self.sessions.borrow();
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
+            };
+
+            let params = SetDeviceMetricsOverrideParams::builder()
+                .width(i64::from(width))
+                .height(i64::from(height))
+                .device_scale_factor(0.0)
+                .mobile(false)
+                .build()
+                .map_err(PortError::Other)?;
+            page.execute(params)
+                .await
+                .map_err(|e| PortError::Other(e.to_string()))?;
+
+            let previous_refs = latest_refs.borrow().clone();
+            let capture = ax::capture_snapshot(&page, &next_ref_id, &previous_refs).await?;
+            let snapshot = install_snapshot(
+                &latest_refs,
+                &known_refs,
+                &latest_url,
+                nav_generation.get(),
+                capture,
+            );
+
+            if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                session.last_used.set(now_millis());
+            }
+
+            Ok(snapshot)
+        };
+
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| PortError::Timeout)?
+    }
 }
 
 /// Builds one `TabInfo` per page in `tabs`, in order — used by every
@@ -2117,9 +2251,13 @@ enum Action {
     Type(String),
     Hover,
     SelectOption(Vec<String>),
-    /// `PressKey` is the only variant that can run with `locator: None` in
-    /// `dispatch_action` — every other variant requires a resolved node.
+    /// `PressKey`/`HistoryBack`/`HistoryForward`/`Reload` are the variants
+    /// that can run with `locator: None` in `dispatch_action` — every other
+    /// variant requires a resolved node.
     PressKey(String),
+    HistoryBack,
+    HistoryForward,
+    Reload,
 }
 
 impl NativeBrowser {
@@ -2222,6 +2360,13 @@ impl NativeBrowser {
                     .await?
                 }
                 Action::PressKey(key) => dispatch_key_event(&page, key, backend_node_id).await?,
+                Action::HistoryBack => go_history(&page, -1).await?,
+                Action::HistoryForward => go_history(&page, 1).await?,
+                Action::Reload => {
+                    page.reload()
+                        .await
+                        .map_err(|e| PortError::Other(e.to_string()))?;
+                }
             }
 
             // Grace period: give the `Page.frameNavigated` listener a chance
@@ -3223,6 +3368,25 @@ mod tests {
             _locator: Option<&Locator>,
             _timeout: Duration,
         ) -> Result<serde_json::Value, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn history(
+            &self,
+            _session_id: &SessionId,
+            _action: HistoryAction,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn resize(
+            &self,
+            _session_id: &SessionId,
+            _width: u32,
+            _height: u32,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
             panic!("not exercised by this test");
         }
     }

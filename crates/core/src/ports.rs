@@ -196,6 +196,14 @@ pub enum TabAction {
     },
 }
 
+/// What `BrowserDriver::history` should do to `session_id`'s current tab.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HistoryAction {
+    Back,
+    Forward,
+    Reload,
+}
+
 /// One entry in a `TabsResult` listing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabInfo {
@@ -365,6 +373,28 @@ pub trait BrowserDriver {
         locator: Option<&Locator>,
         timeout: Duration,
     ) -> Result<serde_json::Value, PortError>;
+
+    /// Navigates `session_id`'s current tab back/forward through its history,
+    /// or reloads it in place. Subject to the same blocked-host guard as
+    /// every other navigation-causing call — `PortError::NotFound` if the
+    /// resulting page is on a blocked host.
+    async fn history(
+        &self,
+        session_id: &SessionId,
+        action: HistoryAction,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
+
+    /// Resizes `session_id`'s current tab's viewport to `width`x`height`
+    /// (CSS pixels) and returns a fresh snapshot, since a resize can change
+    /// what's visible/laid out.
+    async fn resize(
+        &self,
+        session_id: &SessionId,
+        width: u32,
+        height: u32,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
 }
 
 pub trait FileStore {
@@ -562,6 +592,25 @@ mod tests {
             _locator: Option<&Locator>,
             _timeout: Duration,
         ) -> Result<serde_json::Value, PortError> {
+            todo!()
+        }
+
+        async fn history(
+            &self,
+            _session_id: &SessionId,
+            _action: HistoryAction,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
+        async fn resize(
+            &self,
+            _session_id: &SessionId,
+            _width: u32,
+            _height: u32,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
             todo!()
         }
     }

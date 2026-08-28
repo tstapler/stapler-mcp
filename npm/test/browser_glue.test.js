@@ -1035,3 +1035,122 @@ test("jsBrowserEvaluate_should_return_null_when_function_returns_undefined", asy
 
     browserGlue.sessions.delete(id);
 });
+
+test("jsBrowserHistory_should_go_back_and_return_snapshot", async () => {
+    const id = "sess-history-back-1";
+    let receivedOptions;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            goBack: async (options) => {
+                receivedOptions = options;
+                return {};
+            },
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserHistory(id, "back", 5000);
+
+    assert.deepStrictEqual(receivedOptions, { timeout: 5000 });
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserHistory_should_reject_when_going_back_with_no_previous_entry", async () => {
+    const id = "sess-history-back-empty-1";
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({ goBack: async () => null }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserHistory(id, "back", 5000),
+        /cannot go back: no previous entry/,
+    );
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserHistory_should_go_forward_and_return_snapshot", async () => {
+    const id = "sess-history-forward-1";
+    let called = false;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            goForward: async () => {
+                called = true;
+                return {};
+            },
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserHistory(id, "forward", 5000);
+
+    assert.strictEqual(called, true);
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserHistory_should_reload_and_return_snapshot", async () => {
+    const id = "sess-history-reload-1";
+    let called = false;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            reload: async () => {
+                called = true;
+                return {};
+            },
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserHistory(id, "reload", 5000);
+
+    assert.strictEqual(called, true);
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserHistory_should_reject_unknown_action", async () => {
+    const id = "sess-history-unknown-1";
+    browserGlue.sessions.set(id, {
+        page: makeMockPage(),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserHistory(id, "sideways", 5000),
+        /unknown history action/,
+    );
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserResize_should_set_viewport_size_and_return_snapshot", async () => {
+    const id = "sess-resize-1";
+    let receivedSize;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            setViewportSize: async (size) => {
+                receivedSize = size;
+            },
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserResize(id, 1024, 768, 5000);
+
+    assert.deepStrictEqual(receivedSize, { width: 1024, height: 768 });
+    assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});

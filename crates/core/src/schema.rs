@@ -553,11 +553,14 @@ pub enum BrowserFormFieldType {
     /// as `stapler_browser_type`).
     Textbox,
     /// Selects `value` as the single selected option (same as
-    /// `stapler_browser_select_option` with one value). Multi-select and
-    /// checkbox/radio fields aren't supported by this batch tool yet — use
-    /// `stapler_browser_select_option`/`stapler_browser_click` directly for
-    /// those.
+    /// `stapler_browser_select_option` with one value). Multi-select fields
+    /// aren't supported by this batch tool — use
+    /// `stapler_browser_select_option` directly for those.
     Combobox,
+    /// Sets a checkbox or radio button's checked state to `value`
+    /// (`"true"`/`"false"`, case-insensitive) — same as
+    /// `stapler_browser_set_checked`.
+    Checkbox,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -581,6 +584,79 @@ pub struct BrowserFillFormInput {
     /// Applied per-field, not to the whole batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSetCheckedInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`, identifying a checkbox or
+    /// radio button.
+    pub ref_id: String,
+    /// The desired checked state.
+    pub checked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserHistoryAction {
+    Back,
+    Forward,
+    Reload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserHistoryInput {
+    pub session_id: String,
+    pub action: BrowserHistoryAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserResizeInput {
+    pub session_id: String,
+    /// Viewport width in CSS pixels.
+    pub width: u32,
+    /// Viewport height in CSS pixels.
+    pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFindInput {
+    pub session_id: String,
+    /// Case-insensitive substring matched against each accessibility node's
+    /// name (its accessible/visible text).
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFindMatch {
+    pub node_ref: String,
+    pub role: String,
+    pub name: String,
+    /// The matched node's role chain from the snapshot root, e.g.
+    /// `"generic > list > listitem > link"` — cheaper context than
+    /// returning the whole subtree around each match.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFindOutput {
+    pub matches: Vec<BrowserFindMatch>,
+    /// `true` if more matches existed than were returned.
+    pub truncated: bool,
 }
 
 #[cfg(test)]
