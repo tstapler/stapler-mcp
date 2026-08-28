@@ -115,7 +115,14 @@ where
     Fut: std::future::Future<Output = Result<Out, String>> + 'static,
 {
     Box::new(move |params| {
-        match serde_json::from_value::<In>(params.unwrap_or(serde_json::Value::Null)) {
+        // Omitted params (`None`, e.g. a caller that skips `arguments`
+        // entirely for a no-fields `In`) becomes `{}`, not `null` — a
+        // zero-field struct's derived `Deserialize` accepts an empty object
+        // but rejects `null` outright ("invalid type: null, expected struct
+        // ..."), so substituting `null` here made every empty-input tool
+        // (e.g. `BrowserListSessionsInput`) fail on an omitted-params call
+        // even though it needs nothing from the caller.
+        match serde_json::from_value::<In>(params.unwrap_or_else(|| serde_json::json!({}))) {
             Ok(input) => {
                 let fut = f(input);
                 Box::pin(async move {
@@ -129,4 +136,35 @@ where
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct EmptyInput {}
+
+    #[derive(Debug, serde::Serialize)]
+    struct EmptyOutput {
+        ok: bool,
+    }
+
+    /// Regression test for a real bug found while verifying browser-tool
+    /// parity for issue #15: a caller that omits `params` entirely (as
+    /// `crates/cli/tests/browser_session.rs`'s
+    /// `list_sessions_should_report_open_sessions_and_close_all_sessions_should_drain_them`
+    /// does for `stapler_browser_list_sessions`) used to fail with "invalid
+    /// type: null, expected struct ..." for any zero-field `In`, even though
+    /// the tool needs nothing from the caller.
+    #[tokio::test]
+    async fn json_handler_should_accept_omitted_params_for_zero_field_input() {
+        let handler = json_handler(|_input: EmptyInput| async { Ok(EmptyOutput { ok: true }) });
+
+        let result = handler(None)
+            .await
+            .expect("omitted params should deserialize into a zero-field input");
+
+        assert_eq!(result, serde_json::json!({ "ok": true }));
+    }
 }
