@@ -951,3 +951,87 @@ test("jsBrowserWaitFor_should_wait_a_fixed_delay_for_timeMs_condition", async ()
 
     browserGlue.sessions.delete(id);
 });
+
+test("jsBrowserScreenshot_should_pass_full_page_and_timeout_through_and_return_bytes", async () => {
+    const id = "sess-screenshot-1";
+    let receivedOptions;
+    const fakeBytes = Buffer.from([1, 2, 3, 4]);
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            screenshot: async (options) => {
+                receivedOptions = options;
+                return fakeBytes;
+            },
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const bytes = await browserGlue.jsBrowserScreenshot(id, true, 5000);
+
+    assert.deepStrictEqual(receivedOptions, { type: "png", fullPage: true, timeout: 5000 });
+    assert.deepStrictEqual(Buffer.from(bytes), fakeBytes);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserEvaluate_should_call_function_at_page_scope_when_no_ref_given", async () => {
+    const id = "sess-evaluate-page-1";
+    let receivedFn;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            evaluate: async (fn) => {
+                receivedFn = fn;
+                return 42;
+            },
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const value = await browserGlue.jsBrowserEvaluate(id, "() => 40 + 2", undefined, 5000);
+
+    assert.strictEqual(typeof receivedFn, "function");
+    assert.strictEqual(value, 42);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserEvaluate_should_call_function_on_located_element_when_ref_given", async () => {
+    const id = "sess-evaluate-ref-1";
+    let receivedOptions;
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            locator: () => ({
+                evaluate: async (fn, arg, options) => {
+                    receivedOptions = options;
+                    return "value-from-element";
+                },
+            }),
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const value = await browserGlue.jsBrowserEvaluate(id, "(el) => el.value", "e1", 5000);
+
+    assert.deepStrictEqual(receivedOptions, { timeout: 5000 });
+    assert.strictEqual(value, "value-from-element");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserEvaluate_should_return_null_when_function_returns_undefined", async () => {
+    const id = "sess-evaluate-undefined-1";
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({ evaluate: async () => undefined }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const value = await browserGlue.jsBrowserEvaluate(id, "() => {}", undefined, 5000);
+
+    assert.strictEqual(value, null);
+
+    browserGlue.sessions.delete(id);
+});

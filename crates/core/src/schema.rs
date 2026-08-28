@@ -493,6 +493,96 @@ pub struct BrowserCloseAllSessionsOutput {
     pub failed: Vec<BrowserCloseSessionFailure>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserScreenshotInput {
+    pub session_id: String,
+    /// Capture the full scrollable page rather than just the current
+    /// viewport. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_page: Option<bool>,
+    /// Optional local file path to save the PNG to. When set, `dataBase64`
+    /// is omitted from the output (mirrors `fetch_page`'s `savePath`) so a
+    /// large screenshot isn't also inlined into the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserScreenshotOutput {
+    /// Base64-encoded PNG bytes; omitted when `savePath` was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    /// Local path the PNG was saved to, if `savePath` was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_to: Option<String>,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserEvaluateInput {
+    pub session_id: String,
+    /// A JS function-expression string, e.g. `"() => document.title"` or,
+    /// when `refId` is given, `"(element) => element.value"`.
+    pub function: String,
+    /// A `ref` from a previous `AxSnapshotOutput`; when given, `function` is
+    /// called with the resolved element as its argument instead of running
+    /// at page scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserEvaluateOutput {
+    /// `function`'s return value, JSON-serialized. `null` if `function`
+    /// returned `undefined` or nothing.
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserFormFieldType {
+    /// Types `value` into the field, replacing its current contents (same
+    /// as `stapler_browser_type`).
+    Textbox,
+    /// Selects `value` as the single selected option (same as
+    /// `stapler_browser_select_option` with one value). Multi-select and
+    /// checkbox/radio fields aren't supported by this batch tool yet — use
+    /// `stapler_browser_select_option`/`stapler_browser_click` directly for
+    /// those.
+    Combobox,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFormField {
+    /// A `ref` from a previous `AxSnapshotOutput`.
+    pub ref_id: String,
+    pub r#type: BrowserFormFieldType,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFillFormInput {
+    pub session_id: String,
+    /// Filled in order, one call per field — a batch convenience over
+    /// calling `stapler_browser_type`/`stapler_browser_select_option`
+    /// individually, not a single atomic operation. If a field fails partway
+    /// through, earlier fields remain filled.
+    pub fields: Vec<BrowserFormField>,
+    /// Applied per-field, not to the whole batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

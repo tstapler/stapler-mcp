@@ -15,8 +15,9 @@ use stapler_mcp_core::paths;
 use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
     BrowserCloseAllSessionsInput, BrowserCloseAllSessionsOutput, BrowserCloseSessionInput,
-    BrowserCloseSessionOutput, BrowserHoverInput, BrowserListSessionsInput,
-    BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput,
+    BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
+    BrowserHoverInput, BrowserListSessionsInput, BrowserListSessionsOutput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserScreenshotInput, BrowserScreenshotOutput,
     BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
     BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
     FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
@@ -283,6 +284,45 @@ impl ThinClient {
         params: Parameters<BrowserWaitForInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
         call_daemon("stapler_browser_wait_for", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_screenshot",
+        description = "Capture a pixel screenshot (PNG) of an existing browser session's current page — the current viewport by default, or the full scrollable page with fullPage: true. Returns base64-encoded image data, or saves it to savePath if given (omitting the inline data)."
+    )]
+    async fn browser_screenshot(
+        &self,
+        params: Parameters<BrowserScreenshotInput>,
+    ) -> Result<Json<BrowserScreenshotOutput>, String> {
+        call_daemon("stapler_browser_screenshot", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_evaluate",
+        description = "Run a JS function (e.g. \"() => document.title\") in an existing browser session's current page and return its result as JSON. Pass refId (a `ref` from a previous snapshot) to call the function with that element as its argument (e.g. \"(element) => element.value\") instead of running at page scope."
+    )]
+    async fn browser_evaluate(
+        &self,
+        params: Parameters<BrowserEvaluateInput>,
+    ) -> Result<Json<BrowserEvaluateOutput>, String> {
+        call_daemon("stapler_browser_evaluate", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_fill_form",
+        description = "Fill multiple fields in an existing browser session in one call instead of one stapler_browser_type/stapler_browser_select_option call per field. Each field names a `ref` from a previous snapshot, a type (\"textbox\" or \"combobox\"), and a value. Returns the accessibility-tree snapshot after the last field is filled."
+    )]
+    async fn browser_fill_form(
+        &self,
+        params: Parameters<BrowserFillFormInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_fill_form", params.0)
             .await
             .map(Json)
     }

@@ -802,6 +802,61 @@ module.exports.jsBrowserPressKey = async function (sessionId, key, refId, timeou
     });
 };
 
+// Captures the page as PNG bytes and returns the raw `Buffer` (a
+// `Uint8Array` subclass) — `crates/wasm/src/browser.rs`'s
+// `WasmBrowser::screenshot` reads it directly via `js_sys::Uint8Array`
+// rather than round-tripping through base64/`serde_wasm_bindgen`, mirroring
+// how every other binary boundary in this codebase (e.g. `fs.js`'s
+// read/write) stays a raw byte array rather than a text encoding. Doesn't
+// mutate the page, so (like `jsBrowserSnapshot`) there's no grace-period
+// poll or `checkBlocked` re-check afterward.
+module.exports.jsBrowserScreenshot = async function (sessionId, fullPage, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    return runSerialized(session, () =>
+        session.page.screenshot({ type: "png", fullPage: Boolean(fullPage), timeout: timeoutMs }),
+    );
+};
+
+// Constructs the caller-supplied function *object* from its source text
+// without ever executing its body here: `new Function(...)` merely compiles
+// `functionStr` (e.g. `"() => document.title"`) into a real JS `Function`
+// value. Playwright's `evaluate`/`locator.evaluate` then serialize that
+// function's source (`.toString()`) across to the actual page/element
+// context and call it *there* — the body never runs in this Node process,
+// only in the page.
+function compileEvaluateFunction(functionStr) {
+    // eslint-disable-next-line no-new-func -- see doc comment above: this
+    // constructs a callable without invoking it in this process.
+    return new Function(`return (${functionStr});`)();
+}
+
+module.exports.jsBrowserEvaluate = async function (sessionId, functionStr, refId, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    return runSerialized(session, async () => {
+        const fn = compileEvaluateFunction(functionStr);
+        let value;
+        try {
+            if (refId) {
+                value = await refLocator(session.page, refId).evaluate(fn, undefined, {
+                    timeout: timeoutMs,
+                });
+            } else {
+                // `page.evaluate` has no `timeout` option of its own in
+                // Playwright's API (only locator-scoped calls do) — the
+                // caller-supplied `functionStr` is expected to resolve on
+                // its own rather than hang indefinitely.
+                value = await session.page.evaluate(fn);
+            }
+        } catch (e) {
+            throw refId ? describeActionError(refId, e) : e;
+        }
+        // `undefined` (e.g. a function with no explicit `return`) can't cross
+        // `serde_wasm_bindgen::from_value` into `serde_json::Value` the way
+        // `null` can.
+        return value === undefined ? null : value;
+    });
+};
+
 module.exports.jsBrowserWaitFor = async function (sessionId, conditionJson, timeoutMs) {
     const session = requireLiveSession(sessionId);
     const condition = JSON.parse(conditionJson);

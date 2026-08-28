@@ -342,6 +342,29 @@ pub trait BrowserDriver {
         condition: WaitCondition,
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError>;
+
+    /// Captures `session_id`'s current page as PNG bytes. `full_page: true`
+    /// captures the full scrollable page rather than just the current
+    /// viewport.
+    async fn screenshot(
+        &self,
+        session_id: &SessionId,
+        full_page: bool,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, PortError>;
+
+    /// Runs `function` (a JS function-expression string, e.g. `"() =>
+    /// document.title"`) in `session_id`'s current page and returns its
+    /// result as JSON. If `locator` is given, `function` is invoked with the
+    /// resolved element as its argument (`function(element) { ... }`)
+    /// instead of running at page scope.
+    async fn evaluate(
+        &self,
+        session_id: &SessionId,
+        function: &str,
+        locator: Option<&Locator>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PortError>;
 }
 
 pub trait FileStore {
@@ -520,6 +543,25 @@ mod tests {
             _condition: WaitCondition,
             _timeout: Duration,
         ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
+        async fn screenshot(
+            &self,
+            _session_id: &SessionId,
+            _full_page: bool,
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, PortError> {
+            todo!()
+        }
+
+        async fn evaluate(
+            &self,
+            _session_id: &SessionId,
+            _function: &str,
+            _locator: Option<&Locator>,
+            _timeout: Duration,
+        ) -> Result<serde_json::Value, PortError> {
             todo!()
         }
     }
