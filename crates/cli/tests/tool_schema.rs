@@ -28,8 +28,9 @@ use rmcp::model::JsonObject;
 
 use stapler_mcp_core::schema::{
     BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
-    BrowserEvaluateInput, BrowserFillFormInput, BrowserHoverInput, BrowserListSessionsInput,
-    BrowserNavigateInput, BrowserPressKeyInput, BrowserScreenshotInput, BrowserSelectOptionInput,
+    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserHistoryInput,
+    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserPressKeyInput,
+    BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput,
     BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput, IndexDocsInput,
     ListIndexedSourcesInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
@@ -136,6 +137,23 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
             "stapler_browser_fill_form",
             schema_for_input::<BrowserFillFormInput>()
                 .expect("BrowserFillFormInput schemars schema"),
+        ),
+        (
+            "stapler_browser_set_checked",
+            schema_for_input::<BrowserSetCheckedInput>()
+                .expect("BrowserSetCheckedInput schemars schema"),
+        ),
+        (
+            "stapler_browser_history",
+            schema_for_input::<BrowserHistoryInput>().expect("BrowserHistoryInput schemars schema"),
+        ),
+        (
+            "stapler_browser_resize",
+            schema_for_input::<BrowserResizeInput>().expect("BrowserResizeInput schemars schema"),
+        ),
+        (
+            "stapler_browser_find",
+            schema_for_input::<BrowserFindInput>().expect("BrowserFindInput schemars schema"),
         ),
     ];
 

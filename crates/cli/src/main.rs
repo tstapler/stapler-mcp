@@ -9,8 +9,9 @@ use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
     BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
-    BrowserEvaluateInput, BrowserFillFormInput, BrowserHoverInput, BrowserListSessionsInput,
-    BrowserNavigateInput, BrowserPressKeyInput, BrowserScreenshotInput, BrowserSelectOptionInput,
+    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserHistoryInput,
+    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserPressKeyInput,
+    BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput,
     BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput,
     DownloadWebsiteInput, FetchPageInput, IndexDocsInput, ListIndexedSourcesInput,
     ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
@@ -329,6 +330,50 @@ async fn run_daemon() {
             move |input: BrowserFillFormInput| {
                 let browser = browser.clone();
                 async move { browser::browser_fill_form(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_set_checked",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserSetCheckedInput| {
+                let browser = browser.clone();
+                async move { browser::browser_set_checked(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_history",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserHistoryInput| {
+                let browser = browser.clone();
+                async move { browser::browser_history(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_resize",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserResizeInput| {
+                let browser = browser.clone();
+                async move { browser::browser_resize(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_find",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserFindInput| {
+                let browser = browser.clone();
+                async move { browser::browser_find(&*browser, input).await }
             }
         }),
     );

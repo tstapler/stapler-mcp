@@ -857,6 +857,44 @@ module.exports.jsBrowserEvaluate = async function (sessionId, functionStr, refId
     });
 };
 
+// `goBack`/`goForward` resolve with `null` (not a rejection) when there's no
+// previous/next history entry — normalized here into the same kind of
+// descriptive error `crates/native/src/browser.rs`'s `go_history` returns
+// for the identical out-of-range case, rather than silently returning a
+// snapshot of the page as if navigation had happened.
+module.exports.jsBrowserHistory = async function (sessionId, action, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    return runSerialized(session, async () => {
+        let response;
+        if (action === "back") {
+            response = await session.page.goBack({ timeout: timeoutMs });
+        } else if (action === "forward") {
+            response = await session.page.goForward({ timeout: timeoutMs });
+        } else if (action === "reload") {
+            response = await session.page.reload({ timeout: timeoutMs });
+        } else {
+            throw new Error(`unknown history action '${action}'`);
+        }
+        if (action !== "reload" && response === null) {
+            const entry = action === "back" ? "previous" : "next";
+            throw new Error(`cannot go ${action}: no ${entry} entry in this session's history`);
+        }
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        return captureSnapshot(session.page);
+    });
+};
+
+module.exports.jsBrowserResize = async function (sessionId, width, height, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    // `setViewportSize` has no `timeout` option of its own in Playwright's API.
+    void timeoutMs;
+    return runSerialized(session, async () => {
+        await session.page.setViewportSize({ width, height });
+        return captureSnapshot(session.page);
+    });
+};
+
 module.exports.jsBrowserWaitFor = async function (sessionId, conditionJson, timeoutMs) {
     const session = requireLiveSession(sessionId);
     const condition = JSON.parse(conditionJson);

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use stapler_mcp_core::ports::{
-    AxNode, AxSnapshot, BrowserDriver, Locator, NavigateResult, PageExtract, PortError, SessionId,
-    SessionSummary, TabAction, TabInfo, TabsResult, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, HistoryAction, Locator, NavigateResult, PageExtract,
+    PortError, SessionId, SessionSummary, TabAction, TabInfo, TabsResult, WaitCondition,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -71,6 +71,15 @@ extern "C" {
         session_id: &str,
         function: &str,
         ref_id: Option<String>,
+        timeout_ms: f64,
+    ) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsBrowserHistory)]
+    fn js_browser_history(session_id: &str, action: &str, timeout_ms: f64) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsBrowserResize)]
+    fn js_browser_resize(
+        session_id: &str,
+        width: u32,
+        height: u32,
         timeout_ms: f64,
     ) -> js_sys::Promise;
 }
@@ -553,6 +562,51 @@ impl BrowserDriver for WasmBrowser {
         .map_err(js_reject_to_port_error)?;
 
         serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))
+    }
+
+    async fn history(
+        &self,
+        session_id: &SessionId,
+        action: HistoryAction,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError> {
+        let action_str = match action {
+            HistoryAction::Back => "back",
+            HistoryAction::Forward => "forward",
+            HistoryAction::Reload => "reload",
+        };
+        let result = JsFuture::from(js_browser_history(
+            &session_id.0,
+            action_str,
+            timeout.as_millis() as f64,
+        ))
+        .await
+        .map_err(js_reject_to_port_error)?;
+
+        let parsed: JsAxSnapshot =
+            serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))?;
+        Ok(parsed.into())
+    }
+
+    async fn resize(
+        &self,
+        session_id: &SessionId,
+        width: u32,
+        height: u32,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError> {
+        let result = JsFuture::from(js_browser_resize(
+            &session_id.0,
+            width,
+            height,
+            timeout.as_millis() as f64,
+        ))
+        .await
+        .map_err(js_reject_to_port_error)?;
+
+        let parsed: JsAxSnapshot =
+            serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))?;
+        Ok(parsed.into())
     }
 }
 

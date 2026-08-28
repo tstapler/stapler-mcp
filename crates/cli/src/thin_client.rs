@@ -16,11 +16,13 @@ use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
     BrowserCloseAllSessionsInput, BrowserCloseAllSessionsOutput, BrowserCloseSessionInput,
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
-    BrowserHoverInput, BrowserListSessionsInput, BrowserListSessionsOutput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserScreenshotInput, BrowserScreenshotOutput,
-    BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
-    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
-    FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
+    BrowserFindInput, BrowserFindOutput, BrowserHistoryInput, BrowserHoverInput,
+    BrowserListSessionsInput, BrowserListSessionsOutput, BrowserNavigateInput,
+    BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
+    BrowserScreenshotOutput, BrowserSelectOptionInput, BrowserSetCheckedInput,
+    BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
+    BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
+    FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
     ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput,
     RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
 };
@@ -323,6 +325,58 @@ impl ThinClient {
         params: Parameters<BrowserFillFormInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
         call_daemon("stapler_browser_fill_form", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_set_checked",
+        description = "Set a checkbox or radio button in an existing browser session, identified by a `ref` from a previous snapshot, to an explicit checked state. Only clicks if the element's current state differs from the requested one. Returns the accessibility-tree snapshot afterward."
+    )]
+    async fn browser_set_checked(
+        &self,
+        params: Parameters<BrowserSetCheckedInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_set_checked", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_history",
+        description = "Navigate an existing browser session's current tab back or forward through its history, or reload it in place, via the `action` field (\"back\", \"forward\", or \"reload\"). Returns the accessibility-tree snapshot after the navigation completes."
+    )]
+    async fn browser_history(
+        &self,
+        params: Parameters<BrowserHistoryInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_history", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_resize",
+        description = "Resize an existing browser session's current tab's viewport to width x height (CSS pixels). Returns the accessibility-tree snapshot afterward, since a resize can change what's visible/laid out."
+    )]
+    async fn browser_resize(
+        &self,
+        params: Parameters<BrowserResizeInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_resize", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_find",
+        description = "Search an existing browser session's current page for accessibility-tree nodes whose name (visible/accessible text) contains query (case-insensitive), without capturing a full stapler_browser_snapshot. Returns each match's ref, role, name, and its role path from the tree root — cheaper than a full snapshot when you only need to locate one element's ref."
+    )]
+    async fn browser_find(
+        &self,
+        params: Parameters<BrowserFindInput>,
+    ) -> Result<Json<BrowserFindOutput>, String> {
+        call_daemon("stapler_browser_find", params.0)
             .await
             .map(Json)
     }
