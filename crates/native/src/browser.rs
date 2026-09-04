@@ -100,6 +100,61 @@ trait CloseableSession: SessionState {
     async fn close(self);
 }
 
+/// Ref-tracking state for a single tab: which refs are currently resolvable
+/// (`latest_refs`), which have ever been issued (`known_refs`), and which
+/// navigation generation they belong to (`nav_generation`), plus the URL
+/// `latest_refs` was captured against (`latest_url`). Scoped per-tab (not
+/// per-session) so that opening or switching tabs never invalidates refs
+/// held for a tab that itself never navigated — see #34.
+#[derive(Clone)]
+struct TabState {
+    /// Refs from the most recent `AxSnapshot` returned for this tab,
+    /// resolved by `resolve_locator_impl` (Epic 3, Story 3.1). `Rc`-wrapped
+    /// (not a bare `RefCell`) so a short synchronous `self.sessions.borrow()`
+    /// critical section can clone a handle to this field, drop the map
+    /// borrow, then read/write it across `.await` points without holding the
+    /// map borrow live.
+    latest_refs: Rc<RefCell<HashMap<String, ax::ResolvedRef>>>,
+    /// Every ref string ever issued for this tab, tagged with the
+    /// `nav_generation` it was issued under — lets `resolve_locator_impl`
+    /// distinguish "never issued" from "issued, but the page has since
+    /// navigated" (Task 3.1.3).
+    known_refs: Rc<RefCell<HashMap<String, u64>>>,
+    /// Bumped by 1 on every `navigate` call that *reuses* this tab (never on
+    /// the tab's first navigate, and never on `click`/`type_text`/
+    /// `snapshot`). Refs issued before a bump are "stale" once the bump
+    /// happens.
+    nav_generation: Rc<Cell<u64>>,
+    /// The URL of the most recently installed `AxSnapshot` for this tab,
+    /// used to build "no element with ref ... (page: {url})" error text
+    /// without an extra CDP round trip.
+    latest_url: Rc<RefCell<String>>,
+}
+
+impl TabState {
+    /// Fresh, empty ref-tracking state for a tab that has never had an
+    /// `AxSnapshot` installed — used both for a session's first tab and for
+    /// every tab opened later via `tabs(TabAction::New)`.
+    fn fresh() -> Self {
+        Self {
+            latest_refs: Rc::new(RefCell::new(HashMap::new())),
+            known_refs: Rc::new(RefCell::new(HashMap::new())),
+            nav_generation: Rc::new(Cell::new(0u64)),
+            latest_url: Rc::new(RefCell::new(String::new())),
+        }
+    }
+}
+
+/// One open tab: the live CDP `Page` plus that tab's own ref-tracking state.
+/// `next_ref_id` stays session-wide (see `BrowserSession::next_ref_id`) —
+/// cross-tab ref-string uniqueness is harmless and not worth a second
+/// per-tab counter.
+#[derive(Clone)]
+struct Tab {
+    page: Page,
+    refs: TabState,
+}
+
 /// A single persistent browser tab, keyed by `SessionId` in
 /// `NativeBrowser::sessions`.
 struct BrowserSession {
@@ -109,7 +164,7 @@ struct BrowserSession {
     /// `tabs(TabAction::Close)`. Never empty while the session is alive —
     /// closing the last tab must go through `close_session` instead (see
     /// `NativeBrowser::tabs`).
-    tabs: RefCell<Vec<Page>>,
+    tabs: RefCell<Vec<Tab>>,
     /// Index into `tabs` of the tab every other `BrowserDriver` method
     /// (`click`/`type_text`/`snapshot`/`hover`/...) operates against.
     active_tab: Cell<usize>,
@@ -118,31 +173,11 @@ struct BrowserSession {
     /// bumped synchronously, before any `.await`, so an in-flight call is
     /// never mistaken for idle by a concurrent reaper scan (Story 2.3).
     last_used: Cell<u64>,
-    /// Refs from the most recent `AxSnapshot` returned for this session,
-    /// resolved by `resolve_locator_impl` (Epic 3, Story 3.1). `Rc`-wrapped
-    /// (not a bare `RefCell`) so a short synchronous `self.sessions.borrow()`
-    /// critical section can clone a handle to this field, drop the map
-    /// borrow, then read/write it across `.await` points without holding the
-    /// map borrow live.
-    latest_refs: Rc<RefCell<HashMap<String, ax::ResolvedRef>>>,
-    /// Every ref string ever issued for this session, tagged with the
-    /// `nav_generation` it was issued under — lets `resolve_locator_impl`
-    /// distinguish "never issued" from "issued, but the page has since
-    /// navigated" (Task 3.1.3).
-    known_refs: Rc<RefCell<HashMap<String, u64>>>,
-    /// Bumped by 1 on every `navigate` call that *reuses* this session (never
-    /// on the session's first navigate, and never on `click`/`type_text`/
-    /// `snapshot`). Refs issued before a bump are "stale" once the bump
-    /// happens.
-    nav_generation: Rc<Cell<u64>>,
     /// Session-scoped monotonic counter backing every `ref` string minted for
-    /// this session's `AxSnapshot`s — never reset, so a ref string is never
-    /// reused even across re-navigations (Task 3.1.1).
+    /// any tab's `AxSnapshot` in this session — never reset, so a ref string
+    /// is never reused even across re-navigations or across tabs (Task
+    /// 3.1.1).
     next_ref_id: Rc<Cell<u64>>,
-    /// The URL of the most recently installed `AxSnapshot`, used to build
-    /// "no element with ref ... (page: {url})" error text without an extra
-    /// CDP round trip.
-    latest_url: Rc<RefCell<String>>,
     /// Set by the `Page.frameNavigated` listener (Epic 3, Story 3.4) when an
     /// in-page navigation (link click, JS redirect, form submit, ...) lands
     /// on a host the SSRF guard would have blocked at `navigate` time. Every
@@ -170,6 +205,16 @@ impl BrowserSession {
     /// The tab every `BrowserDriver` method (other than `tabs` itself)
     /// operates against.
     fn active_page(&self) -> Page {
+        let tabs = self.tabs.borrow();
+        tabs[self.active_tab.get()].page.clone()
+    }
+
+    /// The `Page` and ref-tracking state of the active tab, both from the
+    /// same lookup — callers must fetch this *after* acquiring the session
+    /// lock (not before), so a concurrent `tabs()` switch can't change which
+    /// tab is "active" between reading the page and reading its refs (see
+    /// #34).
+    fn active_tab_state(&self) -> Tab {
         let tabs = self.tabs.borrow();
         tabs[self.active_tab.get()].clone()
     }
@@ -204,8 +249,8 @@ impl CloseableSession for BrowserSession {
         // only a live-but-idle session reaches here, so `close()` erroring
         // is a best-effort cleanup, not a signal worth propagating. Every
         // tab the session ever opened is closed, not just the active one.
-        for page in self.tabs.into_inner() {
-            let _ = page.close().await;
+        for tab in self.tabs.into_inner() {
+            let _ = tab.page.close().await;
         }
     }
 }
@@ -948,6 +993,53 @@ async fn poll_blocked_grace_period(blocked: &Rc<RefCell<Option<String>>>) -> Opt
     blocked.borrow().clone()
 }
 
+/// Polls `blocked` every 20ms, with no upper bound, until it's set. Only
+/// ever used as the losing side of `goto_or_blocked`'s race
+/// (below), so in practice it runs for at most as long as the winning
+/// `wait_for_navigation()` branch takes — never on its own.
+async fn poll_until_blocked(blocked: &Rc<RefCell<Option<String>>>) -> String {
+    loop {
+        if let Some(reason) = blocked.borrow().clone() {
+            return reason;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Races a full navigation — `page.goto(url)` *and* the trailing
+/// `page.wait_for_navigation()` — against `blocked` being set by the
+/// `Page.frameRequestedNavigation` listener (Story 3.4). Both steps need to
+/// be inside the race, not just the trailing wait: `Page.navigate`'s own CDP
+/// response (awaited inside `page.goto`) was observed to itself hang when
+/// the destination page's inline script fires an immediate same-call
+/// redirect to an unreachable link-local/private host — Chrome doesn't
+/// appear to consider that `Page.navigate` settled until the chained
+/// navigation's own outcome (success or the browser giving up) is known, and
+/// giving up on an unreachable link-local address only happens after a slow
+/// OS-level connection timeout, well past this call's own SSRF grace-period
+/// poll (#35: `blocked` was set almost instantly by the listener, but
+/// nothing checked it until `goto` gave up on its own, so the call ran to
+/// its full 30s `PortError::Timeout` instead of surfacing the block).
+async fn goto_or_blocked(
+    page: &Page,
+    url: &str,
+    blocked: &Rc<RefCell<Option<String>>>,
+) -> Result<(), PortError> {
+    let nav = async {
+        page.goto(url)
+            .await
+            .map_err(|e| PortError::Other(e.to_string()))?;
+        page.wait_for_navigation()
+            .await
+            .map(|_| ())
+            .map_err(|e| PortError::Other(e.to_string()))
+    };
+    tokio::select! {
+        result = nav => result,
+        reason = poll_until_blocked(blocked) => Err(PortError::NotFound(reason)),
+    }
+}
+
 /// Registers this session's `Page.frameNavigated`/`Page.frameRequestedNavigation`
 /// (SSRF re-check, Task 3.4.2) and `Target.targetCrashed` (Story 2.5's
 /// deferred crash listener, implemented here in Story 3.2) event listeners.
@@ -1141,11 +1233,8 @@ impl BrowserDriver for NativeBrowser {
                         .await
                         .map_err(|e| PortError::Other(e.to_string()))?;
 
-                    let latest_refs = Rc::new(RefCell::new(HashMap::new()));
-                    let known_refs = Rc::new(RefCell::new(HashMap::new()));
-                    let nav_generation = Rc::new(Cell::new(0u64));
+                    let tab_state = TabState::fresh();
                     let next_ref_id = Rc::new(Cell::new(0u64));
-                    let latest_url = Rc::new(RefCell::new(String::new()));
                     let blocked = Rc::new(RefCell::new(None));
                     let crashed = Rc::new(Cell::new(false));
 
@@ -1165,30 +1254,37 @@ impl BrowserDriver for NativeBrowser {
                     // Now safe to actually request the caller's URL: the
                     // listeners are attached, so any redirect chained onto
                     // this navigation (server-side or in-page) is observed.
-                    page.goto(url)
-                        .await
-                        .map_err(|e| PortError::Other(e.to_string()))?;
-                    page.wait_for_navigation()
-                        .await
-                        .map_err(|e| PortError::Other(e.to_string()))?;
+                    // `goto_or_blocked` (not a bare `goto`/`wait_for_navigation`
+                    // pair) races the whole navigation against `blocked` — a
+                    // same-call redirect to an unreachable link-local/private
+                    // host would otherwise leave this `.await`ing a
+                    // navigation that only gives up after a slow OS-level
+                    // connection timeout, well past this call's own
+                    // grace-period poll below (#35).
+                    let stuck_blocked = match goto_or_blocked(&page, url, &blocked).await {
+                        Ok(()) => None,
+                        Err(PortError::NotFound(reason)) => Some(reason),
+                        Err(e) => return Err(e),
+                    };
 
                     // Give the listener a moment to observe a same-call
                     // redirect before deciding whether to capture a snapshot
                     // at all.
-                    if let Some(reason) = poll_blocked_grace_period(&blocked).await {
+                    if let Some(reason) =
+                        stuck_blocked.or(poll_blocked_grace_period(&blocked).await)
+                    {
                         // The session is still inserted (with no snapshot
                         // ever captured) so the caller can recover via the
                         // documented path: re-navigate this sessionId to a
                         // safe URL.
                         let session = BrowserSession {
-                            tabs: RefCell::new(vec![page]),
+                            tabs: RefCell::new(vec![Tab {
+                                page,
+                                refs: tab_state,
+                            }]),
                             active_tab: Cell::new(0),
                             last_used: Cell::new(now_millis()),
-                            latest_refs,
-                            known_refs,
-                            nav_generation,
                             next_ref_id,
-                            latest_url,
                             blocked,
                             crashed,
                             lock: Rc::new(tokio::sync::Mutex::new(())),
@@ -1203,22 +1299,21 @@ impl BrowserDriver for NativeBrowser {
                     // live over an await point (clippy::await_holding_refcell_ref).
                     let capture = wait_and_capture(&page, &next_ref_id, &HashMap::new()).await?;
                     let snapshot = install_snapshot(
-                        &latest_refs,
-                        &known_refs,
-                        &latest_url,
-                        nav_generation.get(),
+                        &tab_state.latest_refs,
+                        &tab_state.known_refs,
+                        &tab_state.latest_url,
+                        tab_state.nav_generation.get(),
                         capture,
                     );
 
                     let session = BrowserSession {
-                        tabs: RefCell::new(vec![page]),
+                        tabs: RefCell::new(vec![Tab {
+                            page,
+                            refs: tab_state,
+                        }]),
                         active_tab: Cell::new(0),
                         last_used: Cell::new(now_millis()),
-                        latest_refs,
-                        known_refs,
-                        nav_generation,
                         next_ref_id,
-                        latest_url,
                         blocked,
                         crashed,
                         lock: Rc::new(tokio::sync::Mutex::new(())),
@@ -1234,25 +1329,13 @@ impl BrowserDriver for NativeBrowser {
                 Some(id) => {
                     touch_or_evict(&self.sessions, &id.0, now_millis())?;
 
-                    let (
-                        latest_refs,
-                        known_refs,
-                        nav_generation,
-                        next_ref_id,
-                        latest_url,
-                        blocked,
-                        lock,
-                    ) = {
+                    let (next_ref_id, blocked, lock) = {
                         let map = self.sessions.borrow();
                         let session = map
                             .get(&id.0)
                             .expect("touch_or_evict just confirmed presence");
                         (
-                            session.latest_refs.clone(),
-                            session.known_refs.clone(),
-                            session.nav_generation.clone(),
                             session.next_ref_id.clone(),
-                            session.latest_url.clone(),
                             session.blocked.clone(),
                             session.lock.clone(),
                         )
@@ -1265,11 +1348,14 @@ impl BrowserDriver for NativeBrowser {
                     // `Page` never interleave CDP round-trips.
                     let _session_guard = lock.lock().await;
 
-                    // `active_page()` is read only now, under the lock: a
-                    // concurrent `tabs()` Select/Close/New that runs before
-                    // this call acquires the guard can change which tab is
-                    // active, and reading it earlier would silently
-                    // navigate a tab this call no longer means to touch.
+                    // The active tab (page + its own ref-tracking state) is
+                    // read only now, under the lock, and both from the same
+                    // lookup: a concurrent `tabs()` Select/Close/New that
+                    // runs before this call acquires the guard can change
+                    // which tab is active, and reading the page and its refs
+                    // from two separate lookups (one before the lock, one
+                    // after) could pair the new page with the old tab's refs
+                    // (see #34).
                     //
                     // Holding the lock does NOT guarantee the session is
                     // still present: `close_session` acquires the same lock
@@ -1279,13 +1365,20 @@ impl BrowserDriver for NativeBrowser {
                     // `close_session` has already deleted the entry. Treat
                     // that as the caller closed the session out from under
                     // this call, not as an invariant violation.
-                    let page = {
+                    let tab = {
                         let map = self.sessions.borrow();
                         match map.get(&id.0) {
-                            Some(session) => session.active_page(),
+                            Some(session) => session.active_tab_state(),
                             None => return Err(PortError::NotFound(not_found_message(&id.0))),
                         }
                     };
+                    let page = tab.page;
+                    let TabState {
+                        latest_refs,
+                        known_refs,
+                        nav_generation,
+                        latest_url,
+                    } = tab.refs;
 
                     // This call's own navigation is about to supersede
                     // whatever `blocked` may have recorded from a prior
@@ -1293,12 +1386,16 @@ impl BrowserDriver for NativeBrowser {
                     // recovery path (Task 3.4.2).
                     *blocked.borrow_mut() = None;
 
-                    page.goto(url)
-                        .await
-                        .map_err(|e| PortError::Other(e.to_string()))?;
-                    page.wait_for_navigation()
-                        .await
-                        .map_err(|e| PortError::Other(e.to_string()))?;
+                    // `goto_or_blocked` races the whole navigation against
+                    // `blocked` so a same-call redirect to an unreachable
+                    // link-local/private host is caught immediately rather
+                    // than blocking here until the doomed navigation times
+                    // out on its own (#35).
+                    let stuck_blocked = match goto_or_blocked(&page, url, &blocked).await {
+                        Ok(()) => None,
+                        Err(PortError::NotFound(reason)) => Some(reason),
+                        Err(e) => return Err(e),
+                    };
 
                     nav_generation.set(nav_generation.get() + 1);
 
@@ -1306,7 +1403,9 @@ impl BrowserDriver for NativeBrowser {
                     // listener a chance to flag a redirect chained onto this
                     // same `goto` before capturing (let alone returning) a
                     // snapshot of whatever page it landed on.
-                    if let Some(reason) = poll_blocked_grace_period(&blocked).await {
+                    if let Some(reason) =
+                        stuck_blocked.or(poll_blocked_grace_period(&blocked).await)
+                    {
                         if let Some(session) = self.sessions.borrow().get(&id.0) {
                             session.last_used.set(now_millis());
                         }
@@ -1395,17 +1494,13 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+            let (next_ref_id, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.latest_refs.clone(),
-                    session.known_refs.clone(),
-                    session.nav_generation.clone(),
                     session.next_ref_id.clone(),
-                    session.latest_url.clone(),
                     session.blocked.clone(),
                     session.lock.clone(),
                 )
@@ -1417,18 +1512,26 @@ impl BrowserDriver for NativeBrowser {
                 return Err(PortError::NotFound(reason));
             }
 
-            // `active_page()` is read only now, under the lock — see
+            // The active tab's page and its own ref-tracking state are read
+            // only now, under the lock, and both from the same lookup — see
             // `navigate`'s matching comment for why reading it earlier would
             // be stale against a concurrent `tabs()` switch/close, and for
             // why the session can still be gone here despite holding the
             // lock (a racing `close_session` may have won it first).
-            let page = {
+            let tab = {
                 let map = self.sessions.borrow();
                 match map.get(&session_id.0) {
-                    Some(session) => session.active_page(),
+                    Some(session) => session.active_tab_state(),
                     None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
                 }
             };
+            let page = tab.page;
+            let TabState {
+                latest_refs,
+                known_refs,
+                nav_generation,
+                latest_url,
+            } = tab.refs;
 
             // Clone out of the `RefCell` first — holding a live borrow across
             // the `.await` below would trip clippy::await_holding_refcell_ref
@@ -1604,16 +1707,25 @@ impl BrowserDriver for NativeBrowser {
                         )
                         .await;
 
+                        // See `navigate`'s matching comment (#35):
+                        // `goto_or_blocked` races the whole navigation
+                        // against `blocked` so a same-call redirect to an
+                        // unreachable link-local/private host is caught
+                        // immediately rather than blocking here until the
+                        // doomed navigation times out on its own.
+                        let mut stuck_blocked = None;
                         if let Some(target_url) = &url {
-                            page.goto(target_url)
-                                .await
-                                .map_err(|e| PortError::Other(e.to_string()))?;
-                            page.wait_for_navigation()
-                                .await
-                                .map_err(|e| PortError::Other(e.to_string()))?;
+                            stuck_blocked = match goto_or_blocked(&page, target_url, &blocked).await
+                            {
+                                Ok(()) => None,
+                                Err(PortError::NotFound(reason)) => Some(reason),
+                                Err(e) => return Err(e),
+                            };
                         }
 
-                        if let Some(reason) = poll_blocked_grace_period(&blocked).await {
+                        if let Some(reason) =
+                            stuck_blocked.or(poll_blocked_grace_period(&blocked).await)
+                        {
                             return Err(PortError::NotFound(reason));
                         }
                         Ok(())
@@ -1624,22 +1736,23 @@ impl BrowserDriver for NativeBrowser {
                         return Err(err);
                     }
 
-                    let (next_ref_id, latest_refs, known_refs, latest_url, nav_generation) = {
+                    // A brand-new tab gets its own fresh `TabState` (Task
+                    // #34): its `nav_generation` starts at 0, same as a
+                    // session's first tab, so opening it never invalidates
+                    // refs held for any other tab in this session.
+                    let new_tab_state = TabState::fresh();
+                    let next_ref_id = {
                         let map = self.sessions.borrow();
                         let session = map
                             .get(&session_id.0)
                             .expect("presence confirmed above under the same guard");
-                        session.tabs.borrow_mut().push(page.clone());
+                        session.tabs.borrow_mut().push(Tab {
+                            page: page.clone(),
+                            refs: new_tab_state.clone(),
+                        });
                         let new_index = session.tabs.borrow().len() - 1;
                         session.active_tab.set(new_index);
-                        session.nav_generation.set(session.nav_generation.get() + 1);
-                        (
-                            session.next_ref_id.clone(),
-                            session.latest_refs.clone(),
-                            session.known_refs.clone(),
-                            session.latest_url.clone(),
-                            session.nav_generation.clone(),
-                        )
+                        session.next_ref_id.clone()
                     };
 
                     // A brand-new tab, so (like `navigate`'s real-navigation
@@ -1647,10 +1760,10 @@ impl BrowserDriver for NativeBrowser {
                     // could still apply.
                     let capture = wait_and_capture(&page, &next_ref_id, &HashMap::new()).await?;
                     let snapshot = install_snapshot(
-                        &latest_refs,
-                        &known_refs,
-                        &latest_url,
-                        nav_generation.get(),
+                        &new_tab_state.latest_refs,
+                        &new_tab_state.known_refs,
+                        &new_tab_state.latest_url,
+                        new_tab_state.nav_generation.get(),
                         capture,
                     );
 
@@ -1679,7 +1792,7 @@ impl BrowserDriver for NativeBrowser {
                     // above — see `navigate`'s matching comment on why
                     // holding the lock doesn't guarantee the session is
                     // still present.
-                    let (page, next_ref_id, latest_refs, known_refs, latest_url, nav_generation) = {
+                    let (tab, next_ref_id) = {
                         let map = self.sessions.borrow();
                         let session = match map.get(&session_id.0) {
                             Some(session) => session,
@@ -1695,20 +1808,24 @@ impl BrowserDriver for NativeBrowser {
                             )));
                         }
                         session.active_tab.set(index);
-                        (
-                            tabs[index].clone(),
-                            session.next_ref_id.clone(),
-                            session.latest_refs.clone(),
-                            session.known_refs.clone(),
-                            session.latest_url.clone(),
-                            session.nav_generation.clone(),
-                        )
+                        (tabs[index].clone(), session.next_ref_id.clone())
                     };
+                    let page = tab.page;
+                    let TabState {
+                        latest_refs,
+                        known_refs,
+                        nav_generation,
+                        latest_url,
+                    } = tab.refs;
 
                     // Selecting a tab doesn't navigate it, so refs already
-                    // issued for it are still valid — reuse them the same way
-                    // `snapshot()` does rather than treating this like a real
-                    // navigation.
+                    // issued for it are still valid — reuse *this tab's own*
+                    // previous refs the same way `snapshot()` does, rather
+                    // than treating this like a real navigation. Fetching
+                    // `tab` from `tabs[index]` above (not from
+                    // session-wide state) is what makes this the selected
+                    // tab's own history rather than whichever tab was active
+                    // before this call (#34).
                     let previous_refs = latest_refs.borrow().clone();
                     let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
                     let snapshot = install_snapshot(
@@ -1779,7 +1896,7 @@ impl BrowserDriver for NativeBrowser {
                         session.active_tab.set(new_active);
                         (removed, new_active)
                     };
-                    let _ = page_to_close.close().await;
+                    let _ = page_to_close.page.close().await;
 
                     let tabs_snapshot = {
                         let map = self.sessions.borrow();
@@ -1874,17 +1991,13 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+            let (next_ref_id, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.latest_refs.clone(),
-                    session.known_refs.clone(),
-                    session.nav_generation.clone(),
                     session.next_ref_id.clone(),
-                    session.latest_url.clone(),
                     session.blocked.clone(),
                     session.lock.clone(),
                 )
@@ -1896,18 +2009,26 @@ impl BrowserDriver for NativeBrowser {
                 return Err(PortError::NotFound(reason));
             }
 
-            // `active_page()` is read only now, under the lock — see
+            // The active tab's page and its own ref-tracking state are read
+            // only now, under the lock, and both from the same lookup — see
             // `navigate`'s matching comment for why reading it earlier would
             // be stale against a concurrent `tabs()` switch/close, and for
             // why the session can still be gone here despite holding the
             // lock (a racing `close_session` may have won it first).
-            let page = {
+            let tab = {
                 let map = self.sessions.borrow();
                 match map.get(&session_id.0) {
-                    Some(session) => session.active_page(),
+                    Some(session) => session.active_tab_state(),
                     None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
                 }
             };
+            let page = tab.page;
+            let TabState {
+                latest_refs,
+                known_refs,
+                nav_generation,
+                latest_url,
+            } = tab.refs;
 
             match condition {
                 WaitCondition::TimeMs(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
@@ -2014,19 +2135,12 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (latest_refs, known_refs, nav_generation, latest_url, blocked, lock) = {
+            let (blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
-                (
-                    session.latest_refs.clone(),
-                    session.known_refs.clone(),
-                    session.nav_generation.clone(),
-                    session.latest_url.clone(),
-                    session.blocked.clone(),
-                    session.lock.clone(),
-                )
+                (session.blocked.clone(), session.lock.clone())
             };
 
             let _session_guard = lock.lock().await;
@@ -2035,13 +2149,26 @@ impl BrowserDriver for NativeBrowser {
                 return Err(PortError::NotFound(reason));
             }
 
-            let page = {
+            // The active tab's page and its own ref-tracking state are read
+            // only now, under the lock, and both from the same lookup — see
+            // `navigate`'s matching comment for why reading it earlier would
+            // be stale against a concurrent `tabs()` switch/close, and for
+            // why the session can still be gone here despite holding the
+            // lock (a racing `close_session` may have won it first).
+            let tab = {
                 let map = self.sessions.borrow();
                 match map.get(&session_id.0) {
-                    Some(session) => session.active_page(),
+                    Some(session) => session.active_tab_state(),
                     None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
                 }
             };
+            let page = tab.page;
+            let TabState {
+                latest_refs,
+                known_refs,
+                nav_generation,
+                latest_url,
+            } = tab.refs;
 
             let value = if let Some(locator) = locator {
                 let url_before = page
@@ -2140,17 +2267,13 @@ impl BrowserDriver for NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+            let (next_ref_id, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.latest_refs.clone(),
-                    session.known_refs.clone(),
-                    session.nav_generation.clone(),
                     session.next_ref_id.clone(),
-                    session.latest_url.clone(),
                     session.blocked.clone(),
                     session.lock.clone(),
                 )
@@ -2162,13 +2285,26 @@ impl BrowserDriver for NativeBrowser {
                 return Err(PortError::NotFound(reason));
             }
 
-            let page = {
+            // The active tab's page and its own ref-tracking state are read
+            // only now, under the lock, and both from the same lookup — see
+            // `navigate`'s matching comment for why reading it earlier would
+            // be stale against a concurrent `tabs()` switch/close, and for
+            // why the session can still be gone here despite holding the
+            // lock (a racing `close_session` may have won it first).
+            let tab = {
                 let map = self.sessions.borrow();
                 match map.get(&session_id.0) {
-                    Some(session) => session.active_page(),
+                    Some(session) => session.active_tab_state(),
                     None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
                 }
             };
+            let page = tab.page;
+            let TabState {
+                latest_refs,
+                known_refs,
+                nav_generation,
+                latest_url,
+            } = tab.refs;
 
             let params = SetDeviceMetricsOverrideParams::builder()
                 .width(i64::from(width))
@@ -2206,9 +2342,10 @@ impl BrowserDriver for NativeBrowser {
 
 /// Builds one `TabInfo` per page in `tabs`, in order — used by every
 /// `tabs()` action to report the resulting tab list.
-async fn list_tab_infos(tabs: &[Page]) -> Result<Vec<TabInfo>, PortError> {
+async fn list_tab_infos(tabs: &[Tab]) -> Result<Vec<TabInfo>, PortError> {
     let mut infos = Vec::with_capacity(tabs.len());
-    for (index, page) in tabs.iter().enumerate() {
+    for (index, tab) in tabs.iter().enumerate() {
+        let page = &tab.page;
         let url = page
             .url()
             .await
@@ -2275,17 +2412,13 @@ impl NativeBrowser {
         let fut = async {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
 
-            let (latest_refs, known_refs, nav_generation, next_ref_id, latest_url, blocked, lock) = {
+            let (next_ref_id, blocked, lock) = {
                 let map = self.sessions.borrow();
                 let session = map
                     .get(&session_id.0)
                     .expect("touch_or_evict just confirmed presence");
                 (
-                    session.latest_refs.clone(),
-                    session.known_refs.clone(),
-                    session.nav_generation.clone(),
                     session.next_ref_id.clone(),
-                    session.latest_url.clone(),
                     session.blocked.clone(),
                     session.lock.clone(),
                 )
@@ -2297,18 +2430,26 @@ impl NativeBrowser {
                 return Err(PortError::NotFound(reason));
             }
 
-            // `active_page()` is read only now, under the lock — see
+            // The active tab's page and its own ref-tracking state are read
+            // only now, under the lock, and both from the same lookup — see
             // `navigate`'s matching comment for why reading it earlier would
             // be stale against a concurrent `tabs()` switch/close, and for
             // why the session can still be gone here despite holding the
             // lock (a racing `close_session` may have won it first).
-            let page = {
+            let tab = {
                 let map = self.sessions.borrow();
                 match map.get(&session_id.0) {
-                    Some(session) => session.active_page(),
+                    Some(session) => session.active_tab_state(),
                     None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
                 }
             };
+            let page = tab.page;
+            let TabState {
+                latest_refs,
+                known_refs,
+                nav_generation,
+                latest_url,
+            } = tab.refs;
 
             let url_before = page
                 .url()
