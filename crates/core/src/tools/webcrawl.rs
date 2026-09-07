@@ -104,24 +104,29 @@ fn same_host(a: &Url, b: &Url) -> bool {
     a.host_str().is_some() && a.host_str() == b.host_str()
 }
 
-/// Controls whether the crawler refuses to fetch loopback/private/link-local
-/// addresses (an SSRF guard). Deliberately **not** exposed on any MCP tool
-/// schema (`ReadWebsiteInput`/`DownloadWebsiteInput`/`IndexDocsInput`): the
-/// caller of these tools is an LLM agent that may itself be steered by
+/// Controls whether the crawler refuses to fetch private/link-local
+/// addresses (an SSRF guard). Loopback (`127.0.0.0/8`, `::1`, `localhost`)
+/// is always allowed, under every variant here — it's the common dev-loop
+/// case of pointing a browser tool at a local daemon or test fixture, and
+/// isn't the actual SSRF risk this guard exists for (a LAN host or the cloud
+/// metadata endpoint reachable from wherever this binary runs). Deliberately
+/// **not** exposed on any MCP tool schema
+/// (`ReadWebsiteInput`/`DownloadWebsiteInput`/`IndexDocsInput`): the caller
+/// of these tools is an LLM agent that may itself be steered by
 /// previously-fetched content, so the choice of whether to allow private
-/// targets — including which hosts, under `EnforceWithAllowlist` — must be
-/// made by the trusted binary at its own call sites, not by anything a
-/// tool-call argument can influence. `AllowPrivateNetworks` exists purely so
-/// this crate's own tests can crawl a `127.0.0.1` mock server.
+/// targets beyond loopback — including which hosts, under
+/// `EnforceWithAllowlist` — must be made by the trusted binary at its own
+/// call sites, not by anything a tool-call argument can influence.
+/// `AllowPrivateNetworks` exists purely so this crate's own tests can crawl
+/// a private-range mock server.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum NetworkPolicy {
     Enforce,
     AllowPrivateNetworks,
     /// Same fail-closed default as `Enforce`, except a host in this
-    /// operator-declared set (exact hostname or IP literal, matched
-    /// case-insensitively against `Url::host_str`) is let through — the dev
-    /// loop of pointing a browser tool at a local daemon on `127.0.0.1`,
-    /// without opening every private address up. Applied inside
+    /// operator-declared set (exact hostname or unbracketed IP literal,
+    /// matched case-insensitively) is also let through — e.g. a specific LAN
+    /// service beyond the loopback default. Applied inside
     /// `blocked_host_reason` itself, so it also covers the redirect/in-page
     /// re-check (`frame_navigated_blocked_message`), not just the initial
     /// navigate.
@@ -151,30 +156,40 @@ impl NetworkPolicy {
     }
 }
 
-fn is_blocked_ipv4(ip: std::net::Ipv4Addr) -> bool {
+fn is_loopback_ipv4(ip: std::net::Ipv4Addr) -> bool {
     // `is_unspecified()` only matches the exact address `0.0.0.0`, but the
     // entire `0.0.0.0/8` range is "this network" (RFC 791 §3.2) and, on most
     // OSes, resolves to `127.0.0.1`/local interfaces just like loopback —
-    // `http://0.1.2.3/` must be blocked exactly like `http://0.0.0.0/`.
-    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.octets()[0] == 0
+    // `http://0.1.2.3/` is loopback-equivalent exactly like `http://0.0.0.0/`.
+    ip.is_loopback() || ip.octets()[0] == 0
 }
 
-fn is_blocked_ipv6(ip: std::net::Ipv6Addr) -> bool {
+fn is_private_or_link_local_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_link_local()
+}
+
+fn is_loopback_ipv6(ip: std::net::Ipv6Addr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() {
-        return true;
-    }
-    let seg0 = ip.segments()[0];
-    let is_unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
-    let is_link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
-    if is_unique_local || is_link_local {
         return true;
     }
     // `to_ipv4_mapped()` only unwraps the `::ffff:a.b.c.d/96` form. The
     // legacy IPv4-compatible form `::a.b.c.d` (RFC 4291 §2.5.5.1, deprecated
     // but still parsed by `Ipv6Addr::from_str`) has an all-zero 96-bit
     // prefix instead of the `ffff` prefix and would otherwise sail through
-    // this check unblocked — `to_ipv4()` recognizes both forms.
-    ip.to_ipv4().map(is_blocked_ipv4).unwrap_or(false)
+    // this check unrecognized — `to_ipv4()` recognizes both forms.
+    ip.to_ipv4().map(is_loopback_ipv4).unwrap_or(false)
+}
+
+fn is_private_or_link_local_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    let seg0 = ip.segments()[0];
+    let is_unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
+    let is_link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+    if is_unique_local || is_link_local {
+        return true;
+    }
+    ip.to_ipv4()
+        .map(is_private_or_link_local_ipv4)
+        .unwrap_or(false)
 }
 
 /// Best-effort literal check: `crates/core` has no DNS-resolution port (see
@@ -188,23 +203,34 @@ pub fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
         return None;
     }
     let reason = match url.host()? {
-        url::Host::Ipv4(ip) if is_blocked_ipv4(ip) => {
-            Some(format!("{ip} is a loopback/private/link-local address"))
-        }
-        url::Host::Ipv6(ip) if is_blocked_ipv6(ip) => {
-            Some(format!("{ip} is a loopback/private/link-local address"))
-        }
+        // Loopback is allowed under every policy variant — see
+        // `NetworkPolicy`'s doc comment.
+        url::Host::Ipv4(ip) if is_loopback_ipv4(ip) => return None,
+        url::Host::Ipv6(ip) if is_loopback_ipv6(ip) => return None,
         url::Host::Domain(d)
             if d.eq_ignore_ascii_case("localhost")
                 || d.to_ascii_lowercase().ends_with(".localhost") =>
         {
-            Some(format!("{d} is a loopback hostname"))
+            return None;
+        }
+        url::Host::Ipv4(ip) if is_private_or_link_local_ipv4(ip) => {
+            Some(format!("{ip} is a private/link-local address"))
+        }
+        url::Host::Ipv6(ip) if is_private_or_link_local_ipv6(ip) => {
+            Some(format!("{ip} is a private/link-local address"))
         }
         _ => None,
     }?;
 
     if let NetworkPolicy::EnforceWithAllowlist(allowed) = &policy {
-        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        // `Url::host_str` brackets an IPv6 literal (`"[fe80::1]"`), which
+        // would never match an allowlist entry written the normal way —
+        // re-derive the comparison key from `Host`'s own `Display` instead.
+        let host = match url.host()? {
+            url::Host::Ipv4(ip) => ip.to_string(),
+            url::Host::Ipv6(ip) => ip.to_string(),
+            url::Host::Domain(d) => d.to_ascii_lowercase(),
+        };
         if allowed.contains(&host) {
             return None;
         }
@@ -461,8 +487,8 @@ mod ssrf_guard_tests {
     }
 
     #[test]
-    fn should_block_loopback_ipv4_literal_when_enforcing() {
-        assert!(blocked("http://127.0.0.1/"));
+    fn should_allow_loopback_ipv4_literal_when_enforcing() {
+        assert!(!blocked("http://127.0.0.1/"));
     }
 
     #[test]
@@ -478,38 +504,45 @@ mod ssrf_guard_tests {
     }
 
     #[test]
-    fn should_block_localhost_hostname_case_insensitively_when_enforcing() {
-        assert!(blocked("http://localhost/"));
-        assert!(blocked("http://LOCALHOST/"));
-        assert!(blocked("http://foo.localhost/"));
+    fn should_allow_localhost_hostname_case_insensitively_when_enforcing() {
+        assert!(!blocked("http://localhost/"));
+        assert!(!blocked("http://LOCALHOST/"));
+        assert!(!blocked("http://foo.localhost/"));
     }
 
     #[test]
-    fn should_block_loopback_and_unique_local_ipv6_when_enforcing() {
-        assert!(blocked("http://[::1]/"));
+    fn should_allow_loopback_but_block_private_and_link_local_ipv6_when_enforcing() {
+        assert!(!blocked("http://[::1]/"));
         assert!(blocked("http://[fc00::1]/"));
         assert!(blocked("http://[fe80::1]/"));
     }
 
     #[test]
-    fn should_block_ipv4_mapped_ipv6_of_a_blocked_address_when_enforcing() {
-        assert!(blocked("http://[::ffff:127.0.0.1]/"));
+    fn should_allow_ipv4_mapped_loopback_ipv6_when_enforcing() {
+        assert!(!blocked("http://[::ffff:127.0.0.1]/"));
     }
 
     #[test]
-    fn should_block_entire_0_0_0_0_slash_8_range_when_enforcing() {
+    fn should_block_ipv4_mapped_private_ipv6_when_enforcing() {
+        assert!(blocked("http://[::ffff:10.0.0.1]/"));
+    }
+
+    #[test]
+    fn should_allow_entire_0_0_0_0_slash_8_range_when_enforcing() {
         // Not just the exact address `0.0.0.0` — the whole "this network"
-        // range resolves like loopback on most OSes.
-        assert!(blocked("http://0.0.0.0/"));
-        assert!(blocked("http://0.1.2.3/"));
+        // range resolves like loopback on most OSes, so it's allowed the
+        // same way.
+        assert!(!blocked("http://0.0.0.0/"));
+        assert!(!blocked("http://0.1.2.3/"));
     }
 
     #[test]
-    fn should_block_legacy_ipv4_compatible_ipv6_of_a_blocked_address_when_enforcing() {
+    fn should_allow_ipv4_compatible_loopback_ipv6_but_block_private_when_enforcing() {
         // `::a.b.c.d` (RFC 4291 IPv4-compatible form, distinct from the
-        // `::ffff:a.b.c.d` mapped form) must be blocked the same way.
+        // `::ffff:a.b.c.d` mapped form) resolves the same way as its
+        // embedded IPv4 address.
         assert!(blocked("http://[::10.0.0.1]/"));
-        assert!(blocked("http://[::127.0.0.1]/"));
+        assert!(!blocked("http://[::127.0.0.1]/"));
     }
 
     #[test]
@@ -520,34 +553,27 @@ mod ssrf_guard_tests {
 
     #[test]
     fn should_allow_every_url_when_policy_allows_private_networks() {
-        let seed = Url::parse("http://127.0.0.1/").unwrap();
+        let seed = Url::parse("http://10.0.0.1/").unwrap();
         assert!(blocked_host_reason(&seed, NetworkPolicy::AllowPrivateNetworks).is_none());
     }
 
     #[test]
-    fn should_allow_only_the_allowlisted_host_when_enforcing_with_allowlist() {
-        let policy = NetworkPolicy::from_env(None, Some("127.0.0.1, dev.localhost".to_string()));
+    fn should_allow_only_the_allowlisted_private_host_when_enforcing_with_allowlist() {
+        let policy = NetworkPolicy::from_env(None, Some("192.168.1.50".to_string()));
         assert!(
-            blocked_host_reason(&Url::parse("http://127.0.0.1/").unwrap(), policy.clone())
+            blocked_host_reason(&Url::parse("http://192.168.1.50/").unwrap(), policy.clone())
                 .is_none()
         );
-        assert!(blocked_host_reason(
-            &Url::parse("http://dev.localhost/").unwrap(),
-            policy.clone()
-        )
-        .is_none());
         assert!(
-            blocked_host_reason(&Url::parse("http://10.0.0.1/").unwrap(), policy).is_some(),
+            blocked_host_reason(&Url::parse("http://192.168.1.51/").unwrap(), policy).is_some(),
             "hosts outside the allowlist must still be blocked"
         );
     }
 
     #[test]
     fn should_match_allowlisted_hosts_case_insensitively() {
-        let policy = NetworkPolicy::from_env(None, Some("Dev.Localhost".to_string()));
-        assert!(
-            blocked_host_reason(&Url::parse("http://dev.localhost/").unwrap(), policy).is_none()
-        );
+        let policy = NetworkPolicy::from_env(None, Some("FE80::1".to_string()));
+        assert!(blocked_host_reason(&Url::parse("http://[fe80::1]/").unwrap(), policy).is_none());
     }
 
     #[test]

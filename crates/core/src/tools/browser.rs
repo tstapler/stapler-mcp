@@ -1294,7 +1294,7 @@ mod tests {
 
         let err = browser_navigate(
             &driver,
-            navigate_input("http://127.0.0.1:1/"),
+            navigate_input("http://169.254.169.254/"),
             NetworkPolicy::Enforce,
         )
         .await
@@ -1781,7 +1781,7 @@ mod tests {
             browser_navigate(
                 &driver,
                 BrowserNavigateInput {
-                    url: "http://127.0.0.1:1/".to_string(),
+                    url: "http://169.254.169.254/".to_string(),
                     session_id: None,
                     timeout_seconds: None,
                 },
