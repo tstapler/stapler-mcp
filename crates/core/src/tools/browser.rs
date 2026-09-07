@@ -573,11 +573,11 @@ pub async fn browser_get_html<B: BrowserDriver>(
     let result = browser
         .evaluate(&session_id, function, locator.as_ref(), timeout)
         .await
-        .map_err(|e| map_error("getHtml", &input.session_id, e))?;
+        .map_err(|e| map_error("get html", &input.session_id, e))?;
 
     let html = result.as_str().map(str::to_string).ok_or_else(|| {
         format!(
-            "getHtml {}: expected outerHTML to be a string, got {result}",
+            "get html {}: expected outerHTML to be a string, got {result}",
             input.session_id
         )
     })?;
@@ -871,6 +871,11 @@ mod tests {
         wait_for_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         screenshot_result: RefCell<Option<Result<Vec<u8>, PortError>>>,
         evaluate_result: RefCell<Option<Result<serde_json::Value, PortError>>>,
+        /// Records the `(function, locator)` args each `evaluate()` call
+        /// actually received, so tests can verify which branch a caller
+        /// (e.g. `browser_get_html`) took instead of only checking the
+        /// mock's pre-programmed return value.
+        evaluate_calls: RefCell<Vec<(String, Option<Locator>)>>,
         history_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         resize_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         /// Overrides whatever `tabs()` would otherwise compute from
@@ -899,6 +904,7 @@ mod tests {
                 wait_for_result: RefCell::new(None),
                 screenshot_result: RefCell::new(None),
                 evaluate_result: RefCell::new(None),
+                evaluate_calls: RefCell::new(Vec::new()),
                 history_result: RefCell::new(None),
                 resize_result: RefCell::new(None),
                 tabs_error: RefCell::new(None),
@@ -1225,11 +1231,14 @@ mod tests {
         async fn evaluate(
             &self,
             _session_id: &SessionId,
-            _function: &str,
-            _locator: Option<&Locator>,
+            function: &str,
+            locator: Option<&Locator>,
             _timeout: Duration,
         ) -> Result<serde_json::Value, PortError> {
             self.calls.borrow_mut().push("evaluate");
+            self.evaluate_calls
+                .borrow_mut()
+                .push((function.to_string(), locator.cloned()));
             self.evaluate_result
                 .borrow_mut()
                 .take()
@@ -2832,6 +2841,10 @@ mod tests {
 
         assert_eq!(output.html, "<html>page</html>");
         assert_eq!(*driver.calls.borrow(), vec!["evaluate"]);
+        assert_eq!(
+            *driver.evaluate_calls.borrow(),
+            vec![("() => document.documentElement.outerHTML".to_string(), None)]
+        );
     }
 
     #[tokio::test]
@@ -2851,6 +2864,31 @@ mod tests {
         .expect("get_html should succeed");
 
         assert_eq!(output.html, "<button>Go</button>");
+        assert_eq!(
+            *driver.evaluate_calls.borrow(),
+            vec![(
+                "(element) => element.outerHTML".to_string(),
+                Some(Locator("ref-1".to_string()))
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_format_timeout_error_with_verb_and_session_id() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Err(PortError::Timeout));
+
+        let err = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("timeout should surface as an error");
+
+        assert_eq!(err, "get html sess-1: timed out");
     }
 
     #[tokio::test]
@@ -2870,7 +2908,7 @@ mod tests {
 
         assert_eq!(
             err,
-            "getHtml sess-1: expected outerHTML to be a string, got null"
+            "get html sess-1: expected outerHTML to be a string, got null"
         );
     }
 
