@@ -70,6 +70,20 @@ pub struct ReadWebsiteInput {
     /// 10, capped at 50.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_pages: Option<u32>,
+    /// Override how much Markdown (in characters, summed across every page
+    /// this call returns) comes back inline before the rest is saved to
+    /// disk instead — see `ReadWebsitePage.savedPath`. Defaults to 60,000;
+    /// capped at 200,000. Set `alwaysSaveToFile: true` instead of `0` here
+    /// to force every page to disk regardless of size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inline_chars: Option<usize>,
+    /// Skip the inline budget entirely and always save every page's
+    /// Markdown to disk (only a short preview plus `savedPath` comes back
+    /// inline) — useful when you already plan to read/grep the saved files
+    /// and want this call's own response to stay minimal regardless of
+    /// page size. Defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_save_to_file: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -77,8 +91,63 @@ pub struct ReadWebsiteInput {
 pub struct ReadWebsitePage {
     pub url: String,
     pub title: String,
-    /// Main content extracted via Readability-style extraction, converted to Markdown.
+    /// Main content extracted via Readability-style extraction, converted to
+    /// Markdown. A preview (not the full page) when `savedPath` is set — see
+    /// its doc comment.
     pub markdown: String,
+    /// Set when this page's full Markdown exceeded the inline size cap and
+    /// was written to this local file instead — `markdown` above is only a
+    /// preview in that case. Pass this to `read_saved_page` to search or
+    /// page through the full content — that works even when the caller
+    /// isn't on the same machine as this daemon (this file's own path may
+    /// not be), and supports searching with surrounding context instead of
+    /// paging through blindly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSavedPageInput {
+    /// A `savedPath` value previously returned by `read_website` in a
+    /// page's `savedPath` field. Must be exactly one of those — this tool
+    /// intentionally can't read arbitrary files.
+    pub saved_path: String,
+    /// Case-insensitive substring to search for. When set, returns every
+    /// matching line plus `contextLines` of surrounding context instead of
+    /// a plain paginated read — use this to find a specific section in a
+    /// large saved page without paging through it blindly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Lines of context to include before/after each match when `query` is
+    /// set. Defaults to 3, capped at 50. Ignored when `query` is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_lines: Option<usize>,
+    /// 1-based line number to start a plain paginated read from (ignored
+    /// when `query` is set). Defaults to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    /// Maximum lines to return for a plain paginated read (ignored when
+    /// `query` is set). Defaults to 500, capped at 2,000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSavedPageOutput {
+    /// Line-numbered text ("<lineNumber>: <line>", one per line) — either
+    /// the requested page range, or every match plus its surrounding
+    /// context with a "--" separator between non-adjacent matches (the
+    /// same shape `grep -n -C` produces) when `query` was set.
+    pub content: String,
+    /// Total lines in the saved file, regardless of how much `content`
+    /// covers.
+    pub total_lines: usize,
+    /// True when a plain paginated read didn't reach `totalLines` — call
+    /// again with a higher `offset` to continue. Always false for a search
+    /// (`query` set), since every match is returned in one call.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
