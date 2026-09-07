@@ -66,6 +66,8 @@ extern "C" {
     #[wasm_bindgen(js_name = jsBrowserScreenshot)]
     fn js_browser_screenshot(session_id: &str, full_page: bool, timeout_ms: f64)
         -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsBrowserPdf)]
+    fn js_browser_pdf(session_id: &str, timeout_ms: f64) -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsBrowserEvaluate)]
     fn js_browser_evaluate(
         session_id: &str,
@@ -540,6 +542,17 @@ impl BrowserDriver for WasmBrowser {
         ))
         .await
         .map_err(js_reject_to_port_error)?;
+
+        Ok(js_sys::Uint8Array::new(&result).to_vec())
+    }
+
+    /// See `screenshot`'s doc comment above — `jsBrowserPdf` resolves with
+    /// the raw `Buffer` Playwright's `page.pdf()` returns, so this reads it
+    /// the same way, via `js_sys::Uint8Array` rather than `serde_wasm_bindgen`.
+    async fn pdf(&self, session_id: &SessionId, timeout: Duration) -> Result<Vec<u8>, PortError> {
+        let result = JsFuture::from(js_browser_pdf(&session_id.0, timeout.as_millis() as f64))
+            .await
+            .map_err(js_reject_to_port_error)?;
 
         Ok(js_sys::Uint8Array::new(&result).to_vec())
     }

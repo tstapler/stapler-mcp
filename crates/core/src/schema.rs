@@ -593,6 +593,31 @@ pub struct BrowserScreenshotOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct BrowserPdfInput {
+    pub session_id: String,
+    /// Optional local file path to save the PDF to. When set, `dataBase64`
+    /// is omitted from the output (mirrors `stapler_browser_screenshot`'s
+    /// `savePath`) so a large PDF isn't also inlined into the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPdfOutput {
+    /// Base64-encoded PDF bytes; omitted when `savePath` was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    /// Local path the PDF was saved to, if `savePath` was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_to: Option<String>,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserEvaluateInput {
     pub session_id: String,
     /// A JS function-expression string, e.g. `"() => document.title"` or,

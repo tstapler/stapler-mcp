@@ -30,10 +30,10 @@ use stapler_mcp_core::schema::{
     BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
     BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
-    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
-    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
-    BrowserWaitForInput, IndexDocsInput, ListIndexedSourcesInput, RemoveIndexedSourceInput,
-    SearchDocsInput,
+    BrowserPdfInput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
+    BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput,
+    BrowserTypeInput, BrowserWaitForInput, IndexDocsInput, ListIndexedSourcesInput,
+    RemoveIndexedSourceInput, SearchDocsInput,
 };
 
 #[path = "../src/thin_client.rs"]
@@ -128,6 +128,10 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
             "stapler_browser_screenshot",
             schema_for_input::<BrowserScreenshotInput>()
                 .expect("BrowserScreenshotInput schemars schema"),
+        ),
+        (
+            "stapler_browser_pdf",
+            schema_for_input::<BrowserPdfInput>().expect("BrowserPdfInput schemars schema"),
         ),
         (
             "stapler_browser_evaluate",

@@ -817,6 +817,14 @@ module.exports.jsBrowserScreenshot = async function (sessionId, fullPage, timeou
     );
 };
 
+// Prints the page to PDF and returns the raw `Buffer` — same raw-byte
+// convention as jsBrowserScreenshot above (see its comment): `WasmBrowser::pdf`
+// reads the resolved value directly via `js_sys::Uint8Array`.
+module.exports.jsBrowserPdf = async function (sessionId, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    return runSerialized(session, () => session.page.pdf({ timeout: timeoutMs }));
+};
+
 // Constructs the caller-supplied function *object* from its source text
 // without ever executing its body here: `new Function(...)` merely compiles
 // `functionStr` (e.g. `"() => document.title"`) into a real JS `Function`

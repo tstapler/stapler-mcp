@@ -11,7 +11,7 @@ use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverridePar
 use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, EventFrameNavigated, EventFrameRequestedNavigation,
-    GetNavigationHistoryParams, NavigateToHistoryEntryParams,
+    GetNavigationHistoryParams, NavigateToHistoryEntryParams, PrintToPdfParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::EventTargetCrashed;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
@@ -2120,6 +2120,62 @@ impl BrowserDriver for NativeBrowser {
             .map_err(|_| PortError::Timeout)?
     }
 
+    /// See `screenshot`'s doc comment for the session lookup/lock/blocked
+    /// discipline this mirrors — a PDF print doesn't mutate the page either,
+    /// so there's likewise no AX-recapture step afterward.
+    async fn pdf(&self, session_id: &SessionId, timeout: Duration) -> Result<Vec<u8>, PortError> {
+        let fut = async {
+            touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+
+            let (blocked, lock) = {
+                let map = self.sessions.borrow();
+                let session = map
+                    .get(&session_id.0)
+                    .expect("touch_or_evict just confirmed presence");
+                (session.blocked.clone(), session.lock.clone())
+            };
+
+            let _session_guard = lock.lock().await;
+
+            if let Some(reason) = blocked.borrow().clone() {
+                return Err(PortError::NotFound(reason));
+            }
+
+            let page = {
+                let map = self.sessions.borrow();
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_page(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
+            };
+
+            // Zero margins to match the wasm/Playwright backend's `page.pdf()`
+            // default (0), rather than CDP's own default of ~0.4in — same
+            // tool name, same no-options call, should look the same
+            // regardless of which backend serves the request.
+            let params = PrintToPdfParams::builder()
+                .margin_top(0.0)
+                .margin_bottom(0.0)
+                .margin_left(0.0)
+                .margin_right(0.0)
+                .build();
+            let pdf = page
+                .pdf(params)
+                .await
+                .map_err(|e| PortError::Other(e.to_string()))?;
+
+            if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                session.last_used.set(now_millis());
+            }
+
+            Ok(pdf)
+        };
+
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| PortError::Timeout)?
+    }
+
     /// See `snapshot`'s doc comment for the session lookup/lock/blocked
     /// discipline. `locator: Some(_)` resolves and re-verifies the node the
     /// same way `dispatch_action` does, then invokes `function` via
@@ -3499,6 +3555,14 @@ mod tests {
             &self,
             _session_id: &SessionId,
             _full_page: bool,
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, PortError> {
+            panic!("not exercised by this test");
+        }
+
+        async fn pdf(
+            &self,
+            _session_id: &SessionId,
             _timeout: Duration,
         ) -> Result<Vec<u8>, PortError> {
             panic!("not exercised by this test");
