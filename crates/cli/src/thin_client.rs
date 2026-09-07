@@ -18,14 +18,14 @@ use stapler_mcp_core::schema::{
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
     BrowserFindInput, BrowserFindOutput, BrowserGetHtmlInput, BrowserGetHtmlOutput,
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserListSessionsOutput,
-    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
-    BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
-    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
-    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
-    FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
-    ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput, ReadWebsiteInput,
-    ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
-    SearchDocsOutput,
+    BrowserNavigateInput, BrowserNavigateOutput, BrowserPdfInput, BrowserPdfOutput,
+    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserScreenshotOutput,
+    BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput,
+    BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput,
+    DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput,
+    ListIndexedSourcesInput, ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput,
+    ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput,
+    SearchDocsInput, SearchDocsOutput,
 };
 use stapler_mcp_native::{
     NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
@@ -313,6 +313,17 @@ impl ThinClient {
         call_daemon("stapler_browser_screenshot", params.0)
             .await
             .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_pdf",
+        description = "Save an existing browser session's current page as a PDF (CDP Page.printToPDF / Playwright page.pdf()). Returns base64-encoded PDF data, or saves it to savePath if given (omitting the inline data). Sibling to stapler_browser_screenshot for PDF output instead of PNG."
+    )]
+    async fn browser_pdf(
+        &self,
+        params: Parameters<BrowserPdfInput>,
+    ) -> Result<Json<BrowserPdfOutput>, String> {
+        call_daemon("stapler_browser_pdf", params.0).await.map(Json)
     }
 
     #[tool(

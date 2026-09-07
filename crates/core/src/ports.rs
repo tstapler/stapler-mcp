@@ -361,6 +361,9 @@ pub trait BrowserDriver {
         timeout: Duration,
     ) -> Result<Vec<u8>, PortError>;
 
+    /// Prints `session_id`'s current page to PDF and returns the raw bytes.
+    async fn pdf(&self, session_id: &SessionId, timeout: Duration) -> Result<Vec<u8>, PortError>;
+
     /// Runs `function` (a JS function-expression string, e.g. `"() =>
     /// document.title"`) in `session_id`'s current page and returns its
     /// result as JSON. If `locator` is given, `function` is invoked with the
@@ -580,6 +583,14 @@ mod tests {
             &self,
             _session_id: &SessionId,
             _full_page: bool,
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, PortError> {
+            todo!()
+        }
+
+        async fn pdf(
+            &self,
+            _session_id: &SessionId,
             _timeout: Duration,
         ) -> Result<Vec<u8>, PortError> {
             todo!()

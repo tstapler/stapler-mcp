@@ -32,10 +32,10 @@ use crate::schema::{
     BrowserFindInput, BrowserFindMatch, BrowserFindOutput, BrowserFormFieldType,
     BrowserGetHtmlInput, BrowserGetHtmlOutput, BrowserHistoryAction, BrowserHistoryInput,
     BrowserHoverInput, BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput,
-    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserScreenshotOutput,
-    BrowserSelectOptionInput, BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput,
-    BrowserTabInfo, BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
-    BrowserWaitForInput,
+    BrowserPdfInput, BrowserPdfOutput, BrowserPressKeyInput, BrowserResizeInput,
+    BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
+    BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabInfo,
+    BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
 };
 use crate::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 
@@ -527,6 +527,40 @@ pub async fn browser_screenshot<B: BrowserDriver, F: FileStore>(
     Ok(out)
 }
 
+pub async fn browser_pdf<B: BrowserDriver, F: FileStore>(
+    browser: &B,
+    fs: &F,
+    input: BrowserPdfInput,
+) -> Result<BrowserPdfOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+
+    let pdf = browser
+        .pdf(&session_id, timeout)
+        .await
+        .map_err(|e| map_error("pdf", &input.session_id, e))?;
+
+    let mut out = BrowserPdfOutput {
+        data_base64: None,
+        saved_to: None,
+        mime_type: "application/pdf".to_string(),
+    };
+
+    if let Some(save_path) = input.save_path {
+        fs.write_file(&save_path, &pdf)
+            .await
+            .map_err(|e| e.to_string())?;
+        out.saved_to = Some(save_path);
+    } else {
+        out.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(&pdf));
+    }
+
+    Ok(out)
+}
+
 pub async fn browser_evaluate<B: BrowserDriver>(
     browser: &B,
     input: BrowserEvaluateInput,
@@ -870,6 +904,7 @@ mod tests {
         press_key_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         wait_for_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         screenshot_result: RefCell<Option<Result<Vec<u8>, PortError>>>,
+        pdf_result: RefCell<Option<Result<Vec<u8>, PortError>>>,
         evaluate_result: RefCell<Option<Result<serde_json::Value, PortError>>>,
         /// Records the `(function, locator)` args each `evaluate()` call
         /// actually received, so tests can verify which branch a caller
@@ -903,6 +938,7 @@ mod tests {
                 press_key_result: RefCell::new(None),
                 wait_for_result: RefCell::new(None),
                 screenshot_result: RefCell::new(None),
+                pdf_result: RefCell::new(None),
                 evaluate_result: RefCell::new(None),
                 evaluate_calls: RefCell::new(Vec::new()),
                 history_result: RefCell::new(None),
@@ -973,6 +1009,11 @@ mod tests {
 
         fn with_screenshot(self, result: Result<Vec<u8>, PortError>) -> Self {
             *self.screenshot_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_pdf(self, result: Result<Vec<u8>, PortError>) -> Self {
+            *self.pdf_result.borrow_mut() = Some(result);
             self
         }
 
@@ -1226,6 +1267,18 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .expect("screenshot result not configured")
+        }
+
+        async fn pdf(
+            &self,
+            _session_id: &SessionId,
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, PortError> {
+            self.calls.borrow_mut().push("pdf");
+            self.pdf_result
+                .borrow_mut()
+                .take()
+                .expect("pdf result not configured")
         }
 
         async fn evaluate(
@@ -2704,6 +2757,102 @@ mod tests {
             BrowserScreenshotInput {
                 session_id: "sess-9".to_string(),
                 full_page: None,
+                save_path: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_pdf ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_pdf_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+        let fs = FakeFileStore::new();
+
+        let err = browser_pdf(
+            &driver,
+            &fs,
+            BrowserPdfInput {
+                session_id: String::new(),
+                save_path: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_pdf_should_return_base64_data_when_save_path_omitted() {
+        let driver = FakeBrowserDriver::new().with_pdf(Ok(vec![1, 2, 3, 4]));
+        let fs = FakeFileStore::new();
+
+        let output = browser_pdf(
+            &driver,
+            &fs,
+            BrowserPdfInput {
+                session_id: "sess-1".to_string(),
+                save_path: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("pdf should succeed");
+
+        assert_eq!(output.data_base64.as_deref(), Some("AQIDBA=="));
+        assert_eq!(output.saved_to, None);
+        assert_eq!(output.mime_type, "application/pdf");
+        assert!(fs.last_write.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_pdf_should_save_to_file_and_omit_data_when_save_path_given() {
+        let driver = FakeBrowserDriver::new().with_pdf(Ok(vec![9, 9, 9]));
+        let fs = FakeFileStore::new();
+
+        let output = browser_pdf(
+            &driver,
+            &fs,
+            BrowserPdfInput {
+                session_id: "sess-1".to_string(),
+                save_path: Some("/tmp/page.pdf".to_string()),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("pdf should succeed");
+
+        assert_eq!(output.data_base64, None);
+        assert_eq!(output.saved_to.as_deref(), Some("/tmp/page.pdf"));
+        assert_eq!(
+            *fs.last_write.borrow(),
+            Some(("/tmp/page.pdf".to_string(), vec![9, 9, 9]))
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_pdf_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_pdf(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+        let fs = FakeFileStore::new();
+
+        let err = browser_pdf(
+            &driver,
+            &fs,
+            BrowserPdfInput {
+                session_id: "sess-9".to_string(),
                 save_path: None,
                 timeout_seconds: None,
             },

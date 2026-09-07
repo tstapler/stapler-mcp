@@ -975,6 +975,29 @@ test("jsBrowserScreenshot_should_pass_full_page_and_timeout_through_and_return_b
     browserGlue.sessions.delete(id);
 });
 
+test("jsBrowserPdf_should_pass_timeout_through_and_return_bytes", async () => {
+    const id = "sess-pdf-1";
+    let receivedOptions;
+    const fakeBytes = Buffer.from([5, 6, 7, 8]);
+    browserGlue.sessions.set(id, {
+        page: makeMockPage({
+            pdf: async (options) => {
+                receivedOptions = options;
+                return fakeBytes;
+            },
+        }),
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const bytes = await browserGlue.jsBrowserPdf(id, 5000);
+
+    assert.deepStrictEqual(receivedOptions, { timeout: 5000 });
+    assert.deepStrictEqual(Buffer.from(bytes), fakeBytes);
+
+    browserGlue.sessions.delete(id);
+});
+
 test("jsBrowserEvaluate_should_call_function_at_page_scope_when_no_ref_given", async () => {
     const id = "sess-evaluate-page-1";
     let receivedFn;

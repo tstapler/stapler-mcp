@@ -11,9 +11,9 @@ use stapler_mcp_core::schema::{
     BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
     BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
-    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
-    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
-    BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
+    BrowserPdfInput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
+    BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput,
+    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
     ListIndexedSourcesInput, ReadSavedPageInput, ReadWebsiteInput, RemoveIndexedSourceInput,
     SearchDocsInput,
 };
@@ -331,6 +331,19 @@ async fn run_daemon() {
                 let browser = browser.clone();
                 let fs = fs.clone();
                 async move { browser::browser_screenshot(&*browser, &*fs, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_pdf",
+        json_handler({
+            let browser = browser.clone();
+            let fs = fs.clone();
+            move |input: BrowserPdfInput| {
+                let browser = browser.clone();
+                let fs = fs.clone();
+                async move { browser::browser_pdf(&*browser, &*fs, input).await }
             }
         }),
     );
