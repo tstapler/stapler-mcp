@@ -615,6 +615,26 @@ pub struct BrowserEvaluateOutput {
     pub result: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserGetHtmlInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`; when given, returns that
+    /// element's `outerHTML` instead of the whole page's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserGetHtmlOutput {
+    /// The page's (or, with `refId`, the element's) rendered HTML —
+    /// `document.documentElement.outerHTML` / `element.outerHTML`.
+    pub html: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BrowserFormFieldType {

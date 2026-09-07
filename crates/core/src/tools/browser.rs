@@ -30,11 +30,12 @@ use crate::schema::{
     BrowserCloseAllSessionsOutput, BrowserCloseSessionFailure, BrowserCloseSessionInput,
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
     BrowserFindInput, BrowserFindMatch, BrowserFindOutput, BrowserFormFieldType,
-    BrowserHistoryAction, BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsOutput,
-    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
-    BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
-    BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabInfo,
-    BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
+    BrowserGetHtmlInput, BrowserGetHtmlOutput, BrowserHistoryAction, BrowserHistoryInput,
+    BrowserHoverInput, BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput,
+    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserScreenshotOutput,
+    BrowserSelectOptionInput, BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput,
+    BrowserTabInfo, BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
+    BrowserWaitForInput,
 };
 use crate::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 
@@ -548,6 +549,42 @@ pub async fn browser_evaluate<B: BrowserDriver>(
     Ok(BrowserEvaluateOutput { result })
 }
 
+/// Complementary to `browser_snapshot`'s accessibility-tree view: returns the
+/// page's (or, with `refId`, one element's) actual rendered HTML. Built on
+/// top of `evaluate` rather than a new driver method — `outerHTML` is just
+/// another JS expression, so there's no CDP call this needs that `evaluate`
+/// doesn't already make.
+pub async fn browser_get_html<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserGetHtmlInput,
+) -> Result<BrowserGetHtmlOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let locator = input.ref_id.clone().map(Locator);
+    let function = if locator.is_some() {
+        "(element) => element.outerHTML"
+    } else {
+        "() => document.documentElement.outerHTML"
+    };
+
+    let result = browser
+        .evaluate(&session_id, function, locator.as_ref(), timeout)
+        .await
+        .map_err(|e| map_error("get html", &input.session_id, e))?;
+
+    let html = result.as_str().map(str::to_string).ok_or_else(|| {
+        format!(
+            "get html {}: expected outerHTML to be a string, got {result}",
+            input.session_id
+        )
+    })?;
+
+    Ok(BrowserGetHtmlOutput { html })
+}
+
 /// Batch convenience over calling `stapler_browser_type`/
 /// `stapler_browser_select_option` once per field — not a single atomic
 /// driver call. Fields are filled in order; if one fails, earlier fields
@@ -834,6 +871,11 @@ mod tests {
         wait_for_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         screenshot_result: RefCell<Option<Result<Vec<u8>, PortError>>>,
         evaluate_result: RefCell<Option<Result<serde_json::Value, PortError>>>,
+        /// Records the `(function, locator)` args each `evaluate()` call
+        /// actually received, so tests can verify which branch a caller
+        /// (e.g. `browser_get_html`) took instead of only checking the
+        /// mock's pre-programmed return value.
+        evaluate_calls: RefCell<Vec<(String, Option<Locator>)>>,
         history_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         resize_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         /// Overrides whatever `tabs()` would otherwise compute from
@@ -862,6 +904,7 @@ mod tests {
                 wait_for_result: RefCell::new(None),
                 screenshot_result: RefCell::new(None),
                 evaluate_result: RefCell::new(None),
+                evaluate_calls: RefCell::new(Vec::new()),
                 history_result: RefCell::new(None),
                 resize_result: RefCell::new(None),
                 tabs_error: RefCell::new(None),
@@ -1188,11 +1231,14 @@ mod tests {
         async fn evaluate(
             &self,
             _session_id: &SessionId,
-            _function: &str,
-            _locator: Option<&Locator>,
+            function: &str,
+            locator: Option<&Locator>,
             _timeout: Duration,
         ) -> Result<serde_json::Value, PortError> {
             self.calls.borrow_mut().push("evaluate");
+            self.evaluate_calls
+                .borrow_mut()
+                .push((function.to_string(), locator.cloned()));
             self.evaluate_result
                 .borrow_mut()
                 .take()
@@ -2743,6 +2789,139 @@ mod tests {
             BrowserEvaluateInput {
                 session_id: "sess-9".to_string(),
                 function: "() => 1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_get_html ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_get_html_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: String::new(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_return_whole_page_html_when_ref_id_is_omitted() {
+        let driver =
+            FakeBrowserDriver::new().with_evaluate(Ok(serde_json::json!("<html>page</html>")));
+
+        let output = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("get_html should succeed");
+
+        assert_eq!(output.html, "<html>page</html>");
+        assert_eq!(*driver.calls.borrow(), vec!["evaluate"]);
+        assert_eq!(
+            *driver.evaluate_calls.borrow(),
+            vec![("() => document.documentElement.outerHTML".to_string(), None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_return_element_outer_html_when_ref_id_is_given() {
+        let driver =
+            FakeBrowserDriver::new().with_evaluate(Ok(serde_json::json!("<button>Go</button>")));
+
+        let output = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-1".to_string(),
+                ref_id: Some("ref-1".to_string()),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("get_html should succeed");
+
+        assert_eq!(output.html, "<button>Go</button>");
+        assert_eq!(
+            *driver.evaluate_calls.borrow(),
+            vec![(
+                "(element) => element.outerHTML".to_string(),
+                Some(Locator("ref-1".to_string()))
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_format_timeout_error_with_verb_and_session_id() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Err(PortError::Timeout));
+
+        let err = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("timeout should surface as an error");
+
+        assert_eq!(err, "get html sess-1: timed out");
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_return_err_when_evaluate_result_is_not_a_string() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Ok(serde_json::json!(null)));
+
+        let err = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("non-string evaluate result should be rejected");
+
+        assert_eq!(
+            err,
+            "get html sess-1: expected outerHTML to be a string, got null"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+
+        let err = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-9".to_string(),
                 ref_id: None,
                 timeout_seconds: None,
             },

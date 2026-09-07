@@ -28,11 +28,12 @@ use rmcp::model::JsonObject;
 
 use stapler_mcp_core::schema::{
     BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
-    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserHistoryInput,
-    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserPressKeyInput,
-    BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput, IndexDocsInput,
-    ListIndexedSourcesInput, RemoveIndexedSourceInput, SearchDocsInput,
+    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
+    BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
+    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
+    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
+    BrowserWaitForInput, IndexDocsInput, ListIndexedSourcesInput, RemoveIndexedSourceInput,
+    SearchDocsInput,
 };
 
 #[path = "../src/thin_client.rs"]
@@ -154,6 +155,10 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
         (
             "stapler_browser_find",
             schema_for_input::<BrowserFindInput>().expect("BrowserFindInput schemars schema"),
+        ),
+        (
+            "stapler_browser_get_html",
+            schema_for_input::<BrowserGetHtmlInput>().expect("BrowserGetHtmlInput schemars schema"),
         ),
     ];
 
