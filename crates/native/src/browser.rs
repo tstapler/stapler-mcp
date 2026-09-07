@@ -1074,6 +1074,7 @@ async fn spawn_session_listeners(
                 }
                 let policy = NetworkPolicy::from_env(
                     std::env::var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS").ok(),
+                    std::env::var("STAPLER_MCP_ALLOWED_PRIVATE_HOSTS").ok(),
                 );
                 if let Some(msg) =
                     frame_navigated_blocked_message(&session_id_for_requests, &event.url, policy)
@@ -1095,6 +1096,7 @@ async fn spawn_session_listeners(
                 }
                 let policy = NetworkPolicy::from_env(
                     std::env::var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS").ok(),
+                    std::env::var("STAPLER_MCP_ALLOWED_PRIVATE_HOSTS").ok(),
                 );
                 if let Some(msg) =
                     frame_navigated_blocked_message(&session_id, &event.frame.url, policy)

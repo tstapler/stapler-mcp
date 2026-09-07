@@ -134,19 +134,21 @@ async fn run_daemon() {
     // comment. Read once via `EnvPort` rather than `std::env` directly so
     // it's still exercised through the same seam as everything else in
     // `crates/core`.
-    let network_policy = webcrawl::NetworkPolicy::from_env(stapler_mcp_core::ports::EnvPort::var(
-        &env,
-        "STAPLER_MCP_ALLOW_PRIVATE_NETWORKS",
-    ));
+    let network_policy = webcrawl::NetworkPolicy::from_env(
+        stapler_mcp_core::ports::EnvPort::var(&env, "STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"),
+        stapler_mcp_core::ports::EnvPort::var(&env, "STAPLER_MCP_ALLOWED_PRIVATE_HOSTS"),
+    );
     daemon.register(
         "read_website",
         json_handler({
             let http = http.clone();
             let fs = fs.clone();
+            let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
                 let fs = fs.clone();
                 let cache_dir = cache_dir.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     webcrawl::read_website(&*http, &*fs, &cache_dir, input, network_policy).await
                 }
@@ -159,9 +161,11 @@ async fn run_daemon() {
         json_handler({
             let http = http.clone();
             let fs = fs.clone();
+            let network_policy = network_policy.clone();
             move |input: DownloadWebsiteInput| {
                 let http = http.clone();
                 let fs = fs.clone();
+                let network_policy = network_policy.clone();
                 async move { webcrawl::download_website(&*http, &*fs, input, network_policy).await }
             }
         }),
@@ -171,8 +175,10 @@ async fn run_daemon() {
         "stapler_browser_navigate",
         json_handler({
             let browser = browser.clone();
+            let network_policy = network_policy.clone();
             move |input: BrowserNavigateInput| {
                 let browser = browser.clone();
+                let network_policy = network_policy.clone();
                 async move { browser::browser_navigate(&*browser, input, network_policy).await }
             }
         }),
@@ -248,8 +254,10 @@ async fn run_daemon() {
         "stapler_browser_tabs",
         json_handler({
             let browser = browser.clone();
+            let network_policy = network_policy.clone();
             move |input: BrowserTabsInput| {
                 let browser = browser.clone();
+                let network_policy = network_policy.clone();
                 async move { browser::browser_tabs(&*browser, input, network_policy).await }
             }
         }),
@@ -387,6 +395,7 @@ async fn run_daemon() {
             let clock = clock.clone();
             let source_locks = source_locks.clone();
             let docs_index_dir = docs_index_dir.clone();
+            let network_policy = network_policy.clone();
             move |input: IndexDocsInput| {
                 let http = http.clone();
                 let fs = fs.clone();
@@ -394,6 +403,7 @@ async fn run_daemon() {
                 let clock = clock.clone();
                 let source_locks = source_locks.clone();
                 let docs_index_dir = docs_index_dir.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     docs::index_source(
                         &*http,

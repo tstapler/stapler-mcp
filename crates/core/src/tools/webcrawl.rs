@@ -6,6 +6,7 @@
 //! established by `fetch_page`/`brave_web_search` — no new port trait.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 use dom_smoothie::Readability;
 use serde::{Deserialize, Serialize};
@@ -108,22 +109,44 @@ fn same_host(a: &Url, b: &Url) -> bool {
 /// schema (`ReadWebsiteInput`/`DownloadWebsiteInput`/`IndexDocsInput`): the
 /// caller of these tools is an LLM agent that may itself be steered by
 /// previously-fetched content, so the choice of whether to allow private
-/// targets must be made by the trusted binary at its own call sites, not by
-/// anything a tool-call argument can influence. `AllowPrivateNetworks` exists
-/// purely so this crate's own tests can crawl a `127.0.0.1` mock server.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// targets — including which hosts, under `EnforceWithAllowlist` — must be
+/// made by the trusted binary at its own call sites, not by anything a
+/// tool-call argument can influence. `AllowPrivateNetworks` exists purely so
+/// this crate's own tests can crawl a `127.0.0.1` mock server.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum NetworkPolicy {
     Enforce,
     AllowPrivateNetworks,
+    /// Same fail-closed default as `Enforce`, except a host in this
+    /// operator-declared set (exact hostname or IP literal, matched
+    /// case-insensitively against `Url::host_str`) is let through — the dev
+    /// loop of pointing a browser tool at a local daemon on `127.0.0.1`,
+    /// without opening every private address up. Applied inside
+    /// `blocked_host_reason` itself, so it also covers the redirect/in-page
+    /// re-check (`frame_navigated_blocked_message`), not just the initial
+    /// navigate.
+    EnforceWithAllowlist(Arc<HashSet<String>>),
 }
 
 impl NetworkPolicy {
-    /// `value` is expected to come from the `STAPLER_MCP_ALLOW_PRIVATE_NETWORKS`
-    /// env var, read by the binary's own entry point — never from tool input.
-    pub fn from_env(value: Option<String>) -> Self {
-        match value.as_deref() {
-            Some("1") => NetworkPolicy::AllowPrivateNetworks,
-            _ => NetworkPolicy::Enforce,
+    /// `allow_private` is expected to come from the
+    /// `STAPLER_MCP_ALLOW_PRIVATE_NETWORKS` env var, `allowed_hosts` from
+    /// `STAPLER_MCP_ALLOWED_PRIVATE_HOSTS` (a comma-separated host list) —
+    /// both read by the binary's own entry point, never from tool input.
+    pub fn from_env(allow_private: Option<String>, allowed_hosts: Option<String>) -> Self {
+        if allow_private.as_deref() == Some("1") {
+            return NetworkPolicy::AllowPrivateNetworks;
+        }
+        let hosts: HashSet<String> = allowed_hosts
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if hosts.is_empty() {
+            NetworkPolicy::Enforce
+        } else {
+            NetworkPolicy::EnforceWithAllowlist(Arc::new(hosts))
         }
     }
 }
@@ -164,7 +187,7 @@ pub fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
     if policy == NetworkPolicy::AllowPrivateNetworks {
         return None;
     }
-    match url.host()? {
+    let reason = match url.host()? {
         url::Host::Ipv4(ip) if is_blocked_ipv4(ip) => {
             Some(format!("{ip} is a loopback/private/link-local address"))
         }
@@ -178,7 +201,23 @@ pub fn blocked_host_reason(url: &Url, policy: NetworkPolicy) -> Option<String> {
             Some(format!("{d} is a loopback hostname"))
         }
         _ => None,
+    }?;
+
+    if let NetworkPolicy::EnforceWithAllowlist(allowed) = &policy {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        if allowed.contains(&host) {
+            return None;
+        }
     }
+
+    // Auditable deny event (issue #40): a silent `Option::None`-shaped
+    // refusal leaves no record an operator can distinguish from "nothing
+    // tried to go there" — every actual denial gets one line here, on the
+    // same stderr channel as this crate's other diagnostics (stdout carries
+    // the MCP JSON-RPC stream and can't be used for this).
+    eprintln!("stapler-mcp: SSRF guard denied navigation to '{url}': {reason}");
+
+    Some(reason)
 }
 
 /// A BFS crawl frontier shared by both tools: yields `(url, depth, html)` for
@@ -203,7 +242,7 @@ impl<'a, H: HttpClient> Crawler<'a, H> {
         max_pages: u32,
         policy: NetworkPolicy,
     ) -> Result<Self, String> {
-        if let Some(reason) = blocked_host_reason(&seed, policy) {
+        if let Some(reason) = blocked_host_reason(&seed, policy.clone()) {
             return Err(format!("refusing to crawl {seed}: {reason}"));
         }
         let robot = fetch_robots(http, &seed).await;
@@ -270,7 +309,7 @@ impl<'a, H: HttpClient> Crawler<'a, H> {
                 let link_str = link.to_string();
                 if same_host(&link, &self.seed)
                     && !self.visited.contains(&link_str)
-                    && blocked_host_reason(&link, self.policy).is_none()
+                    && blocked_host_reason(&link, self.policy.clone()).is_none()
                 {
                     self.visited.insert(link_str);
                     self.queue.push_back((link, depth + 1));
@@ -483,5 +522,42 @@ mod ssrf_guard_tests {
     fn should_allow_every_url_when_policy_allows_private_networks() {
         let seed = Url::parse("http://127.0.0.1/").unwrap();
         assert!(blocked_host_reason(&seed, NetworkPolicy::AllowPrivateNetworks).is_none());
+    }
+
+    #[test]
+    fn should_allow_only_the_allowlisted_host_when_enforcing_with_allowlist() {
+        let policy = NetworkPolicy::from_env(None, Some("127.0.0.1, dev.localhost".to_string()));
+        assert!(
+            blocked_host_reason(&Url::parse("http://127.0.0.1/").unwrap(), policy.clone())
+                .is_none()
+        );
+        assert!(blocked_host_reason(
+            &Url::parse("http://dev.localhost/").unwrap(),
+            policy.clone()
+        )
+        .is_none());
+        assert!(
+            blocked_host_reason(&Url::parse("http://10.0.0.1/").unwrap(), policy).is_some(),
+            "hosts outside the allowlist must still be blocked"
+        );
+    }
+
+    #[test]
+    fn should_match_allowlisted_hosts_case_insensitively() {
+        let policy = NetworkPolicy::from_env(None, Some("Dev.Localhost".to_string()));
+        assert!(
+            blocked_host_reason(&Url::parse("http://dev.localhost/").unwrap(), policy).is_none()
+        );
+    }
+
+    #[test]
+    fn should_prefer_allow_private_networks_over_allowlist_when_both_set() {
+        let policy = NetworkPolicy::from_env(Some("1".to_string()), Some("nope".to_string()));
+        assert_eq!(policy, NetworkPolicy::AllowPrivateNetworks);
+    }
+
+    #[test]
+    fn should_enforce_with_no_allowlist_when_env_vars_are_unset() {
+        assert_eq!(NetworkPolicy::from_env(None, None), NetworkPolicy::Enforce);
     }
 }
