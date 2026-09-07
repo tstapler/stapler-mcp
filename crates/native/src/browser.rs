@@ -2149,8 +2149,18 @@ impl BrowserDriver for NativeBrowser {
                 }
             };
 
+            // Zero margins to match the wasm/Playwright backend's `page.pdf()`
+            // default (0), rather than CDP's own default of ~0.4in — same
+            // tool name, same no-options call, should look the same
+            // regardless of which backend serves the request.
+            let params = PrintToPdfParams::builder()
+                .margin_top(0.0)
+                .margin_bottom(0.0)
+                .margin_left(0.0)
+                .margin_right(0.0)
+                .build();
             let pdf = page
-                .pdf(PrintToPdfParams::default())
+                .pdf(params)
                 .await
                 .map_err(|e| PortError::Other(e.to_string()))?;
 
