@@ -85,17 +85,21 @@ pub async fn run_daemon() -> Result<(), JsValue> {
     let cache_dir = paths::cache_dir(&env);
     // Only ever set by this crate's own tests — see `NetworkPolicy`'s doc
     // comment in `crates/core`.
-    let network_policy =
-        webcrawl::NetworkPolicy::from_env(env.var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"));
+    let network_policy = webcrawl::NetworkPolicy::from_env(
+        env.var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"),
+        env.var("STAPLER_MCP_ALLOWED_PRIVATE_HOSTS"),
+    );
     daemon.register(
         "read_website",
         json_handler({
             let http = http.clone();
             let fsstore = fsstore.clone();
+            let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
                 let fsstore = fsstore.clone();
                 let cache_dir = cache_dir.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     webcrawl::read_website(&*http, &*fsstore, &cache_dir, input, network_policy)
                         .await
@@ -109,9 +113,11 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         json_handler({
             let http = http.clone();
             let fsstore = fsstore.clone();
+            let network_policy = network_policy.clone();
             move |input: DownloadWebsiteInput| {
                 let http = http.clone();
                 let fsstore = fsstore.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     webcrawl::download_website(&*http, &*fsstore, input, network_policy).await
                 }
@@ -123,8 +129,10 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         "stapler_browser_navigate",
         json_handler({
             let browser = browser.clone();
+            let network_policy = network_policy.clone();
             move |input: BrowserNavigateInput| {
                 let browser = browser.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     browser_tools::browser_navigate(&*browser, input, network_policy).await
                 }
@@ -202,8 +210,10 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         "stapler_browser_tabs",
         json_handler({
             let browser = browser.clone();
+            let network_policy = network_policy.clone();
             move |input: BrowserTabsInput| {
                 let browser = browser.clone();
+                let network_policy = network_policy.clone();
                 async move { browser_tools::browser_tabs(&*browser, input, network_policy).await }
             }
         }),
