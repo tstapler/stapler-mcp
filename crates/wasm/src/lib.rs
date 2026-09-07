@@ -24,7 +24,8 @@ use stapler_mcp_core::schema::{
     BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput,
     BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
     BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
-    FetchPageInput, FetchPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
+    FetchPageInput, FetchPageOutput, ReadSavedPageInput, ReadSavedPageOutput, ReadWebsiteInput,
+    ReadWebsiteOutput,
 };
 use stapler_mcp_core::tools::{browser as browser_tools, fetch, search, webcrawl};
 
@@ -94,6 +95,7 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         json_handler({
             let http = http.clone();
             let fsstore = fsstore.clone();
+            let cache_dir = cache_dir.clone();
             let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
@@ -104,6 +106,19 @@ pub async fn run_daemon() -> Result<(), JsValue> {
                     webcrawl::read_website(&*http, &*fsstore, &cache_dir, input, network_policy)
                         .await
                 }
+            }
+        }),
+    );
+
+    daemon.register(
+        "read_saved_page",
+        json_handler({
+            let fsstore = fsstore.clone();
+            let cache_dir = cache_dir.clone();
+            move |input: ReadSavedPageInput| {
+                let fsstore = fsstore.clone();
+                let cache_dir = cache_dir.clone();
+                async move { webcrawl::read_saved_page(&*fsstore, &cache_dir, input).await }
             }
         }),
     );
@@ -346,10 +361,18 @@ pub fn list_tools_json() -> Result<String, JsValue> {
         },
         ToolDescriptor {
             name: "read_website",
-            description: "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon.",
+            description: "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon. Once the combined Markdown across all pages returned passes ~60,000 characters (tunable via maxInlineChars, or force it for every page with alwaysSaveToFile), further pages come back as a short preview plus savedPath instead — use read_saved_page to search or page through the full content.",
             input_schema: serde_json::to_value(schemars::schema_for!(ReadWebsiteInput))
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
             output_schema: serde_json::to_value(schemars::schema_for!(ReadWebsiteOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "read_saved_page",
+            description: "Search or page through a page's full Markdown previously saved by read_website (its savedPath). With query set, returns every matching line (case-insensitive) plus surrounding context, like grep -n -C; without it, returns a line-numbered page of content starting at offset. Works even when you're not on the same machine as the daemon.",
+            input_schema: serde_json::to_value(schemars::schema_for!(ReadSavedPageInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(ReadSavedPageOutput))
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
         },
         ToolDescriptor {

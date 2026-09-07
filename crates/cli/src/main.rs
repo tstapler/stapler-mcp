@@ -14,7 +14,7 @@ use stapler_mcp_core::schema::{
     BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput,
     BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput,
     DownloadWebsiteInput, FetchPageInput, IndexDocsInput, ListIndexedSourcesInput,
-    ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
+    ReadSavedPageInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 use stapler_mcp_core::tools::{browser, docs, fetch, search, webcrawl};
 use stapler_mcp_native::{
@@ -143,6 +143,7 @@ async fn run_daemon() {
         json_handler({
             let http = http.clone();
             let fs = fs.clone();
+            let cache_dir = cache_dir.clone();
             let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
@@ -152,6 +153,19 @@ async fn run_daemon() {
                 async move {
                     webcrawl::read_website(&*http, &*fs, &cache_dir, input, network_policy).await
                 }
+            }
+        }),
+    );
+
+    daemon.register(
+        "read_saved_page",
+        json_handler({
+            let fs = fs.clone();
+            let cache_dir = cache_dir.clone();
+            move |input: ReadSavedPageInput| {
+                let fs = fs.clone();
+                let cache_dir = cache_dir.clone();
+                async move { webcrawl::read_saved_page(&*fs, &cache_dir, input).await }
             }
         }),
     );

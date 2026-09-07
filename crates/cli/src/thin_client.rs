@@ -23,8 +23,9 @@ use stapler_mcp_core::schema::{
     BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
     BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
     FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
-    ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput,
-    RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
+    ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput, ReadWebsiteInput,
+    ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
+    SearchDocsOutput,
 };
 use stapler_mcp_native::{
     NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
@@ -114,13 +115,24 @@ impl ThinClient {
 
     #[tool(
         name = "read_website",
-        description = "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon."
+        description = "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon. Once the combined Markdown across all pages returned passes ~60,000 characters (tunable via maxInlineChars, or force it for every page with alwaysSaveToFile), further pages come back as a short preview plus savedPath instead — use read_saved_page to search or page through the full content."
     )]
     async fn read_website(
         &self,
         params: Parameters<ReadWebsiteInput>,
     ) -> Result<Json<ReadWebsiteOutput>, String> {
         call_daemon("read_website", params.0).await.map(Json)
+    }
+
+    #[tool(
+        name = "read_saved_page",
+        description = "Search or page through a page's full Markdown previously saved by read_website (its savedPath). With query set, returns every matching line (case-insensitive) plus surrounding context, like grep -n -C; without it, returns a line-numbered page of content starting at offset. Works even when you're not on the same machine as the daemon."
+    )]
+    async fn read_saved_page(
+        &self,
+        params: Parameters<ReadSavedPageInput>,
+    ) -> Result<Json<ReadSavedPageOutput>, String> {
+        call_daemon("read_saved_page", params.0).await.map(Json)
     }
 
     #[tool(
