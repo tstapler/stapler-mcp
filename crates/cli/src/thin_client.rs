@@ -16,13 +16,13 @@ use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
     BrowserCloseAllSessionsInput, BrowserCloseAllSessionsOutput, BrowserCloseSessionInput,
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
-    BrowserFindInput, BrowserFindOutput, BrowserHistoryInput, BrowserHoverInput,
-    BrowserListSessionsInput, BrowserListSessionsOutput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
-    BrowserScreenshotOutput, BrowserSelectOptionInput, BrowserSetCheckedInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
-    BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
-    FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
+    BrowserFindInput, BrowserFindOutput, BrowserGetHtmlInput, BrowserGetHtmlOutput,
+    BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserListSessionsOutput,
+    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
+    BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
+    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
+    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
+    FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
     ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput, ReadWebsiteInput,
     ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
     SearchDocsOutput,
@@ -324,6 +324,19 @@ impl ThinClient {
         params: Parameters<BrowserEvaluateInput>,
     ) -> Result<Json<BrowserEvaluateOutput>, String> {
         call_daemon("stapler_browser_evaluate", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_get_html",
+        description = "Return the rendered HTML of an existing browser session's current page (document.documentElement.outerHTML), or of a single element's outerHTML when refId (a `ref` from a previous snapshot) is given. Complements stapler_browser_snapshot's accessibility-tree view when the exact markup is what's needed."
+    )]
+    async fn browser_get_html(
+        &self,
+        params: Parameters<BrowserGetHtmlInput>,
+    ) -> Result<Json<BrowserGetHtmlOutput>, String> {
+        call_daemon("stapler_browser_get_html", params.0)
             .await
             .map(Json)
     }

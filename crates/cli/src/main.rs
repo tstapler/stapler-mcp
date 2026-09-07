@@ -9,12 +9,13 @@ use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
     BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
-    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserHistoryInput,
-    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserPressKeyInput,
-    BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput,
-    DownloadWebsiteInput, FetchPageInput, IndexDocsInput, ListIndexedSourcesInput,
-    ReadSavedPageInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
+    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
+    BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
+    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
+    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
+    BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
+    ListIndexedSourcesInput, ReadSavedPageInput, ReadWebsiteInput, RemoveIndexedSourceInput,
+    SearchDocsInput,
 };
 use stapler_mcp_core::tools::{browser, docs, fetch, search, webcrawl};
 use stapler_mcp_native::{
@@ -341,6 +342,17 @@ async fn run_daemon() {
             move |input: BrowserEvaluateInput| {
                 let browser = browser.clone();
                 async move { browser::browser_evaluate(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_get_html",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserGetHtmlInput| {
+                let browser = browser.clone();
+                async move { browser::browser_get_html(&*browser, input).await }
             }
         }),
     );

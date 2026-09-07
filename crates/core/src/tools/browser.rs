@@ -30,11 +30,12 @@ use crate::schema::{
     BrowserCloseAllSessionsOutput, BrowserCloseSessionFailure, BrowserCloseSessionInput,
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
     BrowserFindInput, BrowserFindMatch, BrowserFindOutput, BrowserFormFieldType,
-    BrowserHistoryAction, BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsOutput,
-    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
-    BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
-    BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabInfo,
-    BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
+    BrowserGetHtmlInput, BrowserGetHtmlOutput, BrowserHistoryAction, BrowserHistoryInput,
+    BrowserHoverInput, BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput,
+    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserScreenshotOutput,
+    BrowserSelectOptionInput, BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput,
+    BrowserTabInfo, BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
+    BrowserWaitForInput,
 };
 use crate::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 
@@ -546,6 +547,42 @@ pub async fn browser_evaluate<B: BrowserDriver>(
         .map_err(|e| map_error("evaluate", &input.session_id, e))?;
 
     Ok(BrowserEvaluateOutput { result })
+}
+
+/// Complementary to `browser_snapshot`'s accessibility-tree view: returns the
+/// page's (or, with `refId`, one element's) actual rendered HTML. Built on
+/// top of `evaluate` rather than a new driver method — `outerHTML` is just
+/// another JS expression, so there's no CDP call this needs that `evaluate`
+/// doesn't already make.
+pub async fn browser_get_html<B: BrowserDriver>(
+    browser: &B,
+    input: BrowserGetHtmlInput,
+) -> Result<BrowserGetHtmlOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let timeout = resolve_timeout(input.timeout_seconds);
+    let session_id = SessionId(input.session_id.clone());
+    let locator = input.ref_id.clone().map(Locator);
+    let function = if locator.is_some() {
+        "(element) => element.outerHTML"
+    } else {
+        "() => document.documentElement.outerHTML"
+    };
+
+    let result = browser
+        .evaluate(&session_id, function, locator.as_ref(), timeout)
+        .await
+        .map_err(|e| map_error("getHtml", &input.session_id, e))?;
+
+    let html = result.as_str().map(str::to_string).ok_or_else(|| {
+        format!(
+            "getHtml {}: expected outerHTML to be a string, got {result}",
+            input.session_id
+        )
+    })?;
+
+    Ok(BrowserGetHtmlOutput { html })
 }
 
 /// Batch convenience over calling `stapler_browser_type`/
@@ -2743,6 +2780,110 @@ mod tests {
             BrowserEvaluateInput {
                 session_id: "sess-9".to_string(),
                 function: "() => 1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("not-found should surface as an error");
+
+        assert_eq!(
+            err,
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
+        );
+    }
+
+    // -- browser_get_html ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_get_html_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: String::new(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_return_whole_page_html_when_ref_id_is_omitted() {
+        let driver =
+            FakeBrowserDriver::new().with_evaluate(Ok(serde_json::json!("<html>page</html>")));
+
+        let output = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("get_html should succeed");
+
+        assert_eq!(output.html, "<html>page</html>");
+        assert_eq!(*driver.calls.borrow(), vec!["evaluate"]);
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_return_element_outer_html_when_ref_id_is_given() {
+        let driver =
+            FakeBrowserDriver::new().with_evaluate(Ok(serde_json::json!("<button>Go</button>")));
+
+        let output = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-1".to_string(),
+                ref_id: Some("ref-1".to_string()),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("get_html should succeed");
+
+        assert_eq!(output.html, "<button>Go</button>");
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_return_err_when_evaluate_result_is_not_a_string() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Ok(serde_json::json!(null)));
+
+        let err = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-1".to_string(),
+                ref_id: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect_err("non-string evaluate result should be rejected");
+
+        assert_eq!(
+            err,
+            "getHtml sess-1: expected outerHTML to be a string, got null"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_get_html_should_pass_not_found_error_through_unchanged() {
+        let driver = FakeBrowserDriver::new().with_evaluate(Err(PortError::NotFound(
+            "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session".to_string(),
+        )));
+
+        let err = browser_get_html(
+            &driver,
+            BrowserGetHtmlInput {
+                session_id: "sess-9".to_string(),
                 ref_id: None,
                 timeout_seconds: None,
             },
