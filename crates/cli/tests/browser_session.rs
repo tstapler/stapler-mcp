@@ -1165,9 +1165,16 @@ async fn browser_tabs_hover_select_press_wait_close_round_trip() {
         n["role"] == "combobox" || n["role"] == "listbox"
     })
     .unwrap_or_else(|| panic!("expected a select/combobox node, got: {select_option_result:?}"));
+    // The AX tree's `value` for a `<select>` is Chrome's accessible value —
+    // the selected `<option>`'s visible label text ("Green"), not the
+    // underlying HTML `value` attribute ("green") that was passed to
+    // `stapler_browser_select_option`. Confirmed against a real Chromium
+    // build (playwright-core 1.61.1's bundled chromium-1234): the CDP
+    // `Accessibility.getPartialAXTree` response reports the label, so this
+    // is what "the selection was reflected" actually looks like.
     assert_eq!(
         selected["value"].as_str(),
-        Some("green"),
+        Some("Green"),
         "expected the selected option to be reflected, got: {select_option_result:?}"
     );
 
