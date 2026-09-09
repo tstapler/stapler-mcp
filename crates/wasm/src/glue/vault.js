@@ -179,26 +179,75 @@ function normalizeVaultError(e) {
     return e instanceof Error ? e : new Error(message);
 }
 
+// Mirrors native's `log_resolve_outcome` (`crates/native/src/vault.rs`) —
+// same line shape and stderr channel (stdout carries the MCP JSON-RPC
+// stream), one line per resolve attempt, success and every rejection reason
+// alike (`ux.md` §3: a rejection is exactly as audit-worthy as a success).
+// Never includes the resolved value — `outcome` is a fixed classification
+// string, never the raw secret.
+function logResolveOutcome(domain, field, outcome) {
+    console.error(`stapler-mcp: credential resolve domain='${domain}' field=${field} outcome=${outcome}`);
+}
+
+// Classifies a (already `normalizeVaultError`-passed) error into native's
+// log-line outcome vocabulary (`resolved`/`rejected-domain-mismatch`/
+// `rejected-ambiguous`/`rate-limited`/`totp-expired`/`vault-lookup-failed`).
+// Mirrors `crates/wasm/src/vault.rs`'s `map_vault_js_error` substring
+// dispatch — same marker substrings, same precedence order (checking
+// "not authenticated"/"not signed in" before "expired" matters: an
+// unauthenticated error's `Detail: ...` suffix can itself contain the word
+// "expired", e.g. from a `DesktopSessionExpiredError`) — so the log line
+// never disagrees with the `PortError` variant `map_vault_js_error` actually
+// produces for the same message. Unauthenticated and any other unrecognized
+// failure both mean the vault lookup itself couldn't complete, same as
+// native's `Err(_) => "vault-lookup-failed"` catch-all.
+function outcomeForError(e) {
+    const message = e && e.message ? e.message : String(e);
+    const lower = message.toLowerCase();
+    if (lower.includes("ambiguous")) {
+        return "rejected-ambiguous";
+    }
+    if (lower.includes("no vault entry for domain")) {
+        return "rejected-domain-mismatch";
+    }
+    if (lower.includes("not authenticated") || lower.includes("not signed in")) {
+        return "vault-lookup-failed";
+    }
+    if (lower.includes("rate limit")) {
+        return "rate-limited";
+    }
+    if (lower.includes("expired")) {
+        return "totp-expired";
+    }
+    return "vault-lookup-failed";
+}
+
 // The actual (uncached-at-the-`pending`-level) resolve: client singleton,
-// domain lookup, the field-conditional branch (Task 4.2.1b), and error
-// normalization, in that order.
+// domain lookup, the field-conditional branch (Task 4.2.1b), error
+// normalization, and the audit-log line (Task 5.4.1b), in that order.
 async function resolveUncached(domain, field) {
     try {
         const client = await getVaultClient();
         const { vaultId, itemId } = await lookupDomain(client, domain);
 
+        let value;
         if (field === "totp") {
             // The Node SDK's `items.get()` doesn't return computed OTP
             // values (`architecture.md` §6) — `secrets.resolve()` with the
             // `?attribute=otp` query is required instead, unlike the
             // username/password path below.
-            return await client.secrets.resolve(`op://${vaultId}/${itemId}/${field}?attribute=otp`);
+            value = await client.secrets.resolve(`op://${vaultId}/${itemId}/${field}?attribute=otp`);
+        } else {
+            const item = await client.items.get(vaultId, itemId);
+            value = fieldValueFromItem(item, field, domain);
         }
 
-        const item = await client.items.get(vaultId, itemId);
-        return fieldValueFromItem(item, field, domain);
+        logResolveOutcome(domain, field, "resolved");
+        return value;
     } catch (e) {
-        throw normalizeVaultError(e);
+        const normalized = normalizeVaultError(e);
+        logResolveOutcome(domain, field, outcomeForError(normalized));
+        throw normalized;
     }
 }
 

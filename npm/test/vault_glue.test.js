@@ -255,3 +255,62 @@ test("js_resolve_credential_should_normalize_unauthenticated_error_when_create_c
         },
     );
 });
+
+// -- Observability (Epic 5.4, Task 5.4.1b) --
+//
+// No existing console-capture helper exists elsewhere in this test file (or
+// `npm/test/vault_spike.test.js`), so these two tests monkey-patch
+// `console.error` directly — save the original, install a capturing
+// replacement, and restore it in a `finally` so a failing assertion never
+// leaks the patch into a later test.
+async function captureConsoleError(fn) {
+    const lines = [];
+    const original = console.error;
+    console.error = (line) => lines.push(line);
+    try {
+        await fn();
+    } finally {
+        console.error = original;
+    }
+    return lines;
+}
+
+test("js_resolve_credential_should_emit_log_line_with_domain_field_and_outcome_when_rejected", async () => {
+    const client = {
+        vaults: { list: async () => [{ id: "vault1" }] },
+        items: {
+            list: async () => [loginItem("item1", "vault1", "Other Login", "https://other.example/login")],
+            get: async () => {
+                throw new Error("should not be called on a domain mismatch");
+            },
+        },
+        secrets: { resolve: async () => {
+            throw new Error("should not be called on a domain mismatch");
+        } },
+    };
+    vaultGlue.__setClientFactoryForTesting(async () => client);
+
+    const lines = await captureConsoleError(async () => {
+        await assert.rejects(() => vaultGlue.jsResolveCredential("example.com", "password"));
+    });
+
+    assert.strictEqual(lines.length, 1);
+    assert.match(lines[0], /domain='example\.com'/);
+    assert.match(lines[0], /field=password/);
+    assert.match(lines[0], /outcome=rejected-domain-mismatch/);
+});
+
+test("js_resolve_credential_should_never_emit_resolved_value_in_log_line_when_resolve_succeeds", async () => {
+    const client = singleMatchClient();
+    vaultGlue.__setClientFactoryForTesting(async () => client);
+
+    let value;
+    const lines = await captureConsoleError(async () => {
+        value = await vaultGlue.jsResolveCredential("example.com", "password");
+    });
+
+    assert.strictEqual(value, "hunter2");
+    assert.strictEqual(lines.length, 1);
+    assert.match(lines[0], /outcome=resolved/);
+    assert.doesNotMatch(lines[0], /hunter2/);
+});
