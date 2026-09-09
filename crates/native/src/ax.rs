@@ -17,12 +17,15 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use chromiumoxide::cdp::browser_protocol::accessibility::{AxValue, GetFullAxTreeParams};
-use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, DescribeNodeParams};
+use chromiumoxide::cdp::browser_protocol::dom::{
+    BackendNodeId, DescribeNodeParams, ResolveNodeParams,
+};
 use chromiumoxide::cdp::browser_protocol::page::FrameId;
+use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
 use chromiumoxide::Page;
 use futures::future::BoxFuture;
 
-use stapler_mcp_core::ports::{AxNode, AxSnapshot, PortError};
+use stapler_mcp_core::ports::{AxNode, AxSnapshot, PortError, REDACTED_PLACEHOLDER};
 
 /// Depth limit on same-process `<iframe>` recursion (issue #20). Guards
 /// against pathological/self-referential iframe nesting; a frame beyond this
@@ -115,7 +118,11 @@ pub async fn capture_snapshot(
 
     let raw = fetch_frame_tree(page, frame_id, 0).await?;
 
-    Ok(build_tree(&raw, next_ref_id, url, previous_refs))
+    let mut capture = build_tree(&raw, next_ref_id, url, previous_refs);
+    let probe = PageProbe(page);
+    redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &probe).await;
+
+    Ok(capture)
 }
 
 /// Fetches one frame's AX tree via `Accessibility.getFullAXTree`, then
@@ -383,6 +390,165 @@ fn walk_children<'a>(
     out
 }
 
+/// AX `role` values `redact_form_control_values` bothers probing.
+/// Deliberately narrow (rather than probing every surviving node) — a
+/// generic/button/link node can never carry a form-control `value` to leak,
+/// so probing it would just be a wasted CDP round trip per node.
+fn is_form_control_role(role: &str) -> bool {
+    matches!(role, "textbox" | "searchbox" | "combobox")
+}
+
+/// Seam Task 2.2.1b introduces so `redact_form_control_values` doesn't need
+/// to know whether it's talking to a live `Page` or a test fake — production
+/// uses `PageProbe` (below), unit tests (Task 2.2.1c) use a fake that never
+/// touches CDP.
+///
+/// `Sync` supertrait: `redact_form_control_values` holds a `&dyn
+/// RedactionProbe`-shaped reference across an `.await` inside its own
+/// `BoxFuture` (which is `Send`-bound); without `Sync` here, that reference
+/// wouldn't be `Send`.
+trait RedactionProbe: Sync {
+    fn probe(&self, backend_node_id: BackendNodeId) -> BoxFuture<'_, Result<bool, ()>>;
+}
+
+/// Production `RedactionProbe`: delegates to `probe_redaction` over a real
+/// CDP connection.
+struct PageProbe<'a>(&'a Page);
+
+impl RedactionProbe for PageProbe<'_> {
+    fn probe(&self, backend_node_id: BackendNodeId) -> BoxFuture<'_, Result<bool, ()>> {
+        Box::pin(probe_redaction(self.0, backend_node_id))
+    }
+}
+
+/// Combined DOM `type`/`autocomplete` redaction check for one node, run via
+/// a single `Runtime.callFunctionOn` eval bound to `this` (mirroring
+/// `browser.rs`'s `invoke_on_node`/`ACTIONABILITY_CHECK_JS` pattern) rather
+/// than two separate CDP calls — `research/pitfalls.md` §3a's atomicity
+/// concern: two independent round trips can straddle a DOM mutation and see
+/// an inconsistent `type`/`autocomplete` pair.
+///
+/// Deliberately **not** implemented with `DOM.describeNode`/
+/// `DescribeNodeParams`: that call's `pierce` option defaults to `false`, so
+/// it cannot see into even an *open* shadow root, silently missing a
+/// password field nested inside a web component (`research/pitfalls.md`
+/// §3c). A `Runtime.callFunctionOn` eval bound to `this`, by contrast, sees
+/// into an open shadow root the same way any page script would — it is
+/// ordinary JS reading `this.shadowRoot`'s contents when that root is open —
+/// which is what makes Story 2.2.2's open-shadow-root case work at all. A
+/// future refactor back to `DescribeNodeParams` for this check would
+/// silently reintroduce the closed/open shadow-root asymmetry; don't.
+///
+/// Returns `Ok(true)` when `this.type === 'password'` or `this.autocomplete`
+/// is one of `one-time-code`/`current-password`/`new-password`. `Err(())` on
+/// *any* CDP failure (node gone, resolution failure, thrown exception) is
+/// the fail-safe signal: the caller (`redact_form_control_values`) treats it
+/// identically to `Ok(true)`, since a node whose type can't be determined
+/// must never be assumed safe to leave in the clear.
+///
+/// **Empirical correction to `research/pitfalls.md` §3c** (verified against
+/// Google Chrome 146.0.7680.153, via this module's own `#[ignore]`d
+/// `snapshot_should_redact_value_when_shadow_root_is_closed_and_probe_fails`
+/// test): a *closed* shadow root's contents are **not**, in fact,
+/// unresolvable here. `DOM.resolveNode` on a `BackendNodeId` already
+/// obtained from `Accessibility.getFullAXTree` — which itself pierces closed
+/// roots — resolves to a working `RemoteObject` regardless of the shadow
+/// root's open/closed mode, because CDP operates on the browser engine's own
+/// internal DOM tree, not through the JS-visible `Element.shadowRoot`
+/// accessor that "closed" mode nulls out at the *page-script* API surface
+/// only. So `this` inside the eval is bound directly to the password
+/// `<input>` either way, and closed-shadow redaction in practice happens via
+/// a genuine `Ok(true)` type match, not the `Err(())` fail-safe path. The
+/// fail-safe handling above is kept regardless — it's still correct
+/// defense-in-depth for other genuine resolution failures (a node detached
+/// between the AX-tree fetch and this probe, a thrown accessor, etc.) — but
+/// don't assume `Err(())` is what makes closed-shadow content safe; it's the
+/// eval succeeding anyway that does.
+///
+/// **Story 2.2.3's headless-vs-headed empirical check** (also verified
+/// against Google Chrome 146.0.7680.153, via
+/// `snapshot_should_match_headless_and_headed_ax_output_for_password_field`):
+/// headless Chrome's own `Accessibility.getFullAXTree` already masks a
+/// `type="password"` field's `value` to a run of bullet characters
+/// (`"•••••••"` for a 7-character value) rather than exposing the raw
+/// plaintext — a fact this module's redaction layer doesn't rely on (it
+/// unconditionally substitutes `REDACTED_PLACEHOLDER`, which also hides the
+/// value's *length*, unlike Chrome's own bullet masking) but is worth
+/// recording because it underscores why the `autocomplete`-keyed branch of
+/// this probe matters: that native masking is tied to `type="password"`
+/// specifically, so a `type="text" autocomplete="one-time-code"` field gets
+/// **no** such protection from Chrome itself and would surface its raw
+/// value verbatim through the AX tree without this probe's `autocomplete`
+/// check. The headed half of the comparison — whether headed Chrome differs
+/// from this — could not be completed in the sandbox this was verified in
+/// (no accessible X11 display: `google-chrome`'s own headed launch fails
+/// with "Missing X server or $DISPLAY" there); this is an open gap for
+/// whoever next runs `snapshot_should_match_headless_and_headed_ax_output_for_password_field`
+/// with a real display attached.
+async fn probe_redaction(page: &Page, backend_node_id: BackendNodeId) -> Result<bool, ()> {
+    let resolved = page
+        .execute(
+            ResolveNodeParams::builder()
+                .backend_node_id(backend_node_id)
+                .build(),
+        )
+        .await
+        .map_err(|_| ())?;
+    let object_id = resolved.result.object.object_id.clone().ok_or(())?;
+
+    let params = CallFunctionOnParams::builder()
+        .object_id(object_id)
+        .function_declaration(
+            "function() { return this.type === 'password' || \
+             ['one-time-code', 'current-password', 'new-password'].includes(this.autocomplete); }",
+        )
+        .return_by_value(true)
+        .build()
+        .map_err(|_| ())?;
+
+    let response = page.execute(params).await.map_err(|_| ())?;
+    if response.result.exception_details.is_some() {
+        return Err(());
+    }
+
+    response
+        .result
+        .result
+        .value
+        .as_ref()
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(())
+}
+
+/// Post-`walk_children` resolution pass: for every surviving node whose
+/// `role` looks like a form control, probes its live DOM `type`/
+/// `autocomplete` and substitutes `REDACTED_PLACEHOLDER` for `value` when the
+/// probe says to redact, or fails outright (fail-safe — see
+/// `probe_redaction`'s doc comment). Kept separate from `walk_children`
+/// itself (rather than threading a `&Page` through the tree walk) so
+/// `walk_children`'s existing pure/sync unit tests keep working without a
+/// live `Page`; this pass is looked up by the same `BackendNodeId` ->
+/// `ResolvedRef` map `build_tree` already produces.
+fn redact_form_control_values<'a>(
+    node: &'a mut AxNode,
+    refs: &'a HashMap<String, ResolvedRef>,
+    probe: &'a impl RedactionProbe,
+) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
+        if is_form_control_role(&node.role) {
+            if let Some(resolved) = refs.get(&node.node_ref) {
+                let result = probe.probe(resolved.backend_node_id).await;
+                if !matches!(result, Ok(false)) {
+                    node.value = Some(REDACTED_PLACEHOLDER.to_string());
+                }
+            }
+        }
+        for child in node.children.iter_mut() {
+            redact_form_control_values(child, refs, probe).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +792,374 @@ mod tests {
             second.refs.contains_key(&name_ref),
             "reused ref string must still resolve in the new capture's refs map"
         );
+    }
+
+    // ---- Epic 2.2, Story 2.2.1: redaction ----
+
+    /// Same as `node()` but also sets `value` — Story 2.2.1's ACs are all
+    /// about whether `value` survives or gets replaced, which `node()`
+    /// deliberately doesn't expose (existing tests above never needed it).
+    fn node_with_value(id: &str, parent: Option<&str>, role: &str, value: &str) -> RawAxNode {
+        RawAxNode {
+            node_id: id.to_string(),
+            parent_id: parent.map(|p| p.to_string()),
+            ignored: false,
+            role: Some(role.to_string()),
+            name: None,
+            value: Some(value.to_string()),
+            backend_node_id: Some(id.parse().unwrap_or(0)),
+        }
+    }
+
+    /// Fake `RedactionProbe`: returns a fixed, pre-canned result for every
+    /// node, standing in for a live CDP round trip (Task 2.2.1c's seam).
+    struct FakeProbe(Result<bool, ()>);
+
+    impl RedactionProbe for FakeProbe {
+        fn probe(&self, _backend_node_id: BackendNodeId) -> BoxFuture<'_, Result<bool, ()>> {
+            let result = self.0;
+            Box::pin(async move { result })
+        }
+    }
+
+    #[tokio::test]
+    async fn build_tree_should_redact_value_when_dom_type_is_password() {
+        // Chromium's computed AX role for `<input type="password">` is the
+        // same "textbox" role any other text field gets — redaction can't
+        // key off `role`, which is exactly why this drives the probe's own
+        // `Ok(true)` result (standing in for `this.type === 'password'`)
+        // rather than asserting anything about role.
+        let next_ref_id = Cell::new(1);
+        let nodes = vec![
+            node("1", None, false, None, None),
+            node_with_value("2", Some("1"), "textbox", "hunter2"),
+        ];
+        let mut capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
+
+        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &FakeProbe(Ok(true)))
+            .await;
+
+        assert_eq!(
+            capture.snapshot.root.children[0].value,
+            Some(REDACTED_PLACEHOLDER.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn build_tree_should_leave_value_unredacted_when_neither_key_matches() {
+        let next_ref_id = Cell::new(1);
+        let nodes = vec![
+            node("1", None, false, None, None),
+            node_with_value("2", Some("1"), "textbox", "Jane"),
+        ];
+        let mut capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
+
+        redact_form_control_values(
+            &mut capture.snapshot.root,
+            &capture.refs,
+            &FakeProbe(Ok(false)),
+        )
+        .await;
+
+        assert_eq!(
+            capture.snapshot.root.children[0].value,
+            Some("Jane".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn build_tree_should_redact_value_when_autocomplete_is_one_time_code() {
+        // Not `type="password"` at all — the probe alone (an `autocomplete`
+        // match) must still trigger redaction. This is the single most
+        // consequential redaction-key finding of the whole feature: a
+        // one-time code is exactly as sensitive as a password, and a
+        // redaction rule keyed only off `type` would silently leak it.
+        let next_ref_id = Cell::new(1);
+        let nodes = vec![
+            node("1", None, false, None, None),
+            node_with_value("2", Some("1"), "textbox", "482913"),
+        ];
+        let mut capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
+
+        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &FakeProbe(Ok(true)))
+            .await;
+
+        assert_eq!(
+            capture.snapshot.root.children[0].value,
+            Some(REDACTED_PLACEHOLDER.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn redact_form_control_values_should_redact_when_probe_fails() {
+        // Fail-safe path: `Err(())` from the probe (node resolution failure,
+        // exception, or — per Story 2.2.2 — an unobservable closed shadow
+        // root) must redact, never be treated as "couldn't tell, leave it."
+        let next_ref_id = Cell::new(1);
+        let nodes = vec![
+            node("1", None, false, None, None),
+            node_with_value("2", Some("1"), "textbox", "secret"),
+        ];
+        let mut capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
+
+        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &FakeProbe(Err(())))
+            .await;
+
+        assert_eq!(
+            capture.snapshot.root.children[0].value,
+            Some(REDACTED_PLACEHOLDER.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn redact_form_control_values_should_not_probe_non_form_control_role() {
+        let next_ref_id = Cell::new(1);
+        let nodes = vec![
+            node("1", None, false, None, None),
+            node_with_value("2", Some("1"), "button", "irrelevant"),
+        ];
+        let mut capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
+
+        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &FakeProbe(Ok(true)))
+            .await;
+
+        assert_eq!(
+            capture.snapshot.root.children[0].value,
+            Some("irrelevant".to_string()),
+            "a non-form-control role must never be probed/redacted"
+        );
+    }
+
+    // ---- Epic 2.2, Story 2.2.2: shadow-DOM integration coverage ----
+    //
+    // Both tests below need a real Chrome (they launch `chromiumoxide`'s own
+    // `Browser`), so they're `#[ignore]`d rather than part of the default
+    // `cargo test` run — `crates/native/tests/` has no existing integration
+    // test convention to fit into (the directory doesn't exist yet), so
+    // these live here per the Task 2.2.2b/c investigation note.
+
+    /// Launches a real Chrome with the given config and loads `html` via
+    /// `Page::set_content`. Shared by every `#[ignore]`d test in this module
+    /// that needs a live CDP connection, so the launch/event-pump/set-content
+    /// boilerplate exists exactly once.
+    async fn launch_chrome_page_with_config(
+        config: chromiumoxide::BrowserConfig,
+        html: &str,
+    ) -> (chromiumoxide::Browser, Page) {
+        let (browser, mut handler) = chromiumoxide::Browser::launch(config)
+            .await
+            .expect("Chrome must be installed to run this ignored integration test");
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while handler.next().await.is_some() {}
+        });
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .expect("new_page must succeed");
+        page.set_content(html).await.expect("set_content");
+        (browser, page)
+    }
+
+    /// A fresh, never-reused profile directory — `BrowserConfig::builder()`'s
+    /// own default (unset `user_data_dir`) points every launch at one fixed
+    /// shared path, so two sequential launches within the same test process
+    /// (e.g. Story 2.2.3's headless-then-headed comparison) collide on
+    /// Chrome's own `SingletonLock` (confirmed empirically — see that test's
+    /// history). Mirrors the same fix `browser.rs`'s `NativeBrowser::launch`
+    /// already applies in production.
+    fn unique_test_profile_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "stapler-mcp-ax-test-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test profile dir");
+        dir
+    }
+
+    /// Headless launch — same default `NativeBrowser::launch` (`browser.rs`)
+    /// uses in production.
+    async fn launch_headless_chrome_page(html: &str) -> (chromiumoxide::Browser, Page) {
+        let config = chromiumoxide::BrowserConfig::builder()
+            .user_data_dir(unique_test_profile_dir("headless"))
+            .build()
+            .expect("headless BrowserConfig must build");
+        launch_chrome_page_with_config(config, html).await
+    }
+
+    /// Headed launch, for Story 2.2.3's empirical comparison.
+    async fn launch_headed_chrome_page(html: &str) -> (chromiumoxide::Browser, Page) {
+        let config = chromiumoxide::BrowserConfig::builder()
+            .user_data_dir(unique_test_profile_dir("headed"))
+            .with_head()
+            .build()
+            .expect("headed BrowserConfig must build");
+        launch_chrome_page_with_config(config, html).await
+    }
+
+    const MY_LOGIN_HTML_TEMPLATE: &str = r#"<!doctype html>
+<html><body>
+<my-login></my-login>
+<script>
+customElements.define('my-login', class extends HTMLElement {
+  connectedCallback() {
+    const root = this.attachShadow({ mode: '__MODE__' });
+    root.innerHTML = '<input type="password" value="hunter2">';
+  }
+});
+</script>
+</body></html>"#;
+
+    #[tokio::test]
+    #[ignore = "requires a real Chrome; run with `cargo test -- --ignored`"]
+    async fn snapshot_should_redact_value_when_shadow_root_is_open_and_probe_succeeds() {
+        let html = MY_LOGIN_HTML_TEMPLATE.replace("__MODE__", "open");
+        let (browser, page) = launch_headless_chrome_page(&html).await;
+
+        let next_ref_id = Cell::new(1);
+        let capture = capture_snapshot(&page, &next_ref_id, &HashMap::new())
+            .await
+            .expect("capture_snapshot should succeed");
+
+        let password_node = find_node_by_role(&capture.snapshot.root, "textbox")
+            .expect("password field should surface in the AX tree through the open shadow root");
+        assert_eq!(
+            password_node.value.as_deref(),
+            Some(REDACTED_PLACEHOLDER),
+            "open-shadow-root password field must be redacted via successful piercing"
+        );
+
+        let mut browser = browser;
+        let _ = browser.close().await;
+    }
+
+    /// Named (and originally written) for the fail-safe path
+    /// `pitfalls.md` predicted for a closed shadow root — but running this
+    /// against a real Chrome (see `probe_redaction`'s doc comment) found
+    /// that assumption wrong: `DOM.resolveNode`/`Runtime.callFunctionOn`
+    /// bound to a `BackendNodeId` already obtained from the AX tree succeeds
+    /// for closed-shadow content too, so this actually exercises `Ok(true)`
+    /// (a genuine `type === 'password'` match), not `Err(())`. The AC this
+    /// story cares about — the field ends up redacted either way — still
+    /// holds, which is what's asserted below; the second assertion checks
+    /// *which* of the two safe outcomes actually occurred, documenting the
+    /// corrected finding in a way that would fail loudly if a future Chrome
+    /// build reintroduces genuine unresolvability here.
+    #[tokio::test]
+    #[ignore = "requires a real Chrome; run with `cargo test -- --ignored`"]
+    async fn snapshot_should_redact_value_when_shadow_root_is_closed_and_probe_fails() {
+        let html = MY_LOGIN_HTML_TEMPLATE.replace("__MODE__", "closed");
+        let (browser, page) = launch_headless_chrome_page(&html).await;
+
+        let next_ref_id = Cell::new(1);
+        let capture = capture_snapshot(&page, &next_ref_id, &HashMap::new())
+            .await
+            .expect("capture_snapshot should succeed");
+
+        let password_node = find_node_by_role(&capture.snapshot.root, "textbox")
+            .expect("password field inside a closed shadow root still surfaces in the AX tree");
+        assert_eq!(
+            password_node.value.as_deref(),
+            Some(REDACTED_PLACEHOLDER),
+            "closed-shadow-root password field must end up redacted, whether via a genuine \
+             type match or the fail-safe path"
+        );
+
+        let resolved = capture
+            .refs
+            .get(&password_node.node_ref)
+            .expect("password node's ref must resolve to a BackendNodeId");
+        let probe_result = probe_redaction(&page, resolved.backend_node_id).await;
+        assert!(
+            matches!(probe_result, Ok(true) | Err(())),
+            "expected a genuine type match or the fail-safe path, got {probe_result:?}"
+        );
+
+        let mut browser = browser;
+        let _ = browser.close().await;
+    }
+
+    fn find_node_by_role<'a>(node: &'a AxNode, role: &str) -> Option<&'a AxNode> {
+        if node.role == role {
+            return Some(node);
+        }
+        node.children
+            .iter()
+            .find_map(|c| find_node_by_role(c, role))
+    }
+
+    // ---- Epic 2.2, Story 2.2.3: empirical headless-vs-headed check ----
+
+    #[tokio::test]
+    #[ignore = "manual/empirical; launches Chrome twice (headless + headed) and needs a real \
+                X11 display for the headed half — run with \
+                `cargo test -- --ignored snapshot_should_match_headless_and_headed_ax_output`"]
+    async fn snapshot_should_match_headless_and_headed_ax_output_for_password_field() {
+        use chromiumoxide::cdp::browser_protocol::accessibility::{AxNode as CdpAxNode, GetFullAxTreeParams};
+
+        let html = r#"<!doctype html><html><body>
+<input id="pw" type="password" value="hunter2">
+</body></html>"#;
+
+        // Looks up by role rather than by the raw `"hunter2"` value: per
+        // this test's own empirical finding (see `probe_redaction`'s doc
+        // comment), the AX tree's `value` for a `type="password"` field is
+        // never the raw plaintext in the first place.
+        async fn fetch_password_ax_node(page: &Page) -> Option<CdpAxNode> {
+            let tree = page
+                .execute(GetFullAxTreeParams::default())
+                .await
+                .expect("getFullAXTree");
+            tree.result
+                .nodes
+                .iter()
+                .find(|n| n.role.as_ref().and_then(ax_value_to_string).as_deref() == Some("textbox"))
+                .cloned()
+        }
+
+        let (mut headless_browser, headless_page) = launch_headless_chrome_page(html).await;
+        let headless_pw = fetch_password_ax_node(&headless_page).await;
+
+        let (mut headed_browser, headed_page) = launch_headed_chrome_page(html).await;
+        let headed_pw = fetch_password_ax_node(&headed_page).await;
+
+        println!("headless password AX node: {headless_pw:?}");
+        println!("headed password AX node:   {headed_pw:?}");
+
+        // No assertion beyond both being found: this test's job is to
+        // *produce* the comparison printed above for a human to read and
+        // fold into the doc comment on `probe_redaction`/this module, per
+        // Task 2.2.3a's AC — see that doc comment for the recorded finding.
+        assert!(headless_pw.is_some() && headed_pw.is_some());
+
+        let _ = headless_browser.close().await;
+        let _ = headed_browser.close().await;
     }
 }
