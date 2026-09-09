@@ -74,8 +74,12 @@ Large (3–6 weeks).
   `op` CLI invocation" — this is a login-flow-frequency operation, not a
   hot path. A resolved-value cache (e.g. via `keyring`) is a valid future
   optimization, not required for this pass.
-- **Scalability**: not applicable — single-user, single-daemon, one login
-  flow at a time per session.
+- **Scalability**: single-user, single-daemon, but concurrent multi-tab
+  resolution of the *same* credential is a real scenario (e.g. two tabs
+  both auto-triggering a login flow for the same domain) and must not
+  produce duplicate/racing vault lookups that risk 1Password rate limits —
+  in-flight requests for an identical `CredentialRef` are deduplicated so
+  concurrent callers share one vault round trip.
 - **Security classification**: confidential/regulated — this feature
   exists specifically to handle credentials and must not leak them.
 - **Data residency**: no special requirements (local-only daemon, no data
@@ -96,10 +100,15 @@ Large (3–6 weeks).
   (`crates/native/src/ax.rs`'s `build_tree`/`ax_value_to_string`, and the
   equivalent in `crates/wasm/src/glue/browser.js`), substitute a fixed
   placeholder for any node whose underlying DOM `type` attribute is
-  `password` — regardless of which tool call triggered the snapshot. This
-  necessarily also closes the pre-existing, credential-vault-unrelated leak
-  where a browser-autofilled password field's value was exposed by
-  `browser_snapshot` with zero vault involvement.
+  `password`, **or** whose `autocomplete` attribute is one of
+  `one-time-code`, `current-password`, `new-password` — regardless of which
+  tool call triggered the snapshot. The autocomplete-based key is required,
+  not optional: TOTP fields are conventionally `type="text"`, so a
+  `type`-only redaction key would leave the TOTP success metric above
+  unsatisfied. This necessarily also closes the pre-existing,
+  credential-vault-unrelated leak where a browser-autofilled password
+  field's value was exposed by `browser_snapshot` with zero vault
+  involvement.
 - Native adapter: `op read`/`op item get` via the existing `ProcessSpawner`
   port (`crates/native/src/spawn.rs`), using a 1Password **service account
   token** read once at daemon startup via `EnvPort` — not the user's
@@ -197,6 +206,18 @@ Large (3–6 weeks).
 - Standard request logging (already in place for other tools) is
   sufficient beyond the above; no new metrics/alerting infrastructure
   needed for a single-user local daemon.
+
+## Known Residual Risk
+- **Redaction covers the MCP transport, not the live page DOM.** "Never
+  appears in the MCP transport" (Success Metrics above) is not the same
+  guarantee as "never leaves the machine." `type_secret` still writes the
+  plaintext value into the page's live DOM (`this.value = text`) — any
+  script already running on that exact-host-matched page (site analytics,
+  an injected/XSS payload, a third-party embedded widget) has the same
+  read access to it that every password manager's autofill grants once a
+  value is typed. This is an accepted, named residual risk, not a gap this
+  feature closes. The calling LLM should avoid typing into fields on
+  pages/widgets it doesn't recognize as the login provider itself.
 
 ## Risk Control
 - The feature is inherently opt-in at the infrastructure level: the
