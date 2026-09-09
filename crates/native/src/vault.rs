@@ -246,14 +246,25 @@ async fn resolve_uncached<S: ProcessSpawner>(
     let cached = state.id_cache.borrow().get(domain).cloned();
     let (vault_id, item_id) = match cached {
         Some(ids) => ids,
-        None => {
-            let ids = state.lookup_domain(domain).await?;
-            state
-                .id_cache
-                .borrow_mut()
-                .insert(domain.to_string(), ids.clone());
-            ids
-        }
+        None => match state.lookup_domain(domain).await {
+            Ok(ids) => {
+                state
+                    .id_cache
+                    .borrow_mut()
+                    .insert(domain.to_string(), ids.clone());
+                ids
+            }
+            // A domain-lookup failure (mismatch/ambiguous) is just as
+            // audit-worthy as a successful resolve or an `op read`/`op item
+            // get` failure — without this early log, an uncached domain's
+            // rejection would silently skip the audit trail entirely (the
+            // `?`-early-return this replaces bypassed line ~283's log call).
+            Err(e) => {
+                let result = Err(e);
+                log_resolve_outcome(domain, credential_ref.field, &result);
+                return result;
+            }
+        },
     };
 
     let argv_owned = build_argv(credential_ref.field, &vault_id, &item_id);
@@ -708,6 +719,32 @@ mod tests {
                     1,
                     "no op read/op item get call should ever be made on a domain mismatch"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_credential_store_resolve_should_emit_log_line_when_uncached_domain_lookup_is_rejected(
+    ) {
+        // Regression test: an uncached domain's lookup failure used to
+        // early-return via `?` before reaching `log_resolve_outcome`,
+        // silently skipping the audit trail for exactly the rejection case
+        // Task 5.4.1's own AC names as the example (CredentialDomainMismatch).
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let spawner = FakeProcessSpawner::with_responses(vec![op_item_list_json(
+                    r#"{"id": "item1", "title": "Other Login", "vault": {"id": "vault1"}, "urls": [{"href": "https://other.example/login"}]}"#,
+                )]);
+                let store = NativeCredentialStore::new(spawner, "token".to_string());
+
+                TEST_LOG_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+                let _ = store.resolve(&password_ref("example.com")).await;
+                let lines = TEST_LOG_SINK.with(|s| s.borrow_mut().take().unwrap());
+
+                assert_eq!(lines.len(), 1, "domain-mismatch on an uncached domain must still be logged");
+                assert!(lines[0].contains("example.com"));
+                assert!(lines[0].contains("field=password"));
+                assert!(lines[0].contains("outcome=rejected-domain-mismatch"));
             })
             .await;
     }
