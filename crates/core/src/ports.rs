@@ -123,11 +123,27 @@ pub trait ProcessLock {
     async fn acquire_exclusive(&self, path: &str) -> Result<Self::Guard, LockError>;
 }
 
+/// The captured result of a `spawn_and_capture` invocation.
+pub struct ProcessOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+}
+
 pub trait ProcessSpawner {
     /// Spawns a detached `--daemon` process, redirecting its stdout/stderr to
     /// `log_path` (it has no controlling terminal once detached). Does not wait
     /// for the child; the daemon must outlive the spawning process.
     async fn spawn_daemon(&self, exe_hint: Option<&str>, log_path: &str) -> Result<(), PortError>;
+
+    /// Runs `argv[0]` with `argv[1..]` as literal arguments (never a shell
+    /// string — no `sh -c`), waits for it to exit, and returns its captured
+    /// stdout/stderr/exit code. Distinct from `spawn_daemon`, which is
+    /// fire-and-forget with no capture and a hardcoded `--daemon` arg — this
+    /// method exists specifically because `spawn_daemon` cannot serve `op`
+    /// invocations (confirmed: `architecture.md`'s re-verification note,
+    /// `pitfalls.md` §1a).
+    async fn spawn_and_capture(&self, argv: &[&str]) -> Result<ProcessOutput, PortError>;
 }
 
 pub trait EnvPort {
@@ -215,6 +231,15 @@ pub struct AxNode {
     /// the CDP AX node's own `value` property where present — lets a caller
     /// confirm typed text landed from `type_text`'s own returned snapshot
     /// without a follow-up `snapshot` call.
+    ///
+    /// Redaction key (shared by both the native and wasm adapters — the
+    /// mechanism each uses to read `type`/`autocomplete` differs, but the
+    /// rule must not): a value is replaced with `REDACTED_PLACEHOLDER` when
+    /// the underlying DOM node's `type` is `password`, or its `autocomplete`
+    /// is one of `one-time-code`, `current-password`, `new-password` — and,
+    /// when that determination can't be made with confidence (e.g. inside a
+    /// closed shadow root), the node is redacted anyway, never left in the
+    /// clear.
     pub value: Option<String>,
     pub children: Vec<AxNode>,
 }
