@@ -122,7 +122,12 @@ async fn fetch_ok<H: HttpClient>(http: &H, url: &str) -> Result<HttpResponse, Op
     }
 }
 
-fn same_host(a: &Url, b: &Url) -> bool {
+/// Dual-purpose exact-host-equality check: the SSRF guard's own-host
+/// crawl-boundary test (does a discovered link stay on the seed's host?),
+/// and, per ADR-002, the credential-domain guard's exact host-equality check
+/// in `credential.rs` — both intentionally share this one implementation
+/// rather than maintaining independent copies that could silently diverge.
+pub(crate) fn same_host(a: &Url, b: &Url) -> bool {
     a.host_str().is_some() && a.host_str() == b.host_str()
 }
 
@@ -1182,5 +1187,34 @@ mod read_saved_page_tests {
         .expect("search should succeed");
 
         assert_eq!(output.content, "");
+    }
+}
+
+#[cfg(test)]
+mod same_host_tests {
+    // Fully-qualified crate path rather than `use super::same_host` —
+    // exercises the same call shape the future `credential.rs` domain guard
+    // (Phase 5, ADR-002) will use, now that `same_host` is `pub(crate)`.
+    use crate::tools::webcrawl::same_host;
+    use url::Url;
+
+    #[test]
+    fn same_host_should_return_true_when_hosts_match_across_module_boundary() {
+        let a = Url::parse("https://example.com/login").unwrap();
+        let b = Url::parse("https://example.com/").unwrap();
+        assert!(same_host(&a, &b));
+    }
+
+    #[test]
+    fn same_host_should_normalize_ipv6_brackets_when_comparing_hosts() {
+        // `Url::host_str()` brackets IPv6 literals (`"[::1]"`); the two
+        // inputs below are the same address in compressed vs. fully expanded
+        // form, so this also confirms `url::Url` normalizes IPv6 hosts
+        // before `same_host` ever compares them — see the analogous
+        // allowlist comparison bug this guards against at
+        // `blocked_host_reason`'s `EnforceWithAllowlist` arm above.
+        let a = Url::parse("https://[::1]/login").unwrap();
+        let b = Url::parse("https://[0:0:0:0:0:0:0:1]/").unwrap();
+        assert!(same_host(&a, &b));
     }
 }
