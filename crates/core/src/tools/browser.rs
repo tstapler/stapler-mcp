@@ -22,8 +22,8 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::ports::{
-    AxNode, AxSnapshot, BrowserDriver, CredentialField, CredentialRef, FileStore, HistoryAction,
-    Locator, PortError, SessionId, TabAction, TabInfo, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, FileStore, HistoryAction, Locator, PortError, SessionId,
+    TabAction, TabInfo, WaitCondition,
 };
 use crate::schema::{
     AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput,
@@ -851,7 +851,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::ports::PageExtract;
+    use crate::ports::{CredentialField, CredentialRef, PageExtract};
     use crate::schema::BrowserFormField;
 
     struct FakeBrowserDriver {
