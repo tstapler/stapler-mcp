@@ -3616,6 +3616,8 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "stapler-mcp-core",
+ "tokio",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

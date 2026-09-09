@@ -7,6 +7,7 @@ mod js_util;
 mod lock;
 mod process;
 mod socket;
+mod vault;
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -48,7 +49,14 @@ pub async fn run_daemon() -> Result<(), JsValue> {
 
     let http = Rc::new(http::WasmHttp);
     let fsstore = Rc::new(fs::WasmFs);
-    let browser = Rc::new(browser::WasmBrowser);
+    let browser = Rc::new(browser::WasmBrowser::new());
+    // Phase 4/6 wiring (ADR-001): the daemon constructs the one
+    // `CredentialStore` adapter and injects it into `WasmBrowser` here, so
+    // `type_secret`'s internal `resolve()` call always goes through this
+    // single instance — required for ADR-003's in-flight dedup
+    // (`crates/wasm/src/glue/vault.js`'s `pending` map) to actually see
+    // every resolve request.
+    browser.set_credential_store(Rc::new(vault::WasmCredentialStore));
 
     let daemon = Daemon::new();
 

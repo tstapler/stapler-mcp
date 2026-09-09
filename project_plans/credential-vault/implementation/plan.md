@@ -136,6 +136,30 @@ plan does not deviate from that.
 
 ## Risk Control
 
+- **Known residual risk — redaction stops at the MCP transport.** Structural
+  redaction (Phase 2) and `type_secret`'s never-in-request/never-in-response
+  guarantee cover the MCP transport (request payload and `AxSnapshot`
+  responses) only. They do not, and cannot, prevent a script already running
+  on the exact-host-matched page (site analytics, an injected/XSS payload, a
+  third-party embedded widget) from reading the value out of the live DOM
+  the instant `type_secret` writes it via `this.value = text` — the same
+  exposure every password manager's browser autofill accepts. This is an
+  accepted, named risk (see requirements.md's Known Residual Risk section),
+  not a gap Phase 2/3/4 are meant to close, and every acceptance test in
+  this plan can report green while it applies.
+- **Known pre-existing gap — "same wire shape" success metric is scoped to
+  redaction parity, not full value-population parity.** Wasm's
+  `AxNode.value` is `None` for every textbox-like node today (`browser.js`'s
+  `parseAriaSnapshot` never sets it), independent of this project — a
+  pre-existing native/wasm parity gap. This plan closes the parity gap that
+  matters for security (both adapters now redact the same fields the same
+  way — Story 2.3.1/7.1.4's cross-adapter fixture proves `PortError`
+  discriminant and redaction-key parity), but does not add general
+  non-secret value population on wasm. `requirements.md`'s "identical wire
+  protocol" success metric should be read as scoped to the redaction
+  behavior this feature adds, not as a claim that this plan closes the
+  pre-existing value-population gap; that gap is tracked separately, out of
+  scope here.
 - **Feature flag**: Infrastructure-level opt-in, not a config toggle.
   `CredentialStore` is only constructed at daemon startup if
   `OP_SERVICE_ACCOUNT_TOKEN` is present via `EnvPort`
@@ -168,11 +192,31 @@ plan does not deviate from that.
       §7 flags this as UNVERIFIED. Blocks Story 3.3.1 — owner: implementer,
       spike against a real (or sufessufficiently large test) vault before
       writing the final filtering logic.
-- [ ] Whether `@1password/sdk` actually instantiates and resolves inside this
+- [x] Whether `@1password/sdk` actually instantiates and resolves inside this
       project's real wasm/Node host without wasm-in-wasm-glue nesting issues
       — `pitfalls.md` §4a/4b, UNVERIFIED. Blocks Phase 4 entirely — owner:
       implementer, resolved by Task 4.1.1's spike before any further Phase 4
       work proceeds.
+      **Task 4.1.1 spike result (GO)**: `@1password/sdk@0.5.0` installed in
+      `npm/package.json` and `require()`d via the project's own Node host /
+      `NODE_PATH=npm/node_modules` resolution (the same resolution
+      `crates/wasm/src/glue/vault.js` will use). `@1password/sdk` depends on
+      `@1password/sdk-core`, itself a `wasm-bindgen`-generated Rust module
+      (`nodejs/core.js` + `nodejs/core_bg.wasm`) — i.e. the exact
+      wasm-in-wasm-glue shape §4a/4b worried about, confirmed by inspecting
+      `npm/node_modules/@1password/sdk-core/package.json`. **Verified**:
+      `require("@1password/sdk")` loads cleanly, `createClient({...})`
+      constructs and its internal `WasmCore` actually runs (a dummy/malformed
+      service-account token is decoded and validated *inside* the wasm core,
+      producing a clean, well-formed JS `Error` — "invalid service account
+      token ... base64 decoding failed" — not a wasm trap, memory-corruption
+      panic, or module-loading/duplicate-instance error). This sandbox has no
+      `OP_SERVICE_ACCOUNT_TOKEN` and no real 1Password vault, so a live
+      `client.items.get()`/`client.secrets.resolve()` call against real data
+      **could not be verified** end-to-end. No nesting conflict of any kind
+      was observed across two separate attempts (a placeholder string token
+      and a base64-well-formed-but-fake token) — go/no-go: **GO**, proceed to
+      Epic 4.2/4.3.
 - [ ] Whether `op service-account ratelimit` (or an equivalent diagnostic)
       reliably yields a retry-after duration in practice, or whether
       `CredentialRateLimited`'s message must fall back to an unknown-delay
@@ -1175,10 +1219,16 @@ with extra steps (per the chosen refuse-not-permit policy).
   (`features.md` §2.3's SPA-re-render concern), accepting the minor cost of
   an occasional already-completed `resolve()` call going unused when the
   field turns out to be the wrong shape — cheaper than reordering and
-  reopening the TOCTOU gap this check exists to close. For `field ==
+  reopening the TOCTOU gap this check exists to close. This check must
+  accept exactly the same key as structural redaction's (requirements.md's
+  "Structural snapshot redaction" bullet, widened during Phase 4 validation
+  to also cover autocomplete-keyed fields, closing the TOTP-field redaction
+  gap) — a narrower dispatch-time check would refuse writes that structural
+  redaction would have correctly redacted anyway. For `field ==
   CredentialField::Totp`, accept `autocomplete == "one-time-code"` OR `type
   == "password"`; for `field` in `{CredentialField::Password,
-  CredentialField::Username}`, require `type == "password"` —
+  CredentialField::Username}`, accept `type == "password"` OR
+  `autocomplete` in `{"current-password", "new-password"}` —
   refuse otherwise by returning `PortError::NotActionable` (the existing
   variant, whose doc comment already covers "a resolved element failed a
   click/type actionability check... the ref itself is still valid" — broaden
