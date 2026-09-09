@@ -1404,3 +1404,155 @@ async fn snapshot_should_include_iframe_content_when_same_origin_iframe_present(
     .await
     .expect("shutdown call should succeed");
 }
+
+/// plan.md Epic 6.1 / Story 6.1.1's opt-out AC, exercised end-to-end against
+/// the real `stapler-mcp` binary (Task 6.1.2c's own Files note points here).
+/// `crates/cli/src/main.rs`'s own `credential_wiring_tests` module already
+/// covers the identical assertion as a fast Unit test against the extracted
+/// handler in isolation (validation.md's `daemon_should_return_vault_not_configured_error_when_op_service_account_token_unset`
+/// row) — this test instead proves the *real* `run_daemon` wiring produces
+/// the same result, so it's named with an `_over_real_daemon` suffix rather
+/// than reusing the exact same name across two files.
+#[tokio::test]
+#[ignore]
+async fn daemon_should_return_vault_not_configured_error_when_op_service_account_token_unset_over_real_daemon(
+) {
+    std::env::remove_var("OP_SERVICE_ACCOUNT_TOKEN");
+    let (_tmp, socket, sock_path) = start_daemon(true).await;
+    let (site_url, shutdown_site) = spawn_mock_site().await;
+
+    let navigate_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_navigate",
+        Some(json!({ "url": site_url })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_navigate should succeed");
+    let session_id = navigate_result["sessionId"]
+        .as_str()
+        .expect("sessionId present")
+        .to_string();
+    let name_input = find_node(&navigate_result["snapshot"]["root"], &|n| {
+        n["role"] == "textbox"
+    })
+    .unwrap_or_else(|| panic!("expected a textbox node, got: {navigate_result:?}"));
+    let name_ref = name_input["ref"].as_str().expect("textbox ref").to_string();
+
+    let result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_type_secret",
+        Some(json!({
+            "sessionId": session_id,
+            "refId": name_ref,
+            "credential": { "domain": "127.0.0.1", "field": "password" }
+        })),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let err = result.expect_err("no token configured should always error, never succeed");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains(
+            "vault not configured: set OP_SERVICE_ACCOUNT_TOKEN in the daemon's environment and restart"
+        ),
+        "got: {rendered}"
+    );
+
+    let _ = shutdown_site.send(());
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
+}
+
+/// plan.md Epic 6.1 / Story 6.1.1's opt-in AC (validation.md's
+/// `daemon_should_reach_native_credential_store_when_op_service_account_token_set_and_type_secret_called`
+/// row): with the token present, `stapler_browser_type_secret` must reach
+/// `NativeBrowser::type_secret`'s injected `NativeCredentialStore::resolve`
+/// rather than short-circuiting to the not-configured error. `resolve()`
+/// itself shells out to the real `op` CLI (`crates/native/src/vault.rs`), so
+/// this test also requires `op` on `PATH` (already true of every machine
+/// this suite's other real-Chromium `#[ignore]`d tests assume). The token
+/// `"invalid-token-for-testing"` is deliberately malformed so `op` rejects it
+/// locally (`failed to DecodeSACredentials: failed to parseToken, format is
+/// invalid`, confirmed manually) without any network round trip — fast and
+/// deterministic regardless of the test machine's real 1Password state,
+/// since `NativeSpawner::spawn_and_capture` clears the child's environment
+/// down to just `OP_SERVICE_ACCOUNT_TOKEN`/`PATH`. The exact failure mode
+/// doesn't matter for this AC — only that it differs from the fixed
+/// not-configured message, proving the call actually reached the injected
+/// store instead of being rejected before ever touching it.
+#[tokio::test]
+#[ignore]
+async fn daemon_should_reach_native_credential_store_when_op_service_account_token_set_and_type_secret_called(
+) {
+    std::env::set_var("OP_SERVICE_ACCOUNT_TOKEN", "invalid-token-for-testing");
+    let (_tmp, socket, sock_path) = start_daemon(true).await;
+    let (site_url, shutdown_site) = spawn_mock_site().await;
+
+    let navigate_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_navigate",
+        Some(json!({ "url": site_url })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_navigate should succeed");
+    let session_id = navigate_result["sessionId"]
+        .as_str()
+        .expect("sessionId present")
+        .to_string();
+    let name_input = find_node(&navigate_result["snapshot"]["root"], &|n| {
+        n["role"] == "textbox"
+    })
+    .unwrap_or_else(|| panic!("expected a textbox node, got: {navigate_result:?}"));
+    let name_ref = name_input["ref"].as_str().expect("textbox ref").to_string();
+
+    let result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_type_secret",
+        Some(json!({
+            "sessionId": session_id,
+            "refId": name_ref,
+            // The mock site binds to 127.0.0.1, so this domain passes
+            // `check_credential_domain`'s live-URL gate and reaches
+            // `resolve()`.
+            "credential": { "domain": "127.0.0.1", "field": "password" }
+        })),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let err = result.expect_err("an invalid op token must not resolve a real secret");
+    let rendered = format!("{err}");
+    assert!(
+        !rendered.contains(
+            "vault not configured: set OP_SERVICE_ACCOUNT_TOKEN in the daemon's environment and restart"
+        ),
+        "expected the call to reach the injected NativeCredentialStore (a non-not-configured \
+         error), got the not-configured error instead: {rendered}"
+    );
+
+    std::env::remove_var("OP_SERVICE_ACCOUNT_TOKEN");
+    let _ = shutdown_site.send(());
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
+}
