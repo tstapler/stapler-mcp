@@ -466,9 +466,92 @@ function capSnapshotNodes(root, maxNodes) {
 }
 module.exports.capSnapshotNodes = capSnapshotNodes;
 
+// ---------------------------------------------------------------------------
+// Structural snapshot redaction (Epic 2.3): Playwright's `ariaSnapshot()`
+// text carries no `type`/`autocomplete` attribute at all, so redaction
+// parity with native (`crates/core/src/ports.rs`'s `AxNode.value` doc
+// comment states the shared key) requires a second `page.evaluate()` pass
+// over the live DOM, merged into the tree `parseAriaSnapshot` already built.
+
+// Same fixed, non-length-preserving sentinel as native's
+// `REDACTED_PLACEHOLDER` (`crates/core/src/ports.rs`) — duplicated here
+// because JS glue can't import a Rust const, the same reason `isBlockedHost`
+// above duplicates `webcrawl.rs`'s SSRF logic instead of calling into it.
+const REDACTED_PLACEHOLDER = "[REDACTED]";
+module.exports.REDACTED_PLACEHOLDER = REDACTED_PLACEHOLDER;
+
+// Role(s) `ariaSnapshot()` emits for a bare `<input>`/`<textarea>` — the
+// fail-safe half of the redaction rule below only applies to nodes that look
+// like a form control in the first place; a button or generic container with
+// no live-DOM entry is not a secret-shaped node and must not be redacted.
+const FORM_CONTROL_ROLES = new Set(["textbox"]);
+
+// Live-DOM collection pass (Task 2.3.1a/2.3.2a): walks `document` and every
+// open shadow root — recursively, since `querySelectorAll` never crosses a
+// shadow boundary on its own — collecting `{ref, redact}` for every
+// `input`/`textarea`. Mirrors native's single-combined-check shape: one
+// predicate per element, no separate type/autocomplete round trips.
+function collectRedactionInfo(page) {
+    return page.evaluate(() => {
+        function shouldRedact(el) {
+            return (
+                el.type === "password" ||
+                ["one-time-code", "current-password", "new-password"].includes(el.autocomplete)
+            );
+        }
+        function walk(root, out) {
+            for (const el of root.querySelectorAll("*")) {
+                if (el.matches("input, textarea")) {
+                    out.push({ ref: el.getAttribute("aria-ref") || null, redact: shouldRedact(el) });
+                }
+                // Open shadow root only (Task 2.3.2a) — a closed root's
+                // `shadowRoot` property is `null` by spec, so this walk
+                // simply can't descend into it; that's exactly the
+                // fail-safe boundary `mergeRedactionInfo` relies on below.
+                if (el.shadowRoot) {
+                    walk(el.shadowRoot, out);
+                }
+            }
+        }
+        const out = [];
+        walk(document, out);
+        return out;
+    });
+}
+module.exports.collectRedactionInfo = collectRedactionInfo;
+
+// Merges `collectRedactionInfo`'s live-DOM pass into the tree
+// `parseAriaSnapshot` already built (Task 2.3.1b): substitutes
+// `REDACTED_PLACEHOLDER` for any node whose `ref` matches a `redact: true`
+// entry, and — the fail-safe half of the same rule, matching native's
+// `AxNode.value` doc comment — for any form-control-looking node with no
+// matching entry at all (removed between the two passes, or hidden behind a
+// closed shadow root the live-DOM pass couldn't see into: "can't confirm
+// it's safe" redacts rather than leaking).
+function mergeRedactionInfo(root, redactionInfo) {
+    const byRef = new Map();
+    for (const info of redactionInfo) {
+        if (info.ref) {
+            byRef.set(info.ref, info.redact);
+        }
+    }
+    function visit(node) {
+        if (FORM_CONTROL_ROLES.has(node.role) && byRef.get(node.ref) !== false) {
+            node.value = REDACTED_PLACEHOLDER;
+        }
+        for (const child of node.children) {
+            visit(child);
+        }
+    }
+    visit(root);
+}
+module.exports.mergeRedactionInfo = mergeRedactionInfo;
+
 async function captureSnapshot(page) {
     const text = await page.ariaSnapshot();
     const root = parseAriaSnapshot(text);
+    const redactionInfo = await collectRedactionInfo(page);
+    mergeRedactionInfo(root, redactionInfo);
     const truncated = capSnapshotNodes(root, MAX_SNAPSHOT_NODES);
     return { root, url: page.url(), truncated };
 }

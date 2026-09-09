@@ -368,6 +368,7 @@ test("jsCloseBrowser_should_clear_reaper_interval_and_sessions_when_reaper_was_r
         goto: async () => {},
         url: () => "https://example.com/",
         ariaSnapshot: async () => "",
+        evaluate: async () => [],
     };
     const fakeBrowser = {
         newPage: async () => fakePage,
@@ -423,6 +424,7 @@ test("jsBrowserNavigate_should_clear_blocked_flag_when_reused_session_navigates_
             goto: async () => {},
             url: () => "https://example.com/safe",
             ariaSnapshot: async () => '- text "hi"',
+            evaluate: async () => [],
         },
         lastUsed: Date.now() - 1000,
         blocked: browserGlue.blockedHostMessage(id, "127.0.0.1"),
@@ -605,6 +607,7 @@ test("jsBrowserSnapshot_should_set_truncated_true_when_aria_snapshot_exceeds_nod
         page: {
             url: () => "https://example.com/",
             ariaSnapshot: async () => lines.join("\n"),
+            evaluate: async () => [],
         },
         lastUsed: Date.now(),
         blocked: undefined,
@@ -668,6 +671,10 @@ function makeMockPage(overrides = {}) {
         }),
         keyboard: { press: async () => {} },
         ariaSnapshot: async () => '- text "hi"',
+        // Default: no redactable fields on the live DOM (Epic 2.3's
+        // `collectRedactionInfo` pass) — tests exercising redaction itself
+        // override this via `overrides`.
+        evaluate: async () => [],
         getByText: () => ({
             first: () => ({
                 waitFor: async () => {},
@@ -1153,4 +1160,170 @@ test("jsBrowserResize_should_set_viewport_size_and_return_snapshot", async () =>
     assert.ok(snapshot.root);
 
     browserGlue.sessions.delete(id);
+});
+
+// ---------------------------------------------------------------------------
+// Epic 2.3 (credential-vault): structural snapshot redaction. Playwright's
+// `page.ariaSnapshot()` text carries no `type`/`autocomplete` attribute at
+// all, so `captureSnapshot` merges in a second `page.evaluate()` pass
+// (`collectRedactionInfo`) keyed by `ref`, with the identical redaction key
+// and fail-safe rule as native's `AxNode.value` doc comment
+// (`crates/core/src/ports.rs`): redact on `type === "password"` or
+// `autocomplete` in `one-time-code`/`current-password`/`new-password`, and
+// fail-safe-redact any textbox-like node the live-DOM pass couldn't resolve
+// at all.
+
+test("capture_snapshot_should_redact_value_when_dom_type_is_password", async () => {
+    const id = "sess-redact-password-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Password" [ref=e3]',
+            evaluate: async () => [{ ref: "e3", redact: true }],
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.ref, "e3");
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("capture_snapshot_should_redact_value_when_dom_autocomplete_is_one_time_code", async () => {
+    const id = "sess-redact-otc-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Code" [ref=e5]',
+            evaluate: async () => [{ ref: "e5", redact: true }],
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("capture_snapshot_should_leave_value_unset_when_dom_pass_reports_ordinary_text_field", async () => {
+    const id = "sess-redact-ordinary-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Name" [ref=e7]',
+            evaluate: async () => [{ ref: "e7", redact: false }],
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, undefined);
+
+    browserGlue.sessions.delete(id);
+});
+
+// Fail-safe (Task 2.3.1b): a node the aria-snapshot parse assigned a
+// form-control role but which the live-DOM `evaluate()` pass could not find
+// at all (e.g. removed between the two calls) must be redacted rather than
+// left as whatever `ariaSnapshot()` reported — "can't confirm it's safe"
+// redacts, it never leaks.
+test("capture_snapshot_should_redact_value_when_textbox_ref_missing_from_live_dom_pass", async () => {
+    const id = "sess-redact-missing-ref-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Password" [ref=e3]',
+            evaluate: async () => [], // live DOM pass found nothing for e3
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+// Fail-safe (Task 2.3.2b): a closed shadow root is invisible to
+// `collectRedactionInfo`'s `querySelectorAll` walk by spec (`el.shadowRoot`
+// is `null` for closed roots) — the same asymmetry `pitfalls.md` §3c
+// documents for CDP, since browser accessibility trees generally do reflect
+// closed-shadow content even when JS can't query it directly. This is an
+// accepted parity constraint, not a gap: the field still ends up redacted
+// via the same missing-ref fail-safe rule as above.
+test("capture_snapshot_should_redact_value_when_closed_shadow_root_hides_password_field_from_live_dom_pass", async () => {
+    const id = "sess-redact-closed-shadow-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            // ariaSnapshot() reflects the closed-shadow-root textbox even
+            // though collectRedactionInfo's JS-side walk below cannot see it.
+            ariaSnapshot: async () => '- textbox "Password" [ref=e9]',
+            evaluate: async () => [], // closed shadow root: invisible to querySelectorAll
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+// Exercises `collectRedactionInfo`'s actual recursive walk (not just
+// `captureSnapshot`'s merge) by installing a minimal fake `document` global
+// and letting the real closure run against it — `page.evaluate` in
+// production serializes this same function into the page, so invoking it
+// directly here (rather than stubbing `page.evaluate`'s return value, as the
+// tests above do) is what actually proves the open-shadow-root recursion
+// (Task 2.3.2a) works, not just that `captureSnapshot` trusts its input.
+test("collect_redaction_info_should_find_password_field_when_shadow_root_is_open", async () => {
+    const originalDocument = global.document;
+    try {
+        const passwordInput = {
+            matches: (selector) => selector === "input, textarea",
+            getAttribute: (name) => (name === "aria-ref" ? "e9" : null),
+            type: "password",
+            autocomplete: "",
+            shadowRoot: null,
+        };
+        const openShadowRoot = {
+            querySelectorAll: () => [passwordInput],
+        };
+        const hostElement = {
+            matches: () => false,
+            getAttribute: () => null,
+            type: undefined,
+            autocomplete: "",
+            shadowRoot: openShadowRoot,
+        };
+        global.document = {
+            querySelectorAll: () => [hostElement],
+        };
+
+        const page = { evaluate: (fn) => Promise.resolve(fn()) };
+
+        const info = await browserGlue.collectRedactionInfo(page);
+
+        assert.deepStrictEqual(info, [{ ref: "e9", redact: true }]);
+    } finally {
+        if (originalDocument === undefined) {
+            delete global.document;
+        } else {
+            global.document = originalDocument;
+        }
+    }
 });
