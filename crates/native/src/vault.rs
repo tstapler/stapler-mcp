@@ -13,6 +13,8 @@ use stapler_mcp_core::ports::{
     CredentialField, CredentialRef, CredentialStore, PortError, ProcessOutput, ProcessSpawner,
     SecretValue,
 };
+use stapler_mcp_core::tools::webcrawl::same_host;
+use url::Url;
 
 /// One waiter's view of an in-flight `op` call. `Rc`-wrapped on both sides
 /// (never a bare `Result<SecretValue, PortError>`) because `Shared`'s
@@ -50,20 +52,108 @@ struct State<S: ProcessSpawner> {
 }
 
 impl<S: ProcessSpawner> State<S> {
-    // TODO(Epic 3.3): implement the real domain lookup — `op item list
-    // --categories Login --format json`, filtered by the shared `same_host`
-    // helper (Epic 1.4) matching each item's `urls[].href` host against
-    // `domain`. Zero matches -> `PortError::CredentialDomainMismatch`; more
-    // than one -> `PortError::CredentialAmbiguous` (candidate titles,
-    // comma-separated); exactly one -> `Ok((vault_id, item_id))`. This stub
-    // keeps a synchronous signature only so the crate compiles for this
-    // epic's isolated testing — the real implementation will need
-    // `spawn_and_capture`, so Epic 3.3 will likely need to make this an
-    // `async fn` (and thread that change through `resolve_uncached` below).
-    fn lookup_domain(&self, domain: &str) -> Result<(String, String), PortError> {
-        let _ = domain;
-        todo!("Epic 3.3: op item list --categories Login --format json, filtered by same_host")
+    /// Lists Login-category vault items and filters them to `domain` by
+    /// exact host equality (`same_host`, shared with the webcrawl SSRF guard
+    /// per ADR-002). Zero matches is a `CredentialDomainMismatch`; more than
+    /// one is `CredentialAmbiguous` naming every candidate title
+    /// (`domain`/`field` alone can't disambiguate further, `ux.md` §4
+    /// example-2 — there is no item-id field on `CredentialRef` for the
+    /// caller to narrow with). Exactly one match returns its `(vault_id,
+    /// item_id)`; `resolve_uncached` is the one that actually populates
+    /// `id_cache` with it.
+    async fn lookup_domain(&self, domain: &str) -> Result<(String, String), PortError> {
+        let output = self
+            .spawner
+            .spawn_and_capture(&["op", "item", "list", "--categories", "Login", "--format", "json"])
+            .await?;
+
+        let stdout = match output {
+            ProcessOutput {
+                stdout,
+                exit_code: 0,
+                ..
+            } => stdout,
+            ProcessOutput { stderr, .. } => return Err(build_op_error(&self.spawner, &stderr).await),
+        };
+
+        // A bare host has no scheme; `same_host` only compares `Url::host_str()`,
+        // so the scheme itself is never meaningful here.
+        let target = Url::parse(&format!("https://{domain}"))
+            .map_err(|_| PortError::Other(format!("invalid domain \"{domain}\"")))?;
+
+        let matches = parse_matching_items(&stdout, &target)?;
+        pick_unique_match(domain, matches)
     }
+}
+
+/// Resolves a domain's candidate list down to exactly one `(vault_id,
+/// item_id)`, or the corresponding `ux.md` §4 example-1/example-2 rejection.
+fn pick_unique_match(
+    domain: &str,
+    mut matches: Vec<(String, String, String)>,
+) -> Result<(String, String), PortError> {
+    match matches.len() {
+        0 => Err(PortError::CredentialDomainMismatch(format!(
+            "no vault entry for domain \"{domain}\" — not typed"
+        ))),
+        1 => {
+            let (vault_id, item_id, _title) = matches.remove(0);
+            Ok((vault_id, item_id))
+        }
+        n => {
+            let titles = matches
+                .into_iter()
+                .map(|(_, _, title)| title)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(PortError::CredentialAmbiguous(format!(
+                "{n} vault items match domain \"{domain}\" — ambiguous, not typed. Ask the user which item to use, or scope the request further. Candidates: {titles}"
+            )))
+        }
+    }
+}
+
+/// Parses `op item list --format json`'s array, returning `(vault_id,
+/// item_id, title)` for every item with at least one `urls[].href` whose
+/// host exactly matches `target` (`same_host`). An item missing `id` or
+/// `vault.id`, or whose every `href` fails to parse as a URL, is skipped as
+/// a non-match rather than failing the whole lookup — `op`'s JSON shape for
+/// a well-formed Login item is stable, but one malformed record shouldn't
+/// abort every other candidate's evaluation.
+fn parse_matching_items(
+    stdout: &[u8],
+    target: &Url,
+) -> Result<Vec<(String, String, String)>, PortError> {
+    let items: Vec<serde_json::Value> = serde_json::from_slice(stdout)
+        .map_err(|_| PortError::Other("op item list: could not parse JSON output".to_string()))?;
+
+    Ok(items
+        .into_iter()
+        .filter(|item| item_matches_domain(item, target))
+        .filter_map(|item| {
+            let vault_id = item.get("vault")?.get("id")?.as_str()?.to_string();
+            let item_id = item.get("id")?.as_str()?.to_string();
+            let title = item
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("<untitled>")
+                .to_string();
+            Some((vault_id, item_id, title))
+        })
+        .collect())
+}
+
+fn item_matches_domain(item: &serde_json::Value, target: &Url) -> bool {
+    item.get("urls")
+        .and_then(|urls| urls.as_array())
+        .is_some_and(|urls| {
+            urls.iter().any(|u| {
+                u.get("href")
+                    .and_then(|h| h.as_str())
+                    .and_then(|href| Url::parse(href).ok())
+                    .is_some_and(|url| same_host(&url, target))
+            })
+        })
 }
 
 pub struct NativeCredentialStore<S: ProcessSpawner> {
@@ -157,7 +247,7 @@ async fn resolve_uncached<S: ProcessSpawner>(
     let (vault_id, item_id) = match cached {
         Some(ids) => ids,
         None => {
-            let ids = state.lookup_domain(domain)?;
+            let ids = state.lookup_domain(domain).await?;
             state
                 .id_cache
                 .borrow_mut()
@@ -524,9 +614,10 @@ mod tests {
     ) {
         tokio::task::LocalSet::new()
             .run_until(async {
-                // `lookup_domain` is Epic 3.3's `todo!()` stub — if the cache
-                // check above it were broken, this call would panic instead
-                // of returning a value, failing this test loudly.
+                // Only one queued response: if the cache check above were
+                // broken, `lookup_domain` would issue its own `op item list`
+                // call and this test would fail on the call-count assertion
+                // below (or panic on an empty `FakeProcessSpawner` queue).
                 let spawner = FakeProcessSpawner::with_responses(vec![ok_output("hunter2\n")]);
                 let store = NativeCredentialStore::new(spawner, "token".to_string());
                 seed_cache(&store, "example.com", "v1", "i1");
@@ -553,6 +644,103 @@ mod tests {
 
         let cached = store.state.id_cache.borrow().get("example.com").cloned();
         assert_eq!(cached, Some(("vault1".to_string(), "item1".to_string())));
+    }
+
+    // -- Story 3.3.1: domain-scoped lookup + disambiguation --
+
+    fn op_item_list_json(items: &str) -> Result<ProcessOutput, PortError> {
+        ok_output(&format!("[{items}]\n"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_credential_store_resolve_should_populate_cache_when_exactly_one_item_matches_domain(
+    ) {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let spawner = FakeProcessSpawner::with_responses(vec![
+                    op_item_list_json(
+                        r#"{"id": "item1", "title": "Example Login", "vault": {"id": "vault1"}, "urls": [{"href": "https://example.com/login"}]}"#,
+                    ),
+                    ok_output("hunter2\n"),
+                ]);
+                let store = NativeCredentialStore::new(spawner, "token".to_string());
+
+                let secret = store
+                    .resolve(&password_ref("example.com"))
+                    .await
+                    .expect("exactly one matching item should resolve");
+
+                assert_eq!(secret.expose(), "hunter2");
+                assert_eq!(
+                    store.state.id_cache.borrow().get("example.com").cloned(),
+                    Some(("vault1".to_string(), "item1".to_string()))
+                );
+                let calls = store.state.spawner.calls.borrow();
+                assert_eq!(calls.len(), 2, "list-and-filter, then the actual op read");
+                assert_eq!(
+                    calls[0],
+                    vec!["op", "item", "list", "--categories", "Login", "--format", "json"]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_credential_store_resolve_should_return_credential_domain_mismatch_when_no_item_matches_domain(
+    ) {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let spawner = FakeProcessSpawner::with_responses(vec![op_item_list_json(
+                    r#"{"id": "item1", "title": "Other Login", "vault": {"id": "vault1"}, "urls": [{"href": "https://other.example/login"}]}"#,
+                )]);
+                let store = NativeCredentialStore::new(spawner, "token".to_string());
+
+                let err = store.resolve(&password_ref("example.com")).await.unwrap_err();
+
+                match err {
+                    PortError::CredentialDomainMismatch(msg) => {
+                        assert!(msg.contains("example.com"), "msg = {msg}");
+                    }
+                    other => panic!("expected CredentialDomainMismatch, got {other:?}"),
+                }
+                assert_eq!(
+                    store.state.spawner.calls.borrow().len(),
+                    1,
+                    "no op read/op item get call should ever be made on a domain mismatch"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_credential_store_resolve_should_return_credential_ambiguous_with_both_titles_when_two_items_match_domain(
+    ) {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let spawner = FakeProcessSpawner::with_responses(vec![op_item_list_json(
+                    r#"
+                    {"id": "item1", "title": "Example Login A", "vault": {"id": "vault1"}, "urls": [{"href": "https://example.com/a"}]},
+                    {"id": "item2", "title": "Example Login B", "vault": {"id": "vault2"}, "urls": [{"href": "https://example.com/b"}]}
+                    "#,
+                )]);
+                let store = NativeCredentialStore::new(spawner, "token".to_string());
+
+                let err = store.resolve(&password_ref("example.com")).await.unwrap_err();
+
+                match err {
+                    PortError::CredentialAmbiguous(msg) => {
+                        assert!(msg.contains("Example Login A"), "msg = {msg}");
+                        assert!(msg.contains("Example Login B"), "msg = {msg}");
+                    }
+                    other => panic!("expected CredentialAmbiguous, got {other:?}"),
+                }
+                assert_eq!(
+                    store.state.spawner.calls.borrow().len(),
+                    1,
+                    "no op read/op item get call should ever be made on an ambiguous match"
+                );
+            })
+            .await;
     }
 
     // -- Story 3.2.5: in-flight dedup --

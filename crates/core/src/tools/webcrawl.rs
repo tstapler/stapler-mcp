@@ -125,9 +125,12 @@ async fn fetch_ok<H: HttpClient>(http: &H, url: &str) -> Result<HttpResponse, Op
 /// Dual-purpose exact-host-equality check: the SSRF guard's own-host
 /// crawl-boundary test (does a discovered link stay on the seed's host?),
 /// and, per ADR-002, the credential-domain guard's exact host-equality check
-/// in `credential.rs` — both intentionally share this one implementation
-/// rather than maintaining independent copies that could silently diverge.
-pub(crate) fn same_host(a: &Url, b: &Url) -> bool {
+/// in `crates/native/src/vault.rs`'s `lookup_domain` (Epic 3.3) — both
+/// intentionally share this one implementation rather than maintaining
+/// independent copies that could silently diverge. `pub` (not `pub(crate)`)
+/// so the `native` crate can call it, mirroring `blocked_host_reason`'s and
+/// `NetworkPolicy`'s existing cross-crate visibility below.
+pub fn same_host(a: &Url, b: &Url) -> bool {
     a.host_str().is_some() && a.host_str() == b.host_str()
 }
 
@@ -1193,8 +1196,9 @@ mod read_saved_page_tests {
 #[cfg(test)]
 mod same_host_tests {
     // Fully-qualified crate path rather than `use super::same_host` —
-    // exercises the same call shape the future `credential.rs` domain guard
-    // (Phase 5, ADR-002) will use, now that `same_host` is `pub(crate)`.
+    // exercises the same call shape `crates/native/src/vault.rs`'s
+    // `lookup_domain` (Epic 3.3, ADR-002) now uses, now that `same_host` is
+    // `pub`.
     use crate::tools::webcrawl::same_host;
     use url::Url;
 
