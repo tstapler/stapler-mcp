@@ -1283,6 +1283,39 @@ test("capture_snapshot_should_redact_value_when_closed_shadow_root_hides_passwor
     browserGlue.sessions.delete(id);
 });
 
+// ---------------------------------------------------------------------------
+// Phase 7, Story 7.1.2: the literal acceptance test `requirements.md`'s
+// Success Metrics section names — "verified by a test that autofills a
+// password field out-of-band and then calls `stapler_browser_snapshot`."
+// Mocks `page.evaluate()` the same way the redaction tests above do; a real
+// password-manager/browser autofill write reaches the live DOM through the
+// same mechanism a scripted `evaluate()` call does (never through
+// `jsBrowserTypeSecret`), so `collectRedactionInfo` reporting `redact: true`
+// for the field's ref is exactly what this scenario looks like from
+// `captureSnapshot`'s side — this test's job is to prove the resulting
+// snapshot value is redacted regardless.
+test("snapshot_should_redact_value_when_field_was_autofilled_out_of_band", async () => {
+    const id = "sess-autofill-redact-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Password" [ref=e3]',
+            // Live-DOM redaction pass reports this ref as redact:true,
+            // standing in for a password-manager/browser autofill write via
+            // CDP/page.evaluate() that never went through jsBrowserTypeSecret.
+            evaluate: async () => [{ ref: "e3", redact: true }],
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
 // Exercises `collectRedactionInfo`'s actual recursive walk (not just
 // `captureSnapshot`'s merge) by installing a minimal fake `document` global
 // and letting the real closure run against it — `page.evaluate` in

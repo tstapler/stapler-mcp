@@ -459,6 +459,7 @@ fn log_resolve_outcome(domain: &str, field: CredentialField, result: &Result<Sec
 mod tests {
     use std::collections::VecDeque;
 
+    use chromiumoxide::Page;
     use tokio::sync::Notify;
 
     use super::*;
@@ -917,6 +918,229 @@ mod tests {
                 assert_eq!(lines.len(), 1);
                 assert!(lines[0].contains("outcome=resolved"));
                 assert!(!lines[0].contains("hunter2"));
+            })
+            .await;
+    }
+
+    // -- Phase 7, Story 7.1.3: TOTP end-to-end (gated, requires a real vault) --
+    //
+    // No existing convention in this crate distinguishes "skip: no creds"
+    // from "skip: slow/manual" (the `#[ignore]`d Chrome tests in `ax.rs` use
+    // `#[ignore]` for the latter) — `#[ignore]` alone can't express "runs by
+    // default, self-skips when a precondition is missing," so this test is
+    // deliberately *not* `#[ignore]`d: it always runs under a plain `cargo
+    // test -p stapler-mcp-native`, checks `OP_SERVICE_ACCOUNT_TOKEN` first,
+    // and returns early (with an `eprintln!` explaining why) rather than
+    // failing when the token is absent — matching this story's own AC
+    // ("reports skipped, not failed").
+    //
+    // The token-present branch is unverified in this sandbox (no real
+    // `OP_SERVICE_ACCOUNT_TOKEN`/vault access here, same as Phase 4's SDK
+    // spike, `npm/test/vault_spike.test.js`) — this test was run once here
+    // and confirmed to take the skip path cleanly.
+    //
+    // Scope note: this exercises `NativeCredentialStore::resolve` directly
+    // (the exact call `NativeBrowser::type_secret` itself makes,
+    // `crates/native/src/browser.rs`) rather than the full
+    // `NativeBrowser::type_secret` session/ref-dispatch path — `NativeBrowser`'s
+    // session registry is private to `browser.rs`, and standing up a full
+    // session (navigate, resolve a ref, dispatch) just to read back one
+    // input's value for a test that's unverifiable in this sandbox either
+    // way isn't worth the new pub(crate) test-only surface that would
+    // require on `NativeBrowser`. The "live DOM read, not through the
+    // redacted snapshot" half of the AC is still exercised for real: a
+    // resolved value is written into a live Chrome page and read back via a
+    // second, independent `evaluate()` call.
+    async fn launch_headless_chrome_page_for_totp_test(html: &str) -> (chromiumoxide::Browser, Page) {
+        let user_data_dir = std::env::temp_dir().join(format!(
+            "stapler-mcp-vault-totp-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&user_data_dir).expect("create test profile dir");
+        let config = chromiumoxide::BrowserConfig::builder()
+            .user_data_dir(user_data_dir)
+            .build()
+            .expect("headless BrowserConfig must build");
+        let (browser, mut handler) = chromiumoxide::Browser::launch(config)
+            .await
+            .expect("Chrome must be installed to run this test");
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while handler.next().await.is_some() {}
+        });
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .expect("new_page must succeed");
+        page.set_content(html).await.expect("set_content");
+        (browser, page)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_credential_store_resolve_should_produce_valid_totp_shape_on_live_dom_when_op_service_account_token_present(
+    ) {
+        let Ok(token) = std::env::var("OP_SERVICE_ACCOUNT_TOKEN") else {
+            eprintln!(
+                "skipping native_credential_store_resolve_should_produce_valid_totp_shape_on_live_dom_when_op_service_account_token_present: \
+                 OP_SERVICE_ACCOUNT_TOKEN is not set. This test requires a real 1Password \
+                 service account token and a designated test vault item with a TOTP field \
+                 (its domain is read from STAPLER_MCP_TEST_TOTP_DOMAIN, default \
+                 \"example.com\") — see plan.md Story 7.1.3."
+            );
+            return;
+        };
+        let domain =
+            std::env::var("STAPLER_MCP_TEST_TOTP_DOMAIN").unwrap_or_else(|_| "example.com".to_string());
+
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                let store = NativeCredentialStore::new(crate::spawn::NativeSpawner, token);
+                let credential_ref = CredentialRef {
+                    domain,
+                    field: CredentialField::Totp,
+                };
+                let secret = store
+                    .resolve(&credential_ref)
+                    .await
+                    .expect("resolve(Totp) should succeed against the designated real test vault item");
+
+                let (mut browser, page) = launch_headless_chrome_page_for_totp_test(
+                    r#"<!doctype html><html><body><input id="otp" type="text" autocomplete="one-time-code"></body></html>"#,
+                )
+                .await;
+
+                let value = secret.expose().to_string();
+                page.evaluate(format!(
+                    "document.getElementById('otp').value = {};",
+                    serde_json::to_string(&value).expect("string always serializes to JSON")
+                ))
+                .await
+                .expect("evaluate: set otp field value");
+
+                // A separate, test-only evaluate() call — never through
+                // `capture_snapshot`'s redaction path — per the AC's own
+                // wording.
+                let live_value: String = page
+                    .evaluate("document.getElementById('otp').value")
+                    .await
+                    .expect("evaluate: read otp field value")
+                    .into_value()
+                    .expect("otp field value should deserialize as a string");
+
+                assert!(
+                    live_value.len() == 6 && live_value.chars().all(|c| c.is_ascii_digit()),
+                    "resolved TOTP value read live from the DOM should be 6 digits, got {live_value:?}"
+                );
+
+                let _ = browser.close().await;
+            })
+            .await;
+    }
+
+    // -- Phase 7, Story 7.1.4: native/wasm parity table --
+    //
+    // Hand-mirrored in `npm/test/vault_glue.test.js`'s identically-named
+    // test — the two test harnesses don't share a runtime (plan.md's Story
+    // 7.1.4 explicitly accepts this as expected, not a shortcut). Each row's
+    // `expected` names a `PortError` discriminant that both
+    // `NativeCredentialStore` (canned `op` fixtures below) and
+    // `WasmCredentialStore` (canned JS-mock fixtures) must independently
+    // produce for the same domain/field scenario.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ParityOutcome {
+        DomainMismatch,
+        Ambiguous,
+        Unauthenticated,
+        RateLimited,
+    }
+
+    struct ParityFixture {
+        label: &'static str,
+        domain: &'static str,
+        seed_cache: bool,
+        responses: Vec<Result<ProcessOutput, PortError>>,
+        expected: ParityOutcome,
+    }
+
+    fn parity_fixture_table() -> Vec<ParityFixture> {
+        vec![
+            ParityFixture {
+                label: "no vault item matches the domain",
+                domain: "nomatch.example",
+                seed_cache: false,
+                responses: vec![op_item_list_json("")],
+                expected: ParityOutcome::DomainMismatch,
+            },
+            ParityFixture {
+                label: "two vault items match the domain",
+                domain: "example.com",
+                seed_cache: false,
+                responses: vec![op_item_list_json(
+                    r#"{"id": "item1", "title": "Example Login A", "vault": {"id": "vault1"}, "urls": [{"href": "https://example.com/a"}]},
+                    {"id": "item2", "title": "Example Login B", "vault": {"id": "vault2"}, "urls": [{"href": "https://example.com/b"}]}"#,
+                )],
+                expected: ParityOutcome::Ambiguous,
+            },
+            ParityFixture {
+                label: "op reports not signed in",
+                domain: "example.com",
+                seed_cache: true,
+                responses: vec![err_output(
+                    "[ERROR] 2026/09/08 You are not currently signed in. Please run `op signin --help` for instructions.\n",
+                )],
+                expected: ParityOutcome::Unauthenticated,
+            },
+            ParityFixture {
+                label: "op hits the account-wide rate limit",
+                domain: "example.com",
+                seed_cache: true,
+                responses: vec![
+                    err_output("[ERROR] 2026/09/08 You've made too many requests. Please try again later.\n"),
+                    ok_output("15\n"),
+                ],
+                expected: ParityOutcome::RateLimited,
+            },
+        ]
+    }
+
+    fn outcome_matches(err: &PortError, expected: ParityOutcome) -> bool {
+        matches!(
+            (err, expected),
+            (PortError::CredentialDomainMismatch(_), ParityOutcome::DomainMismatch)
+                | (PortError::CredentialAmbiguous(_), ParityOutcome::Ambiguous)
+                | (PortError::CredentialUnauthenticated(_), ParityOutcome::Unauthenticated)
+                | (PortError::CredentialRateLimited(_), ParityOutcome::RateLimited)
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_should_return_matching_port_error_variant_when_run_against_fixture_table_on_both_adapters(
+    ) {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for fixture in parity_fixture_table() {
+                    let spawner = FakeProcessSpawner::with_responses(fixture.responses);
+                    let store = NativeCredentialStore::new(spawner, "token".to_string());
+                    if fixture.seed_cache {
+                        seed_cache(&store, fixture.domain, "v1", "i1");
+                    }
+
+                    let err = store
+                        .resolve(&password_ref(fixture.domain))
+                        .await
+                        .unwrap_err();
+
+                    assert!(
+                        outcome_matches(&err, fixture.expected),
+                        "fixture \"{}\": expected {:?}, got {err:?}",
+                        fixture.label,
+                        fixture.expected
+                    );
+                }
             })
             .await;
     }

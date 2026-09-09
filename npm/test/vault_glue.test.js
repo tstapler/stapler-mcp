@@ -314,3 +314,167 @@ test("js_resolve_credential_should_never_emit_resolved_value_in_log_line_when_re
     assert.match(lines[0], /outcome=resolved/);
     assert.doesNotMatch(lines[0], /hunter2/);
 });
+
+// ---------------------------------------------------------------------------
+// Phase 7, Story 7.1.3: TOTP end-to-end, gated on a real vault.
+//
+// Skips cleanly via node:test's own `t.skip()` when `OP_SERVICE_ACCOUNT_TOKEN`
+// is absent — deliberately not `vault_spike.test.js`'s swallow-and-tolerate
+// approach, whose goal was different (prove no wasm-in-wasm nesting conflict
+// even *without* a token). This test's job is exactly "report skipped, not
+// failed" per plan.md's Story 7.1.3 AC.
+//
+// When the token is present, resolves a real TOTP value via
+// `jsResolveCredential` against a designated test vault item (domain from
+// `STAPLER_MCP_TEST_TOTP_DOMAIN`, default "example.com" — the real
+// `@1password/sdk` client, not a mock), then writes it into a live
+// one-time-code input via a real headless `playwright-core` page and reads
+// it back with a *separate* evaluate() call — never through a redacted
+// snapshot — asserting it's 6-digit TOTP-shaped.
+//
+// Scope note (mirrors `crates/native/src/vault.rs`'s equivalent gated test):
+// this exercises the vault-resolution half of the flow end-to-end (the exact
+// call `jsBrowserTypeSecret` itself makes) plus a direct DOM write/read,
+// rather than wiring the full `jsBrowserTypeSecret` session/ref-dispatch
+// path for one environment-gated test that's unverifiable in this sandbox
+// either way.
+//
+// The token-present branch is unverified here — this sandbox has no real
+// `OP_SERVICE_ACCOUNT_TOKEN`/vault access (same finding as
+// `npm/test/vault_spike.test.js`); this test was run once and confirmed to
+// take the skip path cleanly.
+test("js_resolve_credential_should_produce_valid_totp_shape_on_live_dom_when_op_service_account_token_present", async (t) => {
+    const token = process.env.OP_SERVICE_ACCOUNT_TOKEN;
+    if (!token) {
+        t.skip(
+            'OP_SERVICE_ACCOUNT_TOKEN not set — this test requires a real 1Password service ' +
+                'account token and a designated test vault item with a TOTP field (domain from ' +
+                'STAPLER_MCP_TEST_TOTP_DOMAIN, default "example.com"); see plan.md Story 7.1.3',
+        );
+        return;
+    }
+
+    const domain = process.env.STAPLER_MCP_TEST_TOTP_DOMAIN || "example.com";
+
+    // Real @1password/sdk client (default factory) — beforeEach's
+    // __resetForTesting() above already restores it, mirroring
+    // vault_spike.test.js's "exercise the real installed SDK" convention.
+    const totp = await vaultGlue.jsResolveCredential(domain, "totp");
+
+    const { chromium } = require("playwright-core");
+    const browser = await chromium.launch();
+    try {
+        const page = await browser.newPage();
+        await page.setContent('<input id="otp" type="text" autocomplete="one-time-code">');
+
+        await page.evaluate((value) => {
+            document.getElementById("otp").value = value;
+        }, totp);
+
+        // Live DOM read via a separate evaluate() call — never through a
+        // redacted snapshot (captureSnapshot would report this ref as
+        // "[REDACTED]" per Epic 2.3); this test asserts the underlying value
+        // directly, matching the AC's own wording.
+        const liveValue = await page.evaluate(() => document.getElementById("otp").value);
+
+        assert.match(
+            liveValue,
+            /^\d{6}$/,
+            `resolved TOTP value read live from the DOM should be 6 digits, got ${JSON.stringify(liveValue)}`,
+        );
+    } finally {
+        await browser.close();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 7, Story 7.1.4: native/wasm parity table.
+//
+// Hand-mirrored from `crates/native/src/vault.rs`'s identically-named test
+// (`parity_fixture_table`) — the two test harnesses don't share a runtime
+// (plan.md's Story 7.1.4 note), so this table is maintained by hand rather
+// than shared. Each row's `expectedMarker` is the substring
+// `crates/wasm/src/vault.rs`'s `map_vault_js_error` greps for to construct
+// the matching `PortError` discriminant — asserting the marker here proves
+// this adapter's JS-side error message classifies identically to native's
+// enum variant for the same scenario, without JS having its own `PortError`
+// type to compare against directly.
+function buildParityFixtureTable() {
+    const { RateLimitExceededError } = require("@1password/sdk");
+    const unreachable = async () => {
+        throw new Error("should not be called for this fixture");
+    };
+
+    return [
+        {
+            label: "no vault item matches the domain",
+            domain: "nomatch.example",
+            client: {
+                vaults: { list: async () => [{ id: "vault1" }] },
+                items: { list: async () => [], get: unreachable },
+                secrets: { resolve: unreachable },
+            },
+            expectedMarker: /no vault entry for domain/i,
+        },
+        {
+            label: "two vault items match the domain",
+            domain: "example.com",
+            client: {
+                vaults: { list: async () => [{ id: "vault1" }] },
+                items: {
+                    list: async () => [
+                        loginItem("item1", "vault1", "Example Login A", "https://example.com/a"),
+                        loginItem("item2", "vault1", "Example Login B", "https://example.com/b"),
+                    ],
+                    get: unreachable,
+                },
+                secrets: { resolve: unreachable },
+            },
+            expectedMarker: /ambiguous/i,
+        },
+        {
+            label: "sdk reports not authenticated",
+            domain: "example.com",
+            factoryError: new Error(
+                "invalid service account token, please make sure you provide a valid service account token as parameter",
+            ),
+            expectedMarker: /not authenticated — not typed/i,
+        },
+        {
+            label: "sdk hits the account-wide rate limit",
+            domain: "example.com",
+            client: {
+                vaults: { list: async () => [{ id: "vault1" }] },
+                items: {
+                    list: async () => {
+                        throw new RateLimitExceededError("account-wide rate limit hit");
+                    },
+                    get: unreachable,
+                },
+                secrets: { resolve: unreachable },
+            },
+            expectedMarker: /rate limit exceeded — not typed/i,
+        },
+    ];
+}
+
+test("resolve_should_return_matching_port_error_variant_when_run_against_fixture_table_on_both_adapters", async () => {
+    for (const fixture of buildParityFixtureTable()) {
+        if (fixture.client) {
+            vaultGlue.__setClientFactoryForTesting(async () => fixture.client);
+        } else {
+            vaultGlue.__setClientFactoryForTesting(async () => {
+                throw fixture.factoryError;
+            });
+        }
+
+        await assert.rejects(
+            () => vaultGlue.jsResolveCredential(fixture.domain, "password"),
+            (err) => {
+                assert.match(err.message, fixture.expectedMarker, `fixture "${fixture.label}": ${err.message}`);
+                return true;
+            },
+            `fixture "${fixture.label}" should reject`,
+        );
+    }
+});

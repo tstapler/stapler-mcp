@@ -1037,6 +1037,49 @@ customElements.define('my-login', class extends HTMLElement {
 </script>
 </body></html>"#;
 
+    // ---- Phase 7, Story 7.1.2: the literal acceptance test
+    // `requirements.md`'s Success Metrics section names — "verified by a
+    // test that autofills a password field out-of-band and then calls
+    // `stapler_browser_snapshot`." Distinct from `MY_LOGIN_HTML_TEMPLATE`'s
+    // tests above (which bake the value into the initial HTML, so it's
+    // present before any AX tree is ever built): this one sets the value
+    // *after* the page has loaded via a raw `page.evaluate()` call — the
+    // same mechanism a real browser/password-manager autofill write uses,
+    // and explicitly not `type_secret`/`type_text` — to prove redaction is
+    // keyed on the live node's `type`/`autocomplete` at capture time, not on
+    // how or when the value arrived.
+    #[tokio::test]
+    #[ignore = "requires a real Chrome; run with `cargo test -- --ignored`"]
+    async fn snapshot_should_redact_value_when_field_was_autofilled_out_of_band() {
+        let html = r#"<!doctype html><html><body>
+<input id="pw" type="password">
+</body></html>"#;
+        let (browser, page) = launch_headless_chrome_page(html).await;
+
+        // Simulates browser/password-manager autofill: written directly onto
+        // the live DOM via CDP (`Runtime.evaluate`, under `page.evaluate()`),
+        // never through `type_secret`/`type_text`.
+        page.evaluate("document.getElementById('pw').value = 'hunter2';")
+            .await
+            .expect("evaluate: autofill password field out-of-band");
+
+        let next_ref_id = Cell::new(1);
+        let capture = capture_snapshot(&page, &next_ref_id, &HashMap::new())
+            .await
+            .expect("capture_snapshot should succeed");
+
+        let password_node = find_node_by_role(&capture.snapshot.root, "textbox")
+            .expect("out-of-band-autofilled password field should surface in the AX tree");
+        assert_eq!(
+            password_node.value.as_deref(),
+            Some(REDACTED_PLACEHOLDER),
+            "an out-of-band-autofilled password field must never surface its raw value"
+        );
+
+        let mut browser = browser;
+        let _ = browser.close().await;
+    }
+
     #[tokio::test]
     #[ignore = "requires a real Chrome; run with `cargo test -- --ignored`"]
     async fn snapshot_should_redact_value_when_shadow_root_is_open_and_probe_succeeds() {
