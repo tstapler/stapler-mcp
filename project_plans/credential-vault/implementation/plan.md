@@ -192,6 +192,18 @@ plan does not deviate from that.
       §7 flags this as UNVERIFIED. Blocks Story 3.3.1 — owner: implementer,
       spike against a real (or sufessufficiently large test) vault before
       writing the final filtering logic.
+      **Still UNVERIFIED at implementation time**: this sandbox has no `op`
+      CLI binary and no real 1Password account/vault (confirmed independently
+      by Epic 3.3's implementer and Phase 4's spike worker), so no spike
+      against a real or large test vault was possible. Task 3.3.1a's
+      list-then-filter logic (`crates/native/src/vault.rs`) was implemented
+      against the documented `op item list --categories Login --format json`
+      output shape only, unverified against a live vault at any scale.
+      Correctness for the common case (a personal vault, tens to low
+      hundreds of Login items, no pagination) is a reasonable assumption but
+      unconfirmed — flagged here rather than silently marked resolved.
+      Follow-up: run this spike against a real service account before
+      relying on this path for large or shared vaults.
 - [x] Whether `@1password/sdk` actually instantiates and resolves inside this
       project's real wasm/Node host without wasm-in-wasm-glue nesting issues
       — `pitfalls.md` §4a/4b, UNVERIFIED. Blocks Phase 4 entirely — owner:
