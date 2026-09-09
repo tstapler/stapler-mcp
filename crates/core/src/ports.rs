@@ -31,7 +31,12 @@ pub enum PortError {
     /// (hidden, disabled, still animating, or covered by another element)
     /// after exhausting the retry/backoff window. Distinct from `NotFound`:
     /// the ref itself is still valid, so the caller's fix is to wait/inspect
-    /// the page, not to re-snapshot for a fresh ref.
+    /// the page, not to re-snapshot for a fresh ref. Also covers
+    /// `type_secret`'s dispatch-time refusal when the resolved node's live
+    /// `type`/`autocomplete` isn't password/TOTP-shaped (Epic 3.4) — the
+    /// same underlying situation (a resolved, still-valid ref that this
+    /// specific action can't be dispatched against right now), just gated
+    /// on the node's shape instead of its visibility/state.
     NotActionable(String),
     /// The requested domain doesn't match the session's current live page
     /// host (see `same_host`) — nothing was typed. Not fixable by retrying
