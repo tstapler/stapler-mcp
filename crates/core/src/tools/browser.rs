@@ -22,8 +22,8 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::ports::{
-    AxNode, AxSnapshot, BrowserDriver, FileStore, HistoryAction, Locator, PortError, SessionId,
-    TabAction, TabInfo, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, CredentialField, CredentialRef, FileStore, HistoryAction,
+    Locator, PortError, SessionId, TabAction, TabInfo, WaitCondition,
 };
 use crate::schema::{
     AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput,
@@ -858,6 +858,7 @@ mod tests {
         navigate_result: RefCell<Option<Result<crate::ports::NavigateResult, PortError>>>,
         click_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         type_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        type_secret_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         snapshot_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         /// Queue of results consumed in order, one per `close_session` call —
         /// a queue (rather than a single `Option`, like every other
@@ -895,6 +896,7 @@ mod tests {
                 navigate_result: RefCell::new(None),
                 click_result: RefCell::new(None),
                 type_result: RefCell::new(None),
+                type_secret_result: RefCell::new(None),
                 snapshot_result: RefCell::new(None),
                 close_session_results: RefCell::new(VecDeque::new()),
                 list_sessions_result: RefCell::new(None),
@@ -930,6 +932,11 @@ mod tests {
 
         fn with_type(self, result: Result<AxSnapshot, PortError>) -> Self {
             *self.type_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_type_secret(self, result: Result<AxSnapshot, PortError>) -> Self {
+            *self.type_secret_result.borrow_mut() = Some(result);
             self
         }
 
@@ -1054,6 +1061,20 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .expect("type result not configured")
+        }
+
+        async fn type_secret(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _credential_ref: &CredentialRef,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            self.calls.borrow_mut().push("type_secret");
+            self.type_secret_result
+                .borrow_mut()
+                .take()
+                .expect("type_secret result not configured")
         }
 
         async fn snapshot(
@@ -1591,6 +1612,32 @@ mod tests {
 
         assert_eq!(err, "sessionId must not be empty");
         assert_eq!(driver.call_count(), 0);
+    }
+
+    // -- type_secret (FakeBrowserDriver direct — no tool-layer wrapper yet,
+    // added in Phase 5) --------------------------------------------------
+
+    #[tokio::test]
+    async fn fake_browser_driver_should_return_configured_result_when_type_secret_called() {
+        let driver = FakeBrowserDriver::new().with_type_secret(Err(
+            PortError::CredentialExpired("TOTP code for example.com expired".to_string()),
+        ));
+
+        let err = driver
+            .type_secret(
+                &SessionId("sess-1".to_string()),
+                &Locator("e1".to_string()),
+                &CredentialRef {
+                    domain: "example.com".to_string(),
+                    field: CredentialField::Totp,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("configured type_secret result should be an error");
+
+        assert!(matches!(err, PortError::CredentialExpired(_)));
+        assert_eq!(driver.call_count(), 1);
     }
 
     #[tokio::test]
