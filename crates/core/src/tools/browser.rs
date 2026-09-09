@@ -58,7 +58,7 @@ fn to_node_output(node: AxNode) -> AxNodeOutput {
     }
 }
 
-fn to_snapshot_output(snapshot: AxSnapshot) -> AxSnapshotOutput {
+pub(crate) fn to_snapshot_output(snapshot: AxSnapshot) -> AxSnapshotOutput {
     AxSnapshotOutput {
         root: to_node_output(snapshot.root),
         url: snapshot.url,
