@@ -16,6 +16,7 @@ htmd = "0.5"
 texting_robots = "0.2"
 sha2 = "0.11"
 base64 = "0.22"
+zeroize = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 text-splitter = { version = "0.32", features = ["markdown"] }

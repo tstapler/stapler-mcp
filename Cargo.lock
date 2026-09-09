@@ -3588,6 +3588,7 @@ dependencies = [
  "texting_robots",
  "tokio",
  "url",
+ "zeroize",
 ]
 
 [[package]]

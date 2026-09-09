@@ -33,9 +33,32 @@ pub enum PortError {
     /// the ref itself is still valid, so the caller's fix is to wait/inspect
     /// the page, not to re-snapshot for a fresh ref.
     NotActionable(String),
+    /// The requested domain doesn't match the session's current live page
+    /// host (see `same_host`) — nothing was typed. Not fixable by retrying
+    /// the same call; the caller must re-check the actual current-page
+    /// domain or accept there's no credential for this site.
+    CredentialDomainMismatch(String),
+    /// Multiple vault items matched the domain; nothing was typed. Not
+    /// fixable with `CredentialRef`'s shape alone — requires human
+    /// disambiguation (see the candidate list in the message).
+    CredentialAmbiguous(String),
+    /// The vault backend itself isn't authenticated/reachable. An operator
+    /// problem, not something the calling LLM can fix by retrying.
+    CredentialUnauthenticated(String),
+    /// 1Password's account-wide rate limit was hit. Retryable, but only
+    /// after the message's stated delay — not immediately.
+    CredentialRateLimited(String),
+    /// The resolved TOTP code's ~30s validity window elapsed before it
+    /// could be typed. The one immediately-retryable case in this family.
+    CredentialExpired(String),
 }
 
 impl std::fmt::Display for PortError {
+    // Like `NotFound`/`SessionCrashed` above, the adapter constructing a
+    // `Credential*` variant is expected to have already built the full
+    // user-facing sentence (matching `ux.md`'s exact drafted strings) into
+    // the inner `String` — callers that already know the specific variant
+    // should pass it through verbatim rather than via `Display`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PortError::Io(e) => write!(f, "io error: {e}"),
@@ -44,6 +67,11 @@ impl std::fmt::Display for PortError {
             PortError::NotFound(e) => write!(f, "not found: {e}"),
             PortError::SessionCrashed(e) => write!(f, "session crashed: {e}"),
             PortError::NotActionable(e) => write!(f, "not actionable: {e}"),
+            PortError::CredentialDomainMismatch(e) => write!(f, "credential rejected: {e}"),
+            PortError::CredentialAmbiguous(e) => write!(f, "credential rejected: {e}"),
+            PortError::CredentialUnauthenticated(e) => write!(f, "vault unauthenticated: {e}"),
+            PortError::CredentialRateLimited(e) => write!(f, "vault rate-limited: {e}"),
+            PortError::CredentialExpired(e) => write!(f, "credential expired: {e}"),
         }
     }
 }
@@ -146,6 +174,36 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Locator(pub String);
 
+/// Placeholder substituted for a resolved secret's value everywhere it would
+/// otherwise appear in output — `SecretValue`'s `Debug` impl, and the
+/// acted-on node's `value` in `type_secret`'s returned `AxSnapshot`.
+pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+
+/// A credential value resolved from a `CredentialStore`. Backed by
+/// `zeroize::Zeroizing<String>` so the backing memory is overwritten on
+/// drop, and its `Debug` impl never prints the wrapped value — use
+/// `expose()` only at the point the value must actually be used (e.g.
+/// dispatching a keystroke), never in a log line or error message.
+pub struct SecretValue(zeroize::Zeroizing<String>);
+
+impl SecretValue {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SecretValue")
+            .field(&REDACTED_PLACEHOLDER)
+            .finish()
+    }
+}
+
 /// One node in an accessibility-tree snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AxNode {
@@ -204,6 +262,27 @@ pub enum HistoryAction {
     Reload,
 }
 
+/// The specific vault field a `CredentialRef` names. Closed by
+/// construction — exactly 3 legal values, exactly like `HistoryAction` —
+/// so a typo or unexpected value fails to compile rather than silently
+/// misresolving (e.g. falling through to the password-shaped path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CredentialField {
+    Username,
+    Password,
+    Totp,
+}
+
+/// An opaque, non-secret domain/field identifier used to look up a
+/// credential in a `CredentialStore` — never carries a credential value
+/// itself. `domain` is matched by exact host-string equality against the
+/// session's live URL (see `same_host`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CredentialRef {
+    pub domain: String,
+    pub field: CredentialField,
+}
+
 /// One entry in a `TabsResult` listing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabInfo {
@@ -249,6 +328,14 @@ pub enum WaitCondition {
     TimeMs(u64),
 }
 
+/// Resolves an opaque `CredentialRef` to the vault-held `SecretValue` it
+/// names. Cross-references `SecretValue`'s non-leaking `Debug`: every
+/// implementation must log its own domain/field/outcome (see the
+/// Observability Plan) but must never log the resolved value itself.
+pub trait CredentialStore {
+    async fn resolve(&self, credential_ref: &CredentialRef) -> Result<SecretValue, PortError>;
+}
+
 pub trait BrowserDriver {
     /// Coarse, call-level operation (navigate + read title/HTML/text/final-URL
     /// in one hop) rather than exposing CDP-message-level primitives — this is
@@ -285,6 +372,37 @@ pub trait BrowserDriver {
         text: &str,
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError>;
+    /// Resolves `credential_ref` and types the result into `locator`, exactly
+    /// like `type_text` except: (1) no plaintext ever crosses this *trait*
+    /// call boundary in either direction — the implementor resolves
+    /// internally, it is never handed a resolved `SecretValue` as an
+    /// argument — and (2) the acted-on node's `value` in the returned
+    /// `AxSnapshot` is always `REDACTED_PLACEHOLDER`, independent of the
+    /// structural redaction every snapshot-producing call already applies
+    /// (see `ax.rs`/`browser.js`'s redaction pass) — belt-and-suspenders per
+    /// `architecture.md` §6.
+    ///
+    /// **Resolution locus, explicit**: the implementing adapter (native/wasm)
+    /// resolves `credential_ref` by calling its OWN adapter-owned
+    /// `CredentialStore` handle internally, as the first step of this method's
+    /// own body — it is not resolved by the tool-layer caller beforehand and
+    /// handed in. The daemon is responsible for constructing/injecting that
+    /// `CredentialStore` dependency into the `BrowserDriver` adapter at
+    /// startup (Phase 3/4 wiring, Phase 6 daemon wiring) — see ADR-001. The
+    /// tool-layer handler built on top of this trait (Phase 5) calls this
+    /// method exactly once per `type_secret` request and never calls
+    /// `CredentialStore::resolve` itself; this is also what makes ADR-003's
+    /// in-flight dedup (Story 3.2.5/4.2.2) actually effective — every resolve
+    /// request passes through the one adapter-owned `CredentialStore`, so its
+    /// dedup map sees all of them, not just some.
+    async fn type_secret(
+        &self,
+        session_id: &SessionId,
+        locator: &Locator,
+        credential_ref: &CredentialRef,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError>;
+
     /// Captures a fresh accessibility-tree snapshot of `session_id`'s current
     /// page without mutating it.
     async fn snapshot(
@@ -513,6 +631,16 @@ mod tests {
             todo!()
         }
 
+        async fn type_secret(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _credential_ref: &CredentialRef,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
         async fn snapshot(
             &self,
             _session_id: &SessionId,
@@ -616,10 +744,10 @@ mod tests {
     }
 
     #[test]
-    fn stub_browser_driver_should_compile_when_all_methods_have_todo_bodies() {
+    fn stub_browser_driver_should_compile_when_type_secret_arm_has_todo_body() {
         // Merely constructing it is the assertion: if the trait signatures
-        // were malformed or clashed with `navigate_and_extract`, this file
-        // wouldn't compile at all.
+        // were malformed or clashed with each other (including the new
+        // `type_secret` method), this file wouldn't compile at all.
         let _stub = StubBrowser;
     }
 
@@ -633,5 +761,87 @@ mod tests {
     fn port_error_session_crashed_display_should_include_message_when_formatted() {
         let err = PortError::SessionCrashed("sess-2".into());
         assert_eq!(format!("{err}"), "session crashed: sess-2");
+    }
+
+    #[test]
+    fn secret_value_debug_should_redact_when_formatted() {
+        let secret = SecretValue::new("hunter2".to_string());
+
+        let formatted = format!("{secret:?}");
+
+        assert_eq!(formatted, "SecretValue(\"[REDACTED]\")");
+        assert!(!formatted.contains("hunter2"));
+    }
+
+    #[test]
+    fn credential_ref_should_hash_and_eq_when_used_as_map_key() {
+        use std::collections::HashSet;
+
+        let username_ref = CredentialRef {
+            domain: "example.com".into(),
+            field: CredentialField::Username,
+        };
+        let password_ref = CredentialRef {
+            domain: "example.com".into(),
+            field: CredentialField::Password,
+        };
+
+        assert_ne!(username_ref, password_ref);
+
+        let mut set = HashSet::new();
+        set.insert(username_ref.clone());
+        set.insert(password_ref.clone());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&username_ref));
+        assert!(set.contains(&password_ref));
+    }
+
+    #[test]
+    fn secret_value_should_wrap_zeroizing_string_when_constructed() {
+        let secret = SecretValue::new("hunter2".to_string());
+
+        // Structural check per the AC: confirms the backing field type is
+        // `Zeroizing<String>` (whose own `Drop` impl, already exercised by
+        // `zeroize`'s own test suite, zeroes the buffer) rather than a bare
+        // `String`.
+        let backing: &zeroize::Zeroizing<String> = &secret.0;
+        assert_eq!(backing.as_str(), "hunter2");
+        assert_eq!(secret.expose(), "hunter2");
+    }
+
+    #[test]
+    fn port_error_credential_domain_mismatch_display_should_start_with_credential_rejected_prefix()
+    {
+        let err = PortError::CredentialDomainMismatch(
+            "no vault entry for domain \"example.com\"".into(),
+        );
+        assert!(format!("{err}").starts_with("credential rejected: "));
+    }
+
+    #[test]
+    fn port_error_credential_ambiguous_display_should_start_with_credential_rejected_prefix() {
+        let err = PortError::CredentialAmbiguous("2 vault items matched \"example.com\"".into());
+        assert!(format!("{err}").starts_with("credential rejected: "));
+    }
+
+    #[test]
+    fn port_error_credential_unauthenticated_display_should_start_with_vault_unauthenticated_prefix()
+     {
+        let err = PortError::CredentialUnauthenticated("1Password CLI not signed in".into());
+        assert!(format!("{err}").starts_with("vault unauthenticated: "));
+    }
+
+    #[test]
+    fn port_error_credential_rate_limited_display_should_start_with_vault_rate_limited_prefix() {
+        let err = PortError::CredentialRateLimited("retry after 30s".into());
+        assert!(format!("{err}").starts_with("vault rate-limited: "));
+    }
+
+    #[test]
+    fn port_error_credential_expired_display_should_start_with_credential_expired_prefix() {
+        let err = PortError::CredentialExpired(
+            "TOTP code for example.com expired before it could be typed".into(),
+        );
+        assert!(format!("{err}").starts_with("credential expired: "));
     }
 }
