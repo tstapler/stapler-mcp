@@ -480,8 +480,8 @@ module.exports.capSnapshotNodes = capSnapshotNodes;
 // Structural snapshot redaction (Epic 2.3): Playwright's `ariaSnapshot()`
 // text carries no `type`/`autocomplete` attribute at all, so redaction
 // parity with native (`crates/core/src/ports.rs`'s `AxNode.value` doc
-// comment states the shared key) requires a second `page.evaluate()` pass
-// over the live DOM, merged into the tree `parseAriaSnapshot` already built.
+// comment states the shared key) requires a second, per-ref probe of the
+// live DOM, merged into the tree `parseAriaSnapshot` already built.
 
 // Same fixed, non-length-preserving sentinel as native's
 // `REDACTED_PLACEHOLDER` (`crates/core/src/ports.rs`) — duplicated here
@@ -496,37 +496,45 @@ module.exports.REDACTED_PLACEHOLDER = REDACTED_PLACEHOLDER;
 // no live-DOM entry is not a secret-shaped node and must not be redacted.
 const FORM_CONTROL_ROLES = new Set(["textbox"]);
 
-// Live-DOM collection pass (Task 2.3.1a/2.3.2a): walks `document` and every
-// open shadow root — recursively, since `querySelectorAll` never crosses a
-// shadow boundary on its own — collecting `{ref, redact}` for every
-// `input`/`textarea`. Mirrors native's single-combined-check shape: one
-// predicate per element, no separate type/autocomplete round trips.
-function collectRedactionInfo(page) {
-    return page.evaluate(() => {
-        function shouldRedact(el) {
-            return (
-                el.type === "password" ||
-                ["one-time-code", "current-password", "new-password"].includes(el.autocomplete)
-            );
+// Live-DOM collection pass (Task 2.3.1a/2.3.2a): resolves each form-control
+// node already present in the parsed snapshot tree back to its live element
+// via `refLocator` — the same `aria-ref=` locator every other ref-targeted
+// action (click/type/type_secret) already uses — rather than a raw
+// `el.getAttribute("aria-ref")` DOM read. That attribute read was the actual
+// bug: Playwright's `aria-ref=` engine resolves purely through an internal
+// per-page snapshot map (`_createAriaRefEngine`) and never writes `aria-ref`
+// as a real DOM attribute, so `getAttribute` always returned `null` against
+// a real browser — every textbox fell into the fail-safe and got redacted
+// unconditionally. An open shadow root's contents resolve correctly here for
+// free, because `ariaSnapshot()`/`aria-ref=` already cross open shadow
+// boundaries when building the ref-annotated tree; a closed shadow root's
+// contents never appear as nodes in `root` at all, so there is nothing here
+// to collect a ref for.
+function collectRedactionInfo(page, root) {
+    const refs = [];
+    (function walk(node) {
+        if (FORM_CONTROL_ROLES.has(node.role) && node.ref) {
+            refs.push(node.ref);
         }
-        function walk(root, out) {
-            for (const el of root.querySelectorAll("*")) {
-                if (el.matches("input, textarea")) {
-                    out.push({ ref: el.getAttribute("aria-ref") || null, redact: shouldRedact(el) });
-                }
-                // Open shadow root only (Task 2.3.2a) — a closed root's
-                // `shadowRoot` property is `null` by spec, so this walk
-                // simply can't descend into it; that's exactly the
-                // fail-safe boundary `mergeRedactionInfo` relies on below.
-                if (el.shadowRoot) {
-                    walk(el.shadowRoot, out);
-                }
-            }
+        for (const child of node.children) {
+            walk(child);
         }
-        const out = [];
-        walk(document, out);
-        return out;
-    });
+    })(root);
+
+    return Promise.all(
+        refs.map((ref) =>
+            refLocator(page, ref)
+                .evaluate((el) => ({ type: el.type || "", autocomplete: el.autocomplete || "" }))
+                .then((shape) => ({ ref, redact: isSecretShapedField(shape.type, shape.autocomplete) }))
+                // Fail-safe: a ref that can't be resolved (element removed
+                // between snapshot and probe, or a closed shadow root hid
+                // it) must redact, never silently drop — same "can't confirm
+                // it's safe" rule `mergeRedactionInfo` applies below, and
+                // .catch() here keeps one failing lookup from rejecting the
+                // whole Promise.all.
+                .catch(() => ({ ref, redact: true })),
+        ),
+    );
 }
 module.exports.collectRedactionInfo = collectRedactionInfo;
 
@@ -560,7 +568,7 @@ module.exports.mergeRedactionInfo = mergeRedactionInfo;
 async function captureSnapshot(page) {
     const text = await page.ariaSnapshot();
     const root = parseAriaSnapshot(text);
-    const redactionInfo = await collectRedactionInfo(page);
+    const redactionInfo = await collectRedactionInfo(page, root);
     mergeRedactionInfo(root, redactionInfo);
     const truncated = capSnapshotNodes(root, MAX_SNAPSHOT_NODES);
     return { root, url: page.url(), truncated };
@@ -704,13 +712,11 @@ module.exports.jsBrowserCurrentUrl = async function (sessionId) {
     return session.page.url();
 };
 
-// Same accept-key `ax.rs`/`collectRedactionInfo`'s structural redaction pass
-// uses (`type === "password"` or `autocomplete` one of the TOTP/password
-// values) — kept as its own Node-side function rather than sharing
-// `collectRedactionInfo`'s internal `shouldRedact` directly, since that one
-// runs serialized into the page context via `page.evaluate` and can't
-// reference an outer Node closure. Operates on plain `{type, autocomplete}`
-// values already extracted from the live DOM node, not the node itself.
+// The shared password/TOTP predicate: `type === "password"` or
+// `autocomplete` one of the TOTP/password values. `collectRedactionInfo`'s
+// structural redaction pass and this dispatch-time re-check both call it
+// directly on plain `{type, autocomplete}` values already extracted from a
+// live DOM node, not the node itself.
 function isSecretShapedField(nodeType, autocomplete) {
     return (
         nodeType === "password" ||
@@ -763,10 +769,13 @@ module.exports.jsBrowserTypeSecret = async function (sessionId, refId, secretVal
 
         let shape;
         try {
-            shape = await locator.evaluate((el) => ({
-                type: el.type || "",
-                autocomplete: el.autocomplete || "",
-            }));
+            shape = await locator.evaluate(
+                (el) => ({
+                    type: el.type || "",
+                    autocomplete: el.autocomplete || "",
+                }),
+                { timeout: timeoutMs },
+            );
         } catch (e) {
             throw describeActionError(refId, e);
         }
