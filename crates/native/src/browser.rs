@@ -915,7 +915,10 @@ fn check_credential_domain(live_url: &str, requested_domain: &str) -> Result<(),
 fn log_domain_check_rejection(domain: &str, field: CredentialField, e: PortError) -> PortError {
     let loggable: Result<SecretValue, PortError> = Err(e);
     crate::vault::log_resolve_outcome(domain, field, &loggable);
-    loggable.unwrap_err()
+    let Err(e) = loggable else {
+        unreachable!("loggable is always Err by construction, just above")
+    };
+    e
 }
 
 /// Task 3.4.1b's dispatch-time redaction-key re-check, decision half: given
