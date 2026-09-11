@@ -88,193 +88,8 @@ pub async fn browser_type_secret<B: BrowserDriver>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::{AxNode, AxSnapshot, NavigateResult, SessionSummary, TabAction};
     use crate::schema::CredentialRefInput;
-
-    /// A minimal `BrowserDriver` fake exercising only `type_secret` — every
-    /// other method is unreachable from this module's tests, mirroring the
-    /// `todo!()`-bodied `StubBrowser` in `ports.rs`'s own test module.
-    struct FakeBrowserDriver {
-        type_secret_result: std::cell::RefCell<Option<Result<AxSnapshot, PortError>>>,
-        type_secret_calls: std::cell::RefCell<u32>,
-    }
-
-    impl FakeBrowserDriver {
-        fn new(result: Result<AxSnapshot, PortError>) -> Self {
-            FakeBrowserDriver {
-                type_secret_result: std::cell::RefCell::new(Some(result)),
-                type_secret_calls: std::cell::RefCell::new(0),
-            }
-        }
-    }
-
-    impl BrowserDriver for FakeBrowserDriver {
-        async fn navigate_and_extract(
-            &self,
-            _url: &str,
-            _timeout: std::time::Duration,
-        ) -> Result<crate::ports::PageExtract, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn navigate(
-            &self,
-            _url: &str,
-            _session_id: Option<&SessionId>,
-            _timeout: std::time::Duration,
-        ) -> Result<NavigateResult, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn click(
-            &self,
-            _session_id: &SessionId,
-            _locator: &Locator,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn type_text(
-            &self,
-            _session_id: &SessionId,
-            _locator: &Locator,
-            _text: &str,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn type_secret(
-            &self,
-            _session_id: &SessionId,
-            _locator: &Locator,
-            _credential_ref: &CredentialRef,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            *self.type_secret_calls.borrow_mut() += 1;
-            self.type_secret_result
-                .borrow_mut()
-                .take()
-                .expect("type_secret called more than once in this test")
-        }
-
-        async fn snapshot(
-            &self,
-            _session_id: &SessionId,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn close_session(&self, _session_id: &SessionId) -> Result<(), PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn list_sessions(&self) -> Result<Vec<SessionSummary>, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn tabs(
-            &self,
-            _session_id: &SessionId,
-            _action: TabAction,
-            _timeout: std::time::Duration,
-        ) -> Result<crate::ports::TabsResult, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn hover(
-            &self,
-            _session_id: &SessionId,
-            _locator: &Locator,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn select_option(
-            &self,
-            _session_id: &SessionId,
-            _locator: &Locator,
-            _values: &[String],
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn press_key(
-            &self,
-            _session_id: &SessionId,
-            _key: &str,
-            _locator: Option<&Locator>,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn wait_for(
-            &self,
-            _session_id: &SessionId,
-            _condition: crate::ports::WaitCondition,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn screenshot(
-            &self,
-            _session_id: &SessionId,
-            _full_page: bool,
-            _timeout: std::time::Duration,
-        ) -> Result<Vec<u8>, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn evaluate(
-            &self,
-            _session_id: &SessionId,
-            _function: &str,
-            _locator: Option<&Locator>,
-            _timeout: std::time::Duration,
-        ) -> Result<serde_json::Value, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn history(
-            &self,
-            _session_id: &SessionId,
-            _action: crate::ports::HistoryAction,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-
-        async fn resize(
-            &self,
-            _session_id: &SessionId,
-            _width: u32,
-            _height: u32,
-            _timeout: std::time::Duration,
-        ) -> Result<AxSnapshot, PortError> {
-            unreachable!("not exercised by browser_type_secret")
-        }
-    }
-
-    fn sample_snapshot() -> AxSnapshot {
-        AxSnapshot {
-            root: AxNode {
-                node_ref: "e1".into(),
-                role: "textbox".into(),
-                name: "Password".into(),
-                value: Some(crate::ports::REDACTED_PLACEHOLDER.to_string()),
-                children: vec![],
-            },
-            url: "https://example.com/login".into(),
-            truncated: false,
-            navigated_from: None,
-        }
-    }
+    use crate::tools::test_support::{sample_snapshot, FakeBrowserDriver};
 
     fn sample_input() -> BrowserTypeSecretInput {
         BrowserTypeSecretInput {
@@ -291,7 +106,8 @@ mod tests {
     #[tokio::test]
     async fn browser_type_secret_should_set_note_to_fixed_success_string_when_type_secret_succeeds()
     {
-        let driver = FakeBrowserDriver::new(Ok(sample_snapshot()));
+        let driver = FakeBrowserDriver::new()
+            .with_type_secret(Ok(sample_snapshot("https://example.com/login", None)));
 
         let result = browser_type_secret(&driver, sample_input()).await.unwrap();
 
@@ -308,8 +124,8 @@ mod tests {
              could be typed (generated t, window closed t+30s) — not typed. Retry the same call; \
              a fresh code will be generated."
             .to_string();
-        let driver =
-            FakeBrowserDriver::new(Err(PortError::CredentialExpired(expired_message.clone())));
+        let driver = FakeBrowserDriver::new()
+            .with_type_secret(Err(PortError::CredentialExpired(expired_message.clone())));
 
         let err = browser_type_secret(&driver, sample_input())
             .await
@@ -320,25 +136,28 @@ mod tests {
 
     /// Structural/negative control (per Epic 5.2's AC): `browser_type_secret`
     /// makes exactly one vault-touching call — `browser.type_secret` — and
-    /// never calls `CredentialStore::resolve`. `FakeBrowserDriver` above
-    /// implements only `BrowserDriver` (no `CredentialStore` impl exists for
-    /// it at all), and `browser_type_secret`'s signature has a single generic
-    /// bound (`B: BrowserDriver`), so this test compiling — and observing
-    /// `type_secret` called exactly once — is itself the verification: there
-    /// is no `CredentialStore` type in scope this function could have called
+    /// never calls `CredentialStore::resolve`. `FakeBrowserDriver` (shared
+    /// with `tools::browser`'s tests, A4 code review fix) implements only
+    /// `BrowserDriver` (no `CredentialStore` impl exists for it at all), and
+    /// `browser_type_secret`'s signature has a single generic bound (`B:
+    /// BrowserDriver`), so this test compiling — and observing `type_secret`
+    /// called exactly once — is itself the verification: there is no
+    /// `CredentialStore` type in scope this function could have called
     /// through.
     #[tokio::test]
     async fn browser_type_secret_should_reference_only_browser_driver_when_body_is_inspected() {
-        let driver = FakeBrowserDriver::new(Ok(sample_snapshot()));
+        let driver = FakeBrowserDriver::new()
+            .with_type_secret(Ok(sample_snapshot("https://example.com/login", None)));
 
         let _ = browser_type_secret(&driver, sample_input()).await;
 
-        assert_eq!(*driver.type_secret_calls.borrow(), 1);
+        assert_eq!(driver.call_count(), 1);
     }
 
     #[tokio::test]
     async fn browser_type_secret_should_reject_empty_session_id() {
-        let driver = FakeBrowserDriver::new(Ok(sample_snapshot()));
+        let driver = FakeBrowserDriver::new()
+            .with_type_secret(Ok(sample_snapshot("https://example.com/login", None)));
         let mut input = sample_input();
         input.session_id = String::new();
 
@@ -347,12 +166,13 @@ mod tests {
             .expect_err("empty sessionId should be rejected");
 
         assert_eq!(err, "sessionId must not be empty");
-        assert_eq!(*driver.type_secret_calls.borrow(), 0);
+        assert_eq!(driver.call_count(), 0);
     }
 
     #[tokio::test]
     async fn browser_type_secret_should_reject_empty_ref_id() {
-        let driver = FakeBrowserDriver::new(Ok(sample_snapshot()));
+        let driver = FakeBrowserDriver::new()
+            .with_type_secret(Ok(sample_snapshot("https://example.com/login", None)));
         let mut input = sample_input();
         input.ref_id = String::new();
 
@@ -361,6 +181,6 @@ mod tests {
             .expect_err("empty refId should be rejected");
 
         assert_eq!(err, "refId must not be empty");
-        assert_eq!(*driver.type_secret_calls.borrow(), 0);
+        assert_eq!(driver.call_count(), 0);
     }
 }

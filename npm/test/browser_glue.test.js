@@ -1196,6 +1196,55 @@ test("capture_snapshot_should_redact_value_when_dom_type_is_password", async () 
     browserGlue.sessions.delete(id);
 });
 
+// A2 code review fix: Chromium can assign `searchbox`/`combobox` (not just
+// `textbox`) to a password/OTP-shaped `<input>` — `FORM_CONTROL_ROLES` must
+// cover both, matching native's `is_form_control_role`
+// (`crates/native/src/ax.rs`), or a field with one of these roles would
+// never even be probed for redaction.
+test("capture_snapshot_should_redact_value_when_role_is_searchbox_and_dom_type_is_password", async () => {
+    const id = "sess-redact-searchbox-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- searchbox "Password" [ref=e6]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e6");
+                return { evaluate: async () => ({ type: "password", autocomplete: "" }) };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("capture_snapshot_should_redact_value_when_role_is_combobox_and_dom_autocomplete_is_current_password", async () => {
+    const id = "sess-redact-combobox-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- combobox "Password" [ref=e7]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e7");
+                return { evaluate: async () => ({ type: "", autocomplete: "current-password" }) };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
 test("capture_snapshot_should_redact_value_when_dom_autocomplete_is_one_time_code", async () => {
     const id = "sess-redact-otc-1";
     browserGlue.sessions.set(id, {

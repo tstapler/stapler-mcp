@@ -4,4 +4,6 @@ pub mod credential;
 pub mod docs;
 pub mod fetch;
 pub mod search;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod webcrawl;

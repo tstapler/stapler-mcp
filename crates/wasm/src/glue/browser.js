@@ -494,7 +494,11 @@ module.exports.REDACTED_PLACEHOLDER = REDACTED_PLACEHOLDER;
 // fail-safe half of the redaction rule below only applies to nodes that look
 // like a form control in the first place; a button or generic container with
 // no live-DOM entry is not a secret-shaped node and must not be redacted.
-const FORM_CONTROL_ROLES = new Set(["textbox"]);
+// Must stay in lockstep with native's `is_form_control_role`
+// (`crates/native/src/ax.rs`) — a password/OTP field Chromium assigns
+// `searchbox`/`combobox` (rather than `textbox`) needs the same redaction
+// coverage on both adapters (A2 code review fix).
+const FORM_CONTROL_ROLES = new Set(["textbox", "searchbox", "combobox"]);
 
 // Live-DOM collection pass (Task 2.3.1a/2.3.2a): resolves each form-control
 // node already present in the parsed snapshot tree back to its live element

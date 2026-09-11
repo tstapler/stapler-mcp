@@ -101,6 +101,15 @@ extern "C" {
     ) -> js_sys::Promise;
 }
 
+// A1 code review fix: the pre-resolve domain-mismatch gate below needs
+// `vault.js`'s audit-log chokepoint, not `browser.js`'s — a separate
+// `wasm_bindgen` extern block since each binds a different JS module.
+#[wasm_bindgen(module = "/src/glue/vault.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = jsLogResolveOutcome)]
+    fn js_log_resolve_outcome(domain: &str, field: &str, outcome: &str);
+}
+
 /// Object-safe erasure of `CredentialStore` for storage behind `dyn`, mirroring
 /// `crates/native/src/browser.rs`'s identically-named trait/impl/helper.
 /// `CredentialStore::resolve` is a native `async fn` in a trait (ports.rs's
@@ -167,6 +176,20 @@ fn check_credential_domain(live_url: &str, requested_domain: &str) -> Result<(),
     Err(PortError::CredentialDomainMismatch(format!(
         "current page is \"{current_host}\", but this credential is scoped to \"{requested_domain}\" — not typed; call stapler_browser_snapshot to confirm the current page, or use the correct domain"
     )))
+}
+
+/// A1 code review fix: the wasm-side twin of native's `log_resolve_outcome`
+/// match arms, restricted to the two outcomes `check_credential_domain` can
+/// actually produce (a mismatch, or an unparsable URL/domain). Pulled out
+/// so the classification is unit-testable under plain `cargo test` — the
+/// `js_log_resolve_outcome` call itself is an extern JS binding only
+/// exercisable via the `wasm_pack_tests` Node harness below, same
+/// limitation as the rest of `type_secret`.
+fn domain_check_rejection_outcome(e: &PortError) -> &'static str {
+    match e {
+        PortError::CredentialDomainMismatch(_) => "rejected-domain-mismatch",
+        _ => "vault-lookup-failed",
+    }
 }
 
 pub struct WasmBrowser {
@@ -506,7 +529,19 @@ impl BrowserDriver for WasmBrowser {
         let live_url = live_url_value.as_string().ok_or_else(|| {
             PortError::Other("jsBrowserCurrentUrl resolved with a non-string value".to_string())
         })?;
-        check_credential_domain(&live_url, &credential_ref.domain)?;
+        // Logged through the same `vault.js::logResolveOutcome` chokepoint the
+        // resolve-layer rejection uses (A1 code review fix) — otherwise this
+        // early rejection would be silently missing from the audit trail,
+        // since `resolve()` (and its own logging) is never reached on this
+        // path.
+        if let Err(e) = check_credential_domain(&live_url, &credential_ref.domain) {
+            js_log_resolve_outcome(
+                &credential_ref.domain,
+                crate::vault::field_wire_string(credential_ref.field),
+                domain_check_rejection_outcome(&e),
+            );
+            return Err(e);
+        }
 
         let store = resolve_via_injected_store(&self.credential_store)?;
         let secret = store.resolve(credential_ref).await?;
@@ -904,6 +939,24 @@ mod tests {
     #[test]
     fn check_credential_domain_should_succeed_when_live_host_matches_requested_domain() {
         assert!(check_credential_domain("https://example.com/login", "example.com").is_ok());
+    }
+
+    /// A1 regression test: `type_secret`'s pre-resolve domain-mismatch gate
+    /// must classify a `CredentialDomainMismatch` into the same
+    /// "rejected-domain-mismatch" outcome native's `log_resolve_outcome`
+    /// uses for the equivalent resolve-layer rejection — the actual
+    /// `js_log_resolve_outcome` call this classification feeds is an extern
+    /// JS binding exercisable only under `wasm-pack test --node` (see the
+    /// `wasm_pack_tests` module doc comment), so this covers the
+    /// classification `type_secret` calls it with.
+    #[test]
+    fn domain_check_rejection_outcome_should_classify_mismatch_as_rejected_domain_mismatch() {
+        let e = check_credential_domain("https://evil-example.com/", "example.com")
+            .expect_err("fixture host deliberately mismatches");
+        assert_eq!(
+            domain_check_rejection_outcome(&e),
+            "rejected-domain-mismatch"
+        );
     }
 
     // -- Story 4.3.0: store injection, fail-closed with no store --

@@ -152,19 +152,35 @@ function fieldValueFromItem(item, field, domain) {
     return match.value;
 }
 
-// Known-typed SDK errors (`@1password/sdk`'s `errors.js`) get rewritten into
-// a fixed, descriptive message carrying a marker substring
-// `crates/wasm/src/vault.rs`'s `map_js_error` greps for — mirrors native's
-// `build_op_error`'s fixed-message convention (never `format!()`-ing raw
-// SDK/CLI error text wholesale into a `PortError`). A bare, unrecognized
-// `Error` (e.g. `createClient`'s own token-shape validation failure, which
-// isn't one of the SDK's typed error classes) is pattern-matched by message
-// text instead, since that's the only signal available for it.
+// Every path through `resolveUncached`'s try block funnels here, including
+// this module's *own* rejections (`pickUniqueMatch`'s domain-mismatch/
+// ambiguous errors, `fieldValueFromItem`'s no-such-field error) alongside
+// actual `@1password/sdk` failures — so this function must tell the two
+// apart. Our own errors are already fixed, safe, marker-bearing strings (never
+// raw/untrusted text) and are recognized by those same markers and passed
+// through unchanged, so `outcomeForError`/`crates/wasm/src/vault.rs`'s
+// `map_vault_js_error` keep classifying them correctly. Known-typed SDK
+// errors (`@1password/sdk`'s `errors.js`) get rewritten into a fixed,
+// descriptive message carrying a marker substring `map_vault_js_error`
+// greps for — mirrors native's `build_op_error`'s fixed-message convention
+// (never forwarding raw SDK/CLI error text — even as a "Detail: ..."
+// suffix — wholesale into a `PortError`, since that's untrusted backend text
+// reaching the MCP client). Anything else — a bare, unrecognized `Error`
+// (e.g. `createClient`'s own token-shape validation failure, or any SDK
+// error shape this function doesn't yet know about) maps to a fixed,
+// generic message rather than being rethrown verbatim.
 function normalizeVaultError(e) {
     const message = e && e.message ? e.message : String(e);
+    if (
+        message.includes("no vault entry for domain") ||
+        message.includes("ambiguous, not typed") ||
+        /has no ".+" field/.test(message)
+    ) {
+        return e instanceof Error ? e : new Error(message);
+    }
     if (e instanceof RateLimitExceededError || /rate limit/i.test(message)) {
         return new Error(
-            `1Password rate limit exceeded — not typed. Retry after an unspecified delay. Detail: ${message}`,
+            "1Password rate limit exceeded — not typed. Retry after an unspecified delay.",
         );
     }
     if (
@@ -173,10 +189,10 @@ function normalizeVaultError(e) {
         /invalid service account token|not signed in|not authenticated/i.test(message)
     ) {
         return new Error(
-            `1Password SDK reports not authenticated — not typed. This requires human action (verify OP_SERVICE_ACCOUNT_TOKEN); the agent cannot resolve this itself. Detail: ${message}`,
+            "1Password SDK reports not authenticated — not typed. This requires human action (verify OP_SERVICE_ACCOUNT_TOKEN); the agent cannot resolve this itself.",
         );
     }
-    return e instanceof Error ? e : new Error(message);
+    return new Error("vault lookup failed");
 }
 
 // Mirrors native's `log_resolve_outcome` (`crates/native/src/vault.rs`) —
@@ -188,6 +204,13 @@ function normalizeVaultError(e) {
 function logResolveOutcome(domain, field, outcome) {
     console.error(`stapler-mcp: credential resolve domain='${domain}' field=${field} outcome=${outcome}`);
 }
+// Exported so `crates/wasm/src/browser.rs`'s pre-resolve domain-mismatch gate
+// (`type_secret`'s `check_credential_domain` call, Story 4.3.3) can log its
+// own early rejection through this same chokepoint (A1 code review fix) —
+// otherwise that rejection would be silently missing from the audit trail,
+// since `jsResolveCredential` (and its own `logResolveOutcome` call) is never
+// reached on this path.
+module.exports.jsLogResolveOutcome = logResolveOutcome;
 
 // Classifies a (already `normalizeVaultError`-passed) error into native's
 // log-line outcome vocabulary (`resolved`/`rejected-domain-mismatch`/

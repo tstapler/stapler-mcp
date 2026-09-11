@@ -205,6 +205,16 @@ pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 /// drop, and its `Debug` impl never prints the wrapped value — use
 /// `expose()` only at the point the value must actually be used (e.g.
 /// dispatching a keystroke), never in a log line or error message.
+///
+/// This guarantee covers `SecretValue`'s own storage only, not what happens
+/// after `expose()` is called: native's `invoke_on_node`
+/// (`crates/native/src/browser.rs`) copies the exposed plaintext into a
+/// non-zeroizing `String`/`serde_json::Value`/CDP `CallArgument` chain for
+/// the one-shot DOM write, and wasm's `type_secret`
+/// (`crates/wasm/src/browser.rs`) hands it to the JS engine entirely outside
+/// Rust's zeroize reach. This is an accepted residual risk at the point of
+/// use (mirroring `requirements.md`'s "Known Residual Risk" note on the live
+/// DOM write itself), not a redesign.
 pub struct SecretValue(zeroize::Zeroizing<String>);
 
 impl SecretValue {
@@ -296,6 +306,14 @@ pub enum HistoryAction {
 /// construction — exactly 3 legal values, exactly like `HistoryAction` —
 /// so a typo or unexpected value fails to compile rather than silently
 /// misresolving (e.g. falling through to the password-shaped path).
+///
+/// `Username`'s dispatch-time write is gated identically to `Password`'s
+/// (`accepts_secret_write` in `crates/native/src/browser.rs` and its wasm
+/// twin): the live DOM node must still look password-shaped (`type=
+/// "password"`, or a `current-password`/`new-password` autocomplete). A
+/// typical username field (`type="text" autocomplete="username"`) is
+/// refused, per `plan.md`'s Task 3.4.1b design — this is not a bug to fix,
+/// callers should expect it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CredentialField {
     Username,

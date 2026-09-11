@@ -69,6 +69,46 @@ test("js_resolve_credential_should_resolve_password_field_from_item_get_when_fie
     assert.strictEqual(value, "hunter2");
 });
 
+// C4 code review fix: `fieldValueFromItem`'s title-fallback match (used when
+// an item's field has a non-standard `id` but a recognizable `title`) and its
+// "no such field" rejection had zero coverage — every other fixture's
+// requested field id matches a field directly by `id`.
+test("js_resolve_credential_should_resolve_field_by_title_when_id_does_not_match", async () => {
+    const client = singleMatchClient({
+        items: {
+            list: async () => [loginItem("item1", "vault1", "Example Login", "https://example.com/login")],
+            get: async () => ({
+                fields: [{ id: "custom-field-1", title: "Password", value: "hunter2" }],
+            }),
+        },
+    });
+    vaultGlue.__setClientFactoryForTesting(async () => client);
+
+    const value = await vaultGlue.jsResolveCredential("example.com", "password");
+
+    assert.strictEqual(value, "hunter2");
+});
+
+test("js_resolve_credential_should_reject_when_item_has_no_matching_field_by_id_or_title", async () => {
+    const client = singleMatchClient({
+        items: {
+            list: async () => [loginItem("item1", "vault1", "Example Login", "https://example.com/login")],
+            get: async () => ({
+                fields: [{ id: "username", value: "alice" }],
+            }),
+        },
+    });
+    vaultGlue.__setClientFactoryForTesting(async () => client);
+
+    await assert.rejects(
+        () => vaultGlue.jsResolveCredential("example.com", "password"),
+        (err) => {
+            assert.match(err.message, /item for domain "example\.com" has no "password" field — not typed/);
+            return true;
+        },
+    );
+});
+
 test("js_resolve_credential_should_reject_when_no_item_matches_domain", async () => {
     const client = {
         vaults: { list: async () => [{ id: "vault1" }] },
@@ -80,6 +120,42 @@ test("js_resolve_credential_should_reject_when_no_item_matches_domain", async ()
         },
         secrets: { resolve: async () => {
             throw new Error("should not be called on a domain mismatch");
+        } },
+    };
+    vaultGlue.__setClientFactoryForTesting(async () => client);
+
+    await assert.rejects(
+        () => vaultGlue.jsResolveCredential("example.com", "password"),
+        (err) => {
+            assert.match(err.message, /no vault entry for domain "example\.com"/);
+            return true;
+        },
+    );
+});
+
+// C3 code review fix: `itemMatchesDomain`'s `item.category !== "Login"`
+// filter had zero coverage — every existing fixture hardcodes `category:
+// "Login"`. A non-Login item with an otherwise-matching website must still
+// be excluded, the same as a Login item on the wrong domain.
+test("js_resolve_credential_should_reject_when_only_matching_item_is_not_a_login_category", async () => {
+    const client = {
+        vaults: { list: async () => [{ id: "vault1" }] },
+        items: {
+            list: async () => [
+                {
+                    id: "item1",
+                    vaultId: "vault1",
+                    title: "Example Secure Note",
+                    category: "SecureNote",
+                    websites: [{ url: "https://example.com/login" }],
+                },
+            ],
+            get: async () => {
+                throw new Error("should not be called on a category mismatch");
+            },
+        },
+        secrets: { resolve: async () => {
+            throw new Error("should not be called on a category mismatch");
         } },
     };
     vaultGlue.__setClientFactoryForTesting(async () => client);
@@ -217,19 +293,27 @@ test("js_resolve_credential_pending_map_should_be_empty_when_all_waiters_served"
 
 // -- Error mapping (Task 4.3.1b's JS-side source of the markers it greps for) --
 
-test("js_resolve_credential_should_normalize_rate_limit_error_when_sdk_throws_rate_limit_exceeded", async () => {
-    const { RateLimitExceededError } = require("@1password/sdk");
-    const client = singleMatchClient({
+// Builds a `singleMatchClient` whose `items.list()` throws `thrown` instead
+// of returning matches — shared by the rate-limit/raw-text-leak tests below
+// so each only states what varies: the thrown error and the assertion.
+function listRejectingClient(thrown) {
+    return singleMatchClient({
         items: {
             list: async () => {
-                throw new RateLimitExceededError("account-wide rate limit hit");
+                throw thrown;
             },
             get: async () => {
                 throw new Error("unreachable");
             },
         },
     });
-    vaultGlue.__setClientFactoryForTesting(async () => client);
+}
+
+test("js_resolve_credential_should_normalize_rate_limit_error_when_sdk_throws_rate_limit_exceeded", async () => {
+    const { RateLimitExceededError } = require("@1password/sdk");
+    vaultGlue.__setClientFactoryForTesting(async () =>
+        listRejectingClient(new RateLimitExceededError("account-wide rate limit hit")),
+    );
 
     await assert.rejects(
         () => vaultGlue.jsResolveCredential("example.com", "password"),
@@ -256,6 +340,52 @@ test("js_resolve_credential_should_normalize_unauthenticated_error_when_create_c
     );
 });
 
+test("js_resolve_credential_should_never_forward_raw_sdk_error_text_when_rate_limited", async () => {
+    const { RateLimitExceededError } = require("@1password/sdk");
+    vaultGlue.__setClientFactoryForTesting(async () =>
+        listRejectingClient(new RateLimitExceededError("internal-detail-should-not-leak-12345")),
+    );
+
+    await assert.rejects(
+        () => vaultGlue.jsResolveCredential("example.com", "password"),
+        (err) => {
+            assert.doesNotMatch(err.message, /internal-detail-should-not-leak-12345/);
+            assert.doesNotMatch(err.message, /Detail:/);
+            return true;
+        },
+    );
+});
+
+test("js_resolve_credential_should_never_forward_raw_sdk_error_text_when_create_client_rejects_unauthenticated", async () => {
+    vaultGlue.__setClientFactoryForTesting(async () => {
+        throw new Error("not signed in — session-token-abc123-should-not-leak");
+    });
+
+    await assert.rejects(
+        () => vaultGlue.jsResolveCredential("example.com", "password"),
+        (err) => {
+            assert.doesNotMatch(err.message, /session-token-abc123-should-not-leak/);
+            assert.doesNotMatch(err.message, /Detail:/);
+            return true;
+        },
+    );
+});
+
+test("js_resolve_credential_should_map_unrecognized_sdk_error_to_fixed_generic_message_never_raw_text", async () => {
+    vaultGlue.__setClientFactoryForTesting(async () =>
+        listRejectingClient(new Error("some unexpected internal SDK failure with sensitive-token-xyz")),
+    );
+
+    await assert.rejects(
+        () => vaultGlue.jsResolveCredential("example.com", "password"),
+        (err) => {
+            assert.strictEqual(err.message, "vault lookup failed");
+            assert.doesNotMatch(err.message, /sensitive-token-xyz/);
+            return true;
+        },
+    );
+});
+
 // -- Observability (Epic 5.4, Task 5.4.1b) --
 //
 // No existing console-capture helper exists elsewhere in this test file (or
@@ -274,6 +404,23 @@ async function captureConsoleError(fn) {
     }
     return lines;
 }
+
+// A1 regression test: `crates/wasm/src/browser.rs`'s pre-resolve
+// domain-mismatch gate (`type_secret`'s `check_credential_domain` call) logs
+// through this exported `jsLogResolveOutcome`, not through
+// `jsResolveCredential`'s own `resolveUncached` try/catch — so it needs its
+// own coverage, separate from the `jsResolveCredential`-driven log tests
+// below.
+test("js_log_resolve_outcome_should_emit_same_line_shape_as_resolve_layer_logging", async () => {
+    const lines = await captureConsoleError(async () => {
+        vaultGlue.jsLogResolveOutcome("example.com", "password", "rejected-domain-mismatch");
+    });
+
+    assert.strictEqual(lines.length, 1);
+    assert.match(lines[0], /domain='example\.com'/);
+    assert.match(lines[0], /field=password/);
+    assert.match(lines[0], /outcome=rejected-domain-mismatch/);
+});
 
 test("js_resolve_credential_should_emit_log_line_with_domain_field_and_outcome_when_rejected", async () => {
     const client = {
@@ -458,8 +605,13 @@ function buildParityFixtureTable() {
     ];
 }
 
-test("resolve_should_return_matching_port_error_variant_when_run_against_fixture_table_on_both_adapters", async () => {
-    for (const fixture of buildParityFixtureTable()) {
+// C5 code review fix: this table used to run as a plain `for` loop inside one
+// `test()` — a failure on fixture N silently skipped fixtures N+1..end for
+// that run (`assert.rejects` throwing aborts the loop). Per-fixture
+// `node:test` subtests mean every fixture always runs and reports
+// independently, regardless of an earlier fixture's outcome.
+for (const fixture of buildParityFixtureTable()) {
+    test(`resolve_should_match_port_error_variant: ${fixture.label}`, async () => {
         if (fixture.client) {
             vaultGlue.__setClientFactoryForTesting(async () => fixture.client);
         } else {
@@ -476,5 +628,5 @@ test("resolve_should_return_matching_port_error_variant_when_run_against_fixture
             },
             `fixture "${fixture.label}" should reject`,
         );
-    }
-});
+    });
+}

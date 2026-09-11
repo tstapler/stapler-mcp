@@ -26,8 +26,10 @@ extern "C" {
 /// except `Totp` is a real, reachable wire value here (native's
 /// `field_wire_segment` deliberately never handles it, since native routes
 /// TOTP through a different `op` subcommand entirely) — `vault.js`'s own
-/// field-conditional branch is what dispatches on it.
-fn field_wire_string(field: CredentialField) -> &'static str {
+/// field-conditional branch is what dispatches on it. `pub(crate)` so
+/// `browser.rs`'s pre-resolve domain-mismatch audit-log call (A1 code review
+/// fix) can reuse the same wire strings rather than re-deriving them.
+pub(crate) fn field_wire_string(field: CredentialField) -> &'static str {
     match field {
         CredentialField::Username => "username",
         CredentialField::Password => "password",
@@ -141,6 +143,23 @@ mod tests {
         match err {
             PortError::CredentialRateLimited(m) => assert_eq!(m, message),
             other => panic!("expected PortError::CredentialRateLimited, got {other:?}"),
+        }
+    }
+
+    /// C2 code review fix: the domain-mismatch/unauthenticated/rate-limit
+    /// branches above all had coverage, but nothing exercised the "expired"
+    /// branch (`PortError::CredentialExpired`) — checked last in
+    /// `map_vault_js_error`'s precedence order specifically so it never
+    /// shadows the unauthenticated branch (see that function's doc comment).
+    #[test]
+    fn map_vault_js_error_should_map_expired_marker_to_credential_expired() {
+        let message = "TOTP code for example.com expired before it could be typed".to_string();
+
+        let err = map_vault_js_error(message.clone());
+
+        match err {
+            PortError::CredentialExpired(m) => assert_eq!(m, message),
+            other => panic!("expected PortError::CredentialExpired, got {other:?}"),
         }
     }
 

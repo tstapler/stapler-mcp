@@ -405,7 +405,11 @@ pub struct CredentialRefInput {
     /// Which credential to type. Field names must match 1Password's
     /// field labels for the item; `totp` requests the item's
     /// current TOTP/2FA code (generated fresh by 1Password, never
-    /// cached).
+    /// cached). `username` is dispatch-gated identically to `password`: the
+    /// target must still look password-shaped to the live DOM (`type=
+    /// "password"`, or a `current-password`/`new-password` autocomplete) —
+    /// a typical username field (`type="text" autocomplete="username"`) is
+    /// refused, not silently typed as plaintext.
     pub field: CredentialFieldInput,
 }
 

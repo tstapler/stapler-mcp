@@ -305,14 +305,27 @@ async fn resolve_uncached<S: ProcessSpawner>(
     result
 }
 
-/// Converts `field` to its lowercase `op://` wire segment. `Totp` never
-/// reaches this — it resolves via `op item get --otp` (its own branch in
-/// `build_argv`), not `op read`.
-fn field_wire_segment(field: CredentialField) -> &'static str {
+/// The 2-variant subset of `CredentialField` that resolves via `op read`
+/// (`Totp` resolves via `op item get --otp` instead — `build_argv`'s other
+/// match arm). B1 code review fix: previously `field_wire_segment` took a
+/// bare `CredentialField` and handled `Totp` with an `unreachable!()`,
+/// relied on solely by `build_argv` never calling it from the `Totp` arm —
+/// nothing in the type system enforced that. `build_argv`'s `Username |
+/// Password` arm now constructs this type before calling into the
+/// wire-string logic, making `Totp` structurally inexpressible as an
+/// argument to `field_wire_segment` rather than merely unreachable at
+/// runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadableField {
+    Username,
+    Password,
+}
+
+/// Converts `field` to its lowercase `op://` wire segment.
+fn field_wire_segment(field: ReadableField) -> &'static str {
     match field {
-        CredentialField::Username => "username",
-        CredentialField::Password => "password",
-        CredentialField::Totp => unreachable!("Totp resolves via op item get, not op read"),
+        ReadableField::Username => "username",
+        ReadableField::Password => "password",
     }
 }
 
@@ -332,13 +345,20 @@ fn build_argv(field: CredentialField, vault_id: &str, item_id: &str) -> Vec<Stri
             item_id.to_string(),
             "--otp".to_string(),
         ],
-        CredentialField::Username | CredentialField::Password => vec![
-            "op".to_string(),
-            "read".to_string(),
-            "--vault".to_string(),
-            vault_id.to_string(),
-            format!("op://{vault_id}/{item_id}/{}", field_wire_segment(field)),
-        ],
+        CredentialField::Username | CredentialField::Password => {
+            let readable = if field == CredentialField::Username {
+                ReadableField::Username
+            } else {
+                ReadableField::Password
+            };
+            vec![
+                "op".to_string(),
+                "read".to_string(),
+                "--vault".to_string(),
+                vault_id.to_string(),
+                format!("op://{vault_id}/{item_id}/{}", field_wire_segment(readable)),
+            ]
+        }
     }
 }
 
@@ -417,8 +437,10 @@ thread_local! {
     /// Test-only override for `log_resolve_outcome`'s destination — lets
     /// tests assert the audit line's shape without OS-level stderr capture.
     /// `None` (production, and any test that never sets it) falls through
-    /// to the real `eprintln!`.
-    static TEST_LOG_SINK: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    /// to the real `eprintln!`. `pub(crate)` so `browser.rs`'s own
+    /// `log_resolve_outcome` regression tests (the pre-resolve
+    /// domain-mismatch gate, Story 3.4.3) can drive the same sink.
+    pub(crate) static TEST_LOG_SINK: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
 /// One `eprintln!` line per `resolve()` attempt (REQ-19/Epic 5.4's
@@ -430,7 +452,11 @@ thread_local! {
 /// `SecretValue`'s non-leaking `Debug` rather than manually formatting the
 /// exposed value. A rejection is logged identically to a success (`ux.md`
 /// §3: both are equally audit-worthy).
-fn log_resolve_outcome(
+/// `pub(crate)` so `browser.rs`'s pre-resolve domain-mismatch gate (Story
+/// 3.4.3's `check_credential_domain` call site in `type_secret`) can log its
+/// own early rejection through this same chokepoint, keeping both gates
+/// equally audit-visible.
+pub(crate) fn log_resolve_outcome(
     domain: &str,
     field: CredentialField,
     result: &Result<SecretValue, PortError>,

@@ -904,6 +904,20 @@ fn check_credential_domain(live_url: &str, requested_domain: &str) -> Result<(),
     )))
 }
 
+/// A1 code review fix: `check_credential_domain`'s rejection used to
+/// early-return via `?` before `type_secret` ever reached
+/// `CredentialStore::resolve`, silently skipping the audit trail for exactly
+/// the rejection case the resolve-layer chokepoint (`vault::log_resolve_outcome`)
+/// already logs — the same gap `465395e` fixed for `vault.rs`'s own uncached
+/// domain-lookup path. Pulled out of `type_secret`'s body so it's
+/// unit-testable without a live `Page`/session (`check_credential_domain`'s
+/// own error, unlike the rest of `type_secret`, needs no Chrome connection).
+fn log_domain_check_rejection(domain: &str, field: CredentialField, e: PortError) -> PortError {
+    let loggable: Result<SecretValue, PortError> = Err(e);
+    crate::vault::log_resolve_outcome(domain, field, &loggable);
+    loggable.unwrap_err()
+}
+
 /// Task 3.4.1b's dispatch-time redaction-key re-check, decision half: given
 /// the live node's own `type`/`autocomplete`, is it shaped enough like a
 /// password/TOTP field for `type_secret` to write into? Deliberately the
@@ -1749,8 +1763,18 @@ impl BrowserDriver for NativeBrowser {
                 .unwrap_or_else(|| latest_url.borrow().clone());
 
             // Story 3.4.3: gate on the live URL before touching the vault at
-            // all.
-            check_credential_domain(&url_before, &credential_ref.domain)?;
+            // all. Logged (A1 code review fix) through the same
+            // `vault::log_resolve_outcome` chokepoint the resolve-layer
+            // rejection uses — otherwise a rejection here would be silently
+            // missing from the audit trail, since `resolve()` (and its own
+            // logging) is never reached on this path.
+            if let Err(e) = check_credential_domain(&url_before, &credential_ref.domain) {
+                return Err(log_domain_check_rejection(
+                    &credential_ref.domain,
+                    credential_ref.field,
+                    e,
+                ));
+            }
 
             // Resolved synchronously (no CDP round trip) before the
             // (potentially slow) vault lookup below, so a `ref` that's
@@ -3905,6 +3929,33 @@ mod tests {
         assert!(check_credential_domain("https://example.com/login", "example.com").is_ok());
     }
 
+    /// A1 regression test (mirrors `vault.rs`'s `465395e`-fixed
+    /// `native_credential_store_resolve_should_emit_log_line_when_uncached_domain_lookup_is_rejected`):
+    /// `type_secret`'s pre-resolve domain-mismatch gate must be just as
+    /// audit-visible as the resolve-layer rejection, not silently skip the
+    /// audit trail just because it rejects before ever calling
+    /// `CredentialStore::resolve`.
+    #[test]
+    fn log_domain_check_rejection_should_emit_log_line_for_pre_resolve_domain_mismatch() {
+        let mismatch = check_credential_domain("https://evil-example.com/", "example.com")
+            .expect_err("fixture host deliberately mismatches");
+
+        crate::vault::TEST_LOG_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+        let returned =
+            log_domain_check_rejection("example.com", CredentialField::Password, mismatch);
+        let lines = crate::vault::TEST_LOG_SINK.with(|s| s.borrow_mut().take().unwrap());
+
+        assert!(matches!(returned, PortError::CredentialDomainMismatch(_)));
+        assert_eq!(
+            lines.len(),
+            1,
+            "the pre-resolve domain-mismatch gate must log exactly like the resolve-layer chokepoint"
+        );
+        assert!(lines[0].contains("domain='example.com'"));
+        assert!(lines[0].contains("field=password"));
+        assert!(lines[0].contains("outcome=rejected-domain-mismatch"));
+    }
+
     // -- Story 3.4.0: store injection, fail-closed with no store --
 
     #[tokio::test]
@@ -3949,6 +4000,147 @@ mod tests {
             Err(other) => panic!("expected PortError::CredentialUnauthenticated, got {other:?}"),
             Ok(_) => panic!("expected an error with no store injected, got Ok"),
         }
+    }
+
+    // ---- B2 code review fix: `type_secret`'s full real sequence, against a
+    // real Chrome ----
+    //
+    // Every sub-function `type_secret` calls (`accepts_secret_write`,
+    // `check_credential_domain`, `redact_node_by_ref`,
+    // `resolve_via_injected_store`) is unit-tested in isolation above, but
+    // nothing previously drove the real method end to end: domain-check ->
+    // resolve -> verify-live -> DOM-write -> redact, in order, against an
+    // actual live DOM. `#[ignore]`d for the same reason as `ax.rs`'s real-Chrome
+    // tests (needs a real Chromium binary) — run with `cargo test -- --ignored`.
+
+    /// Minimal same-process HTTP server bound to `127.0.0.1`, serving `html`
+    /// for every request. A real bound host (unlike a `data:` URL, which
+    /// `Url::host_str()` never returns `Some` for) is required so
+    /// `check_credential_domain`'s live-URL gate has something to match
+    /// against — mirrors `crates/cli/tests/browser_session.rs`'s
+    /// `spawn_mock_site`, scaled down to the single fixed page this test
+    /// needs.
+    async fn spawn_single_page_site(
+        html: &'static str,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock site");
+        let addr = listener.local_addr().expect("mock site addr");
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { return };
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let _ = stream.read(&mut buf).await;
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                html.len(),
+                                html
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        (format!("http://{addr}/"), shutdown_tx)
+    }
+
+    fn find_node_by_role<'a>(node: &'a AxNode, role: &str) -> Option<&'a AxNode> {
+        if node.role == role {
+            return Some(node);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_node_by_role(child, role))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires a real Chrome; run with `cargo test -- --ignored`"]
+    async fn native_browser_type_secret_should_write_plaintext_to_live_dom_and_redact_returned_snapshot_against_real_chrome(
+    ) {
+        // `NativeBrowser::launch()` spawns its idle-session reaper via
+        // `tokio::task::spawn_local` (not `Send`, like every other `Rc`-based
+        // piece of this struct — see `spawn_reaper`), so this whole test must
+        // run inside a `LocalSet`, mirroring `vault.rs`'s
+        // `#[tokio::test(flavor = "current_thread")]` + `LocalSet` convention
+        // for the same reason.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let html =
+                    "<!doctype html><html><body><input type=\"password\" id=\"pw\"></body></html>";
+                let (site_url, _shutdown_site) = spawn_single_page_site(html).await;
+
+                let mut browser = NativeBrowser::launch()
+                    .await
+                    .expect("Chrome must be installed to run this ignored integration test");
+                browser.set_credential_store(Rc::new(FakeCredentialStore::with_response(Ok(
+                    "hunter2".to_string(),
+                ))));
+
+                let nav = browser
+                    .navigate(&site_url, None, Duration::from_secs(30))
+                    .await
+                    .expect("navigate should succeed against the local mock site");
+
+                let password_node = find_node_by_role(&nav.snapshot.root, "textbox")
+                    .expect("the password field should surface as a textbox in the AX tree");
+                let locator = Locator(password_node.node_ref.clone());
+
+                let credential_ref = CredentialRef {
+                    domain: "127.0.0.1".to_string(),
+                    field: CredentialField::Password,
+                };
+                let result_snapshot = browser
+                    .type_secret(
+                        &nav.session_id,
+                        &locator,
+                        &credential_ref,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("type_secret should succeed against a real password field");
+
+                // (b): the returned `AxSnapshot` shows the redaction placeholder,
+                // not the plaintext.
+                let redacted_node = find_node_by_role(&result_snapshot.root, "textbox")
+                    .expect("password field should still be present after type_secret");
+                assert_eq!(
+                    redacted_node.value.as_deref(),
+                    Some(stapler_mcp_core::ports::REDACTED_PLACEHOLDER),
+                    "the returned snapshot must redact the just-typed secret, never surface it"
+                );
+
+                // (a): the live DOM actually received the plaintext value — read
+                // back via a *separate* `evaluate()` call, never through the
+                // (deliberately redacted) snapshot.
+                let live_value = browser
+                    .evaluate(
+                        &nav.session_id,
+                        "() => document.getElementById('pw').value",
+                        None,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("evaluate should succeed");
+                assert_eq!(
+                    live_value.as_str(),
+                    Some("hunter2"),
+                    "the live DOM must actually have received the resolved secret's plaintext value"
+                );
+
+                browser.close().await;
+            })
+            .await;
     }
 
     // ---- Epic 6 / Story 6.1: reaper eviction through the public tool API

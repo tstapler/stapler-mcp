@@ -103,6 +103,36 @@ mod tests {
         assert_eq!(result.exit_code, 0);
     }
 
+    /// C1 code review fix: the `.env_clear()` hardening (pitfalls.md §1c —
+    /// stops daemon secrets leaking into the `op` subprocess environment) had
+    /// zero test coverage. Sets a canary env var the daemon process would
+    /// otherwise inherit, spawns `/usr/bin/env` (which just dumps its own
+    /// environment to stdout) through `spawn_and_capture`, and asserts the
+    /// canary never reaches the child — while `PATH` (one of the two
+    /// explicitly allow-listed vars) still does, proving the child process
+    /// actually ran with a real, non-empty environment rather than merely
+    /// failing to launch.
+    #[tokio::test]
+    async fn spawn_and_capture_should_clear_env_except_allowlisted_vars_when_spawning_child() {
+        std::env::set_var("STAPLER_MCP_TEST_CANARY", "should-not-leak-into-child-env");
+        let spawner = NativeSpawner;
+
+        let result = spawner.spawn_and_capture(&["/usr/bin/env"]).await;
+
+        std::env::remove_var("STAPLER_MCP_TEST_CANARY");
+        let result = result.unwrap();
+
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            !stdout.contains("STAPLER_MCP_TEST_CANARY"),
+            "child environment must not inherit arbitrary daemon env vars, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("PATH="),
+            "the explicitly allow-listed PATH var should still reach the child, got: {stdout}"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_and_capture_should_separate_stdout_and_stderr_when_command_fails() {
         let spawner = NativeSpawner;
