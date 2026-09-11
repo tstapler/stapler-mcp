@@ -11,6 +11,7 @@ mod lock;
 mod sleep;
 mod socket;
 mod spawn;
+mod vault;
 
 pub use browser::NativeBrowser;
 pub use embed::NativeEmbedder;
@@ -21,3 +22,4 @@ pub use lock::{NativeLock, NativeLockGuard};
 pub use sleep::{NativeClock, NativeSleeper};
 pub use socket::{NativeConn, NativeListener, NativeSocketFactory};
 pub use spawn::NativeSpawner;
+pub use vault::NativeCredentialStore;

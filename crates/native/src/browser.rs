@@ -21,10 +21,11 @@ use chromiumoxide::{keys, Browser, BrowserConfig, Page};
 use futures::StreamExt;
 
 use stapler_mcp_core::ports::{
-    AxSnapshot, BrowserDriver, ClockPort, HistoryAction, Locator, NavigateResult, PageExtract,
-    PortError, SessionId, SessionSummary, SleepPort, TabAction, TabInfo, TabsResult, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, ClockPort, CredentialField, CredentialRef, CredentialStore,
+    HistoryAction, Locator, NavigateResult, PageExtract, PortError, SecretValue, SessionId,
+    SessionSummary, SleepPort, TabAction, TabInfo, TabsResult, WaitCondition, REDACTED_PLACEHOLDER,
 };
-use stapler_mcp_core::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
+use stapler_mcp_core::tools::webcrawl::{blocked_host_reason, same_host, NetworkPolicy};
 use url::Url;
 
 use crate::ax;
@@ -351,6 +352,58 @@ pub struct NativeBrowser {
     /// `pub` so `crates/cli/src/main.rs`'s shutdown sequence can
     /// `take()`/`abort()` it before `close()`ing the browser (Story 2.4).
     pub reaper: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Injected post-construction via `set_credential_store` (Story 3.4.0) —
+    /// `None` until the daemon wires one up (Phase 6), so `type_secret` must
+    /// fail closed rather than panic when it's unset. `Rc<dyn
+    /// DynCredentialStore>`, not `Rc<dyn CredentialStore>`: see
+    /// `DynCredentialStore`'s doc comment for why the latter can't be named
+    /// at all.
+    credential_store: RefCell<Option<Rc<dyn DynCredentialStore>>>,
+}
+
+/// Object-safe erasure of `CredentialStore` for storage behind `dyn`.
+/// `CredentialStore::resolve` is a native `async fn` in a trait (ports.rs's
+/// deliberate choice, documented at the top of that file, for every *other*
+/// port — generic callers, never `Box<dyn Port>`) — but that shape is not
+/// dyn-compatible (return-position-impl-trait-in-trait has no vtable-safe
+/// representation), so `dyn CredentialStore` cannot be named at all
+/// (confirmed: `rustc --explain E0038`). `type_secret`'s design (`ports.rs`'s
+/// trait doc comment) specifically wants a `NativeBrowser`-owned handle
+/// injected *after* construction, with `launch()`'s own signature staying
+/// non-generic — that rules out making `NativeBrowser` generic over `S:
+/// CredentialStore` instead, since the concrete type would then need to be
+/// known at construction time. This shim is the standard erasure pattern for
+/// exactly that mismatch: box the future once, at the boundary, so the outer
+/// trait object only ever needs to promise a `Future`, not an `async fn`.
+trait DynCredentialStore {
+    fn resolve<'a>(
+        &'a self,
+        credential_ref: &'a CredentialRef,
+    ) -> futures::future::LocalBoxFuture<'a, Result<SecretValue, PortError>>;
+}
+
+impl<T: CredentialStore> DynCredentialStore for T {
+    fn resolve<'a>(
+        &'a self,
+        credential_ref: &'a CredentialRef,
+    ) -> futures::future::LocalBoxFuture<'a, Result<SecretValue, PortError>> {
+        Box::pin(CredentialStore::resolve(self, credential_ref))
+    }
+}
+
+/// Story 3.4.0's fail-closed lookup: `None` (no `set_credential_store` call
+/// ever made) becomes `PortError::CredentialUnauthenticated`, not a panic —
+/// pulled out of `type_secret`'s body so it's unit-testable against a bare
+/// `RefCell` slot, without needing a live `NativeBrowser` (which needs a real
+/// Chromium binary to construct at all).
+fn resolve_via_injected_store(
+    slot: &RefCell<Option<Rc<dyn DynCredentialStore>>>,
+) -> Result<Rc<dyn DynCredentialStore>, PortError> {
+    slot.borrow().clone().ok_or_else(|| {
+        PortError::CredentialUnauthenticated(
+            "no credential store is configured for this browser session — not typed".to_string(),
+        )
+    })
 }
 
 /// RAII reservation for the `MAX_OPEN_SESSIONS` cap: `navigate()`'s no-`session_id`
@@ -418,6 +471,7 @@ impl NativeBrowser {
             next_id: Cell::new(0),
             pending_new_sessions: Cell::new(0),
             reaper: RefCell::new(Some(reaper)),
+            credential_store: RefCell::new(None),
         })
     }
 
@@ -427,6 +481,19 @@ impl NativeBrowser {
         let n = self.next_id.get();
         self.next_id.set(n + 1);
         format!("sess-{:x}-{:x}", now_millis(), n)
+    }
+
+    /// Injects the `CredentialStore` `type_secret` resolves against
+    /// internally (Story 3.4.0). Interior mutability, matching this struct's
+    /// existing `RefCell`/`Cell` convention, so `launch()`'s own signature
+    /// doesn't need a new generic parameter — the daemon calls this once,
+    /// post-construction, at startup (Phase 6 wiring). Generic over `S`
+    /// rather than taking `Rc<dyn CredentialStore>` directly (as originally
+    /// sketched) only because the latter can't be named at all — see
+    /// `DynCredentialStore`'s doc comment; callers write this exactly the
+    /// same either way (`browser.set_credential_store(Rc::new(store))`).
+    pub fn set_credential_store<S: CredentialStore + 'static>(&self, store: Rc<S>) {
+        *self.credential_store.borrow_mut() = Some(store as Rc<dyn DynCredentialStore>);
     }
 }
 
@@ -789,6 +856,13 @@ async fn dispatch_click(page: &Page, backend_node_id: BackendNodeId) -> Result<(
     .await
 }
 
+/// Shared by `dispatch_type` and `type_secret`'s DOM write (Task 3.4.1c:
+/// "reuse `dispatch_type`'s exact JS") — a single constant so the two call
+/// sites can never drift apart.
+const TYPE_VALUE_JS: &str = "function(text) { this.focus(); this.value = text; \
+     this.dispatchEvent(new Event('input', {bubbles: true})); \
+     this.dispatchEvent(new Event('change', {bubbles: true})); }";
+
 async fn dispatch_type(
     page: &Page,
     backend_node_id: BackendNodeId,
@@ -799,12 +873,138 @@ async fn dispatch_type(
         page,
         backend_node_id,
         "type",
-        "function(text) { this.focus(); this.value = text; \
-         this.dispatchEvent(new Event('input', {bubbles: true})); \
-         this.dispatchEvent(new Event('change', {bubbles: true})); }",
+        TYPE_VALUE_JS,
         vec![serde_json::Value::String(text.to_string())],
     )
     .await
+}
+
+/// Story 3.4.3: rejects `type_secret` when the session's freshly-queried
+/// live URL doesn't match `credential_ref`'s requested domain — checked
+/// *before* `CredentialStore::resolve` is ever called, closing the same
+/// same-call-redirect staleness class `6b6b56a` already fixed for the SSRF
+/// guard (a cached `latest_url` would let a same-call redirect slip a
+/// credential past this check).
+fn check_credential_domain(live_url: &str, requested_domain: &str) -> Result<(), PortError> {
+    let live = Url::parse(live_url).map_err(|_| {
+        PortError::Other(format!(
+            "current page url \"{live_url}\" could not be parsed"
+        ))
+    })?;
+    // A bare host has no scheme; `same_host` only compares `Url::host_str()`
+    // (mirrors `vault.rs::lookup_domain`'s identical construction).
+    let requested = Url::parse(&format!("https://{requested_domain}"))
+        .map_err(|_| PortError::Other(format!("invalid domain \"{requested_domain}\"")))?;
+    if same_host(&live, &requested) {
+        return Ok(());
+    }
+    let current_host = live.host_str().unwrap_or(live_url);
+    Err(PortError::CredentialDomainMismatch(format!(
+        "current page is \"{current_host}\", but this credential is scoped to \"{requested_domain}\" — not typed; call stapler_browser_snapshot to confirm the current page, or use the correct domain"
+    )))
+}
+
+/// A1 code review fix: `check_credential_domain`'s rejection used to
+/// early-return via `?` before `type_secret` ever reached
+/// `CredentialStore::resolve`, silently skipping the audit trail for exactly
+/// the rejection case the resolve-layer chokepoint (`vault::log_resolve_outcome`)
+/// already logs — the same gap `465395e` fixed for `vault.rs`'s own uncached
+/// domain-lookup path. Pulled out of `type_secret`'s body so it's
+/// unit-testable without a live `Page`/session (`check_credential_domain`'s
+/// own error, unlike the rest of `type_secret`, needs no Chrome connection).
+fn log_domain_check_rejection(domain: &str, field: CredentialField, e: PortError) -> PortError {
+    let loggable: Result<SecretValue, PortError> = Err(e);
+    crate::vault::log_resolve_outcome(domain, field, &loggable);
+    let Err(e) = loggable else {
+        unreachable!("loggable is always Err by construction, just above")
+    };
+    e
+}
+
+/// Task 3.4.1b's dispatch-time redaction-key re-check, decision half: given
+/// the live node's own `type`/`autocomplete`, is it shaped enough like a
+/// password/TOTP field for `type_secret` to write into? Deliberately the
+/// *same* accept-key `ax.rs`'s structural redaction pass uses (see
+/// `AxNode::value`'s doc comment) — a narrower check here would refuse a
+/// write into a field structural redaction would still correctly redact
+/// after the fact.
+fn accepts_secret_write(field: CredentialField, node_type: &str, autocomplete: &str) -> bool {
+    match field {
+        CredentialField::Totp => autocomplete == "one-time-code" || node_type == "password",
+        CredentialField::Password | CredentialField::Username => {
+            node_type == "password" || matches!(autocomplete, "current-password" | "new-password")
+        }
+    }
+}
+
+/// CDP half of the Task 3.4.1b re-check: reads the resolved node's live
+/// `type`/`autocomplete` via one `Runtime.callFunctionOn` eval, mirroring
+/// `ax.rs`'s `probe_redaction` (kept as a separate eval here, rather than
+/// reused directly, since that function is private to `ax.rs` and only ever
+/// returns a bool — `accepts_secret_write` above needs the actual field
+/// values to key off per-`CredentialField`, not just a yes/no). `Err(())` on
+/// any CDP failure (node gone, resolution failure, thrown exception) is the
+/// fail-safe signal — the caller treats it as "does not accept a write",
+/// same convention as `probe_redaction`.
+async fn probe_type_and_autocomplete(
+    page: &Page,
+    backend_node_id: BackendNodeId,
+) -> Result<(String, String), ()> {
+    let object_id = resolve_object_id(page, backend_node_id)
+        .await
+        .map_err(|_| ())?;
+
+    let params = CallFunctionOnParams::builder()
+        .object_id(object_id)
+        .function_declaration(
+            "function() { return { type: this.type || '', autocomplete: this.autocomplete || '' }; }",
+        )
+        .return_by_value(true)
+        .build()
+        .map_err(|_| ())?;
+
+    let response = page.execute(params).await.map_err(|_| ())?;
+    if response.result.exception_details.is_some() {
+        return Err(());
+    }
+
+    let value = response.result.result.value.as_ref().ok_or(())?;
+    let node_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let autocomplete = value
+        .get("autocomplete")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok((node_type, autocomplete))
+}
+
+/// `ux.md` §4 example-5's verbatim refusal template, substituting the real
+/// `ref`/role.
+fn secret_field_shape_refusal(ref_id: &str, role: &str) -> PortError {
+    PortError::NotActionable(format!(
+        "type_secret refused: ref \"{ref_id}\" resolves to a plain text field (role={role}, no protected/password state), not a password or TOTP input — use stapler_browser_type for non-secret fields, or re-snapshot if this field should be a password field."
+    ))
+}
+
+/// Story 3.4.2: unconditionally redacts `type_secret`'s own acted-on node in
+/// its returned snapshot, independent of whatever `ax.rs`'s structural
+/// redaction pass already decided for it — belt-and-suspenders for a field
+/// shape the structural key doesn't happen to catch (`architecture.md` §6).
+/// `node_ref` strings are unique within one `AxSnapshot` (`ax.rs`'s
+/// `next_ref_id` counter), so this stops at the first match rather than
+/// walking the rest of the tree once found.
+fn redact_node_by_ref(node: &mut AxNode, node_ref: &str) -> bool {
+    if node.node_ref == node_ref {
+        node.value = Some(REDACTED_PLACEHOLDER.to_string());
+        return true;
+    }
+    node.children
+        .iter_mut()
+        .any(|child| redact_node_by_ref(child, node_ref))
 }
 
 async fn dispatch_select_option(
@@ -1481,6 +1681,189 @@ impl BrowserDriver for NativeBrowser {
             Action::Type(text.to_string()),
         )
         .await
+    }
+
+    /// Epic 3.4: resolves `credential_ref` internally (never accepted as a
+    /// resolved value from the caller — see the trait doc comment) and types
+    /// it into `locator`, with two safety gates `type_text` doesn't have and
+    /// one belt-and-suspenders redaction step:
+    ///
+    /// 1. **Domain check first** (Story 3.4.3): `credential_ref.domain` is
+    ///    matched against this call's own freshly-queried `page.url()` — not
+    ///    a cached `latest_url` — *before* `CredentialStore::resolve` is ever
+    ///    invoked, so a same-call redirect can't slip a credential past the
+    ///    check.
+    /// 2. **Dispatch-time type re-check** (Story 3.4.1): run immediately
+    ///    before the write, after `verify_node_live`'s own TOCTOU check, so
+    ///    the (potentially slow) `resolve()` call sits *before* both checks
+    ///    rather than between them and the write — a locator that no longer
+    ///    resolves to a password/TOTP-shaped field is refused with
+    ///    `PortError::NotActionable`, never silently typed into.
+    /// 3. **Own-node redaction** (Story 3.4.2): the acted-on node's `value`
+    ///    in the returned snapshot is unconditionally forced to
+    ///    `REDACTED_PLACEHOLDER`, independent of whatever the structural
+    ///    redaction pass already decided for it.
+    ///
+    /// Deliberately its own method rather than a `dispatch_action`/`Action`
+    /// variant like `click`/`type_text`: that shared helper resolves the
+    /// locator and calls `verify_node_live` back-to-back, immediately before
+    /// dispatch, for every action uniformly — there's no seam in it for an
+    /// `.await`ing `CredentialStore::resolve` call that must land *between*
+    /// locator resolution and `verify_node_live` (per the ordering above),
+    /// without either double-locking this session's mutex or duplicating
+    /// `verify_node_live`'s call for every other action too.
+    async fn type_secret(
+        &self,
+        session_id: &SessionId,
+        locator: &Locator,
+        credential_ref: &CredentialRef,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError> {
+        let fut = async {
+            touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+
+            let (next_ref_id, blocked, lock) = {
+                let map = self.sessions.borrow();
+                let session = map
+                    .get(&session_id.0)
+                    .expect("touch_or_evict just confirmed presence");
+                (
+                    session.next_ref_id.clone(),
+                    session.blocked.clone(),
+                    session.lock.clone(),
+                )
+            };
+
+            let _session_guard = lock.lock().await;
+
+            if let Some(reason) = blocked.borrow().clone() {
+                return Err(PortError::NotFound(reason));
+            }
+
+            // Same reasoning as `dispatch_action`/`navigate`'s matching
+            // comment: the active tab's page and its own ref-tracking state
+            // are read only now, under the lock, and both from the same
+            // lookup.
+            let tab = {
+                let map = self.sessions.borrow();
+                match map.get(&session_id.0) {
+                    Some(session) => session.active_tab_state(),
+                    None => return Err(PortError::NotFound(not_found_message(&session_id.0))),
+                }
+            };
+            let page = tab.page;
+            let TabState {
+                latest_refs,
+                known_refs,
+                nav_generation,
+                latest_url,
+            } = tab.refs;
+
+            let url_before = page
+                .url()
+                .await
+                .map_err(|e| PortError::Other(e.to_string()))?
+                .unwrap_or_else(|| latest_url.borrow().clone());
+
+            // Story 3.4.3: gate on the live URL before touching the vault at
+            // all. Logged (A1 code review fix) through the same
+            // `vault::log_resolve_outcome` chokepoint the resolve-layer
+            // rejection uses — otherwise a rejection here would be silently
+            // missing from the audit trail, since `resolve()` (and its own
+            // logging) is never reached on this path.
+            if let Err(e) = check_credential_domain(&url_before, &credential_ref.domain) {
+                return Err(log_domain_check_rejection(
+                    &credential_ref.domain,
+                    credential_ref.field,
+                    e,
+                ));
+            }
+
+            // Resolved synchronously (no CDP round trip) before the
+            // (potentially slow) vault lookup below, so a `ref` that's
+            // already invalid fails fast without wasting an `op` call — the
+            // ordering the plan actually cares about is `resolve()` landing
+            // *before* `verify_node_live`, not before this.
+            let (backend_node_id, expected_role) = {
+                let refs = latest_refs.borrow();
+                let known = known_refs.borrow();
+                resolve_locator_impl(&refs, &known, nav_generation.get(), locator, &url_before)?
+            };
+
+            // Story 3.4.0/3.4.1: resolved via this adapter's own injected
+            // handle — `credential_ref` never carries a resolved value in
+            // from the caller, and no other code path in this crate calls
+            // `CredentialStore::resolve`, which is what makes ADR-003's
+            // in-flight dedup effective (every resolve request passes
+            // through this one call site). Deliberately sits *before*
+            // `verify_node_live` and the dispatch-time type re-check below:
+            // this is the slow step (an `op` CLI invocation), so keeping it
+            // ahead of both checks — rather than between them and the write
+            // — keeps them exactly as close to the actual write as
+            // `verify_node_live`'s own TOCTOU check already is.
+            let store = resolve_via_injected_store(&self.credential_store)?;
+            let secret = store.resolve(credential_ref).await?;
+
+            verify_node_live(&page, backend_node_id, &expected_role, locator).await?;
+
+            // Task 3.4.1b: as close to the write as `verify_node_live`'s own
+            // check already is.
+            let (node_type, autocomplete) = probe_type_and_autocomplete(&page, backend_node_id)
+                .await
+                .unwrap_or_default(); // fail-safe: never accepted by `accepts_secret_write`.
+            if !accepts_secret_write(credential_ref.field, &node_type, &autocomplete) {
+                return Err(secret_field_shape_refusal(&locator.0, &expected_role));
+            }
+
+            // Task 3.4.1c: the same atomic DOM write `dispatch_type` uses,
+            // with `secret.expose()` as the value — the exposed `&str` is
+            // used only for this one call, never stored/formatted/logged
+            // anywhere in this path.
+            retry_until_actionable(|| check_actionable(&page, backend_node_id)).await?;
+            invoke_on_node(
+                &page,
+                backend_node_id,
+                "type_secret",
+                TYPE_VALUE_JS,
+                vec![serde_json::Value::String(secret.expose().to_string())],
+            )
+            .await?;
+
+            if let Some(reason) = poll_blocked_grace_period(&blocked).await {
+                return Err(PortError::NotFound(reason));
+            }
+
+            let previous_refs = latest_refs.borrow().clone();
+            let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
+            let mut snapshot = install_snapshot(
+                &latest_refs,
+                &known_refs,
+                &latest_url,
+                nav_generation.get(),
+                capture,
+            );
+            if snapshot.url != url_before {
+                snapshot.navigated_from = Some(url_before);
+            }
+
+            // Story 3.4.2: unconditional own-node redaction, independent of
+            // the structural pass `wait_and_capture`/`ax::capture_snapshot`
+            // already applied.
+            redact_node_by_ref(&mut snapshot.root, &locator.0);
+
+            if let Some(session) = self.sessions.borrow().get(&session_id.0) {
+                session.last_used.set(now_millis());
+            }
+
+            Ok(snapshot)
+        };
+
+        tokio::time::timeout(timeout, fut).await.map_err(|_| {
+            PortError::Other(format!(
+                "timeout after {}s waiting for the action to complete",
+                timeout.as_secs()
+            ))
+        })?
     }
 
     /// Read-only: captures and installs a fresh AX tree without dispatching
@@ -3348,6 +3731,421 @@ mod tests {
         assert!(matches!(result, Err(PortError::NotFound(_))));
     }
 
+    // ---- Epic 3.4: `type_secret` dispatch ----
+    //
+    // `type_secret`'s full body needs a live `chromiumoxide::Page` for
+    // `page.url()`/`verify_node_live`/the CDP type-probe/the actual DOM
+    // write — chromiumoxide only ever constructs a `Page` via a live CDP
+    // handshake (see this module's other doc comments making the same
+    // point for `click`/`snapshot`), and `NativeBrowser::launch()` needs a
+    // real Chromium binary this offline unit-test environment doesn't have.
+    // What's unit-testable offline, mirroring how `resolve_locator_impl`/
+    // `install_snapshot`/`retry_until_actionable` are tested elsewhere in
+    // this module, is the decision logic `type_secret`'s body is built
+    // from: the domain gate, the dispatch-time type re-check, the
+    // own-node redaction, and the store-injection/fail-closed lookup —
+    // each pulled out into its own free function specifically so it's
+    // testable without a `Page`.
+
+    /// Hand-rolled `CredentialStore` test double, mirroring
+    /// `FakeBrowserDriver`'s (`crates/core/src/tools/browser.rs`) and
+    /// `vault.rs`'s `FakeProcessSpawner`'s shape: records every
+    /// `resolve()` call's `CredentialRef` and returns one canned result.
+    #[derive(Default)]
+    struct FakeCredentialStore {
+        calls: RefCell<Vec<CredentialRef>>,
+        response: RefCell<Option<Result<String, PortError>>>,
+    }
+
+    impl FakeCredentialStore {
+        fn with_response(response: Result<String, PortError>) -> Self {
+            FakeCredentialStore {
+                calls: RefCell::new(Vec::new()),
+                response: RefCell::new(Some(response)),
+            }
+        }
+    }
+
+    impl CredentialStore for FakeCredentialStore {
+        async fn resolve(&self, credential_ref: &CredentialRef) -> Result<SecretValue, PortError> {
+            self.calls.borrow_mut().push(credential_ref.clone());
+            match self.response.borrow_mut().take() {
+                Some(Ok(value)) => Ok(SecretValue::new(value)),
+                Some(Err(e)) => Err(e),
+                None => panic!("FakeCredentialStore: resolve called more times than configured"),
+            }
+        }
+    }
+
+    fn totp_ref(domain: &str) -> CredentialRef {
+        CredentialRef {
+            domain: domain.to_string(),
+            field: CredentialField::Totp,
+        }
+    }
+
+    // -- Story 3.4.1: dispatch-time type re-check --
+
+    #[test]
+    fn native_browser_type_secret_should_write_value_when_live_dom_type_is_password() {
+        // AC: "a resolved node with live type=\"password\" ... the DOM write
+        // proceeds via the same atomic `this.value = text` path
+        // `dispatch_type` already uses" — the gate that lets the write
+        // through is `accepts_secret_write`; a genuine password field must
+        // pass it for every `CredentialField` variant `type_secret` can be
+        // asked to type (username/password use the same widget in
+        // practice, and a TOTP field is very often `type="password"` too).
+        assert!(accepts_secret_write(
+            CredentialField::Password,
+            "password",
+            ""
+        ));
+        assert!(accepts_secret_write(
+            CredentialField::Username,
+            "password",
+            ""
+        ));
+        assert!(accepts_secret_write(CredentialField::Totp, "password", ""));
+
+        // The DOM write itself reuses `dispatch_type`'s exact JS (Task
+        // 3.4.1c) — enforced at compile time by both call sites sharing the
+        // one `TYPE_VALUE_JS` constant, so there is no separate string to
+        // drift out of sync.
+        assert!(TYPE_VALUE_JS.contains("this.value = text"));
+    }
+
+    #[test]
+    fn native_browser_type_secret_should_refuse_write_when_live_dom_type_is_plain_text() {
+        // AC: "a resolved node with live type=\"text\" and no TOTP-shaped
+        // autocomplete, and credential_ref.field != CredentialField::Totp
+        // ... the call returns an error whose message is `ux.md` §4
+        // example-5's verbatim template ... and no DOM write occurs."
+        assert!(!accepts_secret_write(CredentialField::Password, "text", ""));
+        assert!(!accepts_secret_write(CredentialField::Username, "text", ""));
+
+        let err = secret_field_shape_refusal("e14", "textbox");
+        match err {
+            PortError::NotActionable(msg) => {
+                assert_eq!(
+                    msg,
+                    "type_secret refused: ref \"e14\" resolves to a plain text field (role=textbox, no protected/password state), not a password or TOTP input — use stapler_browser_type for non-secret fields, or re-snapshot if this field should be a password field."
+                );
+            }
+            other => panic!("expected PortError::NotActionable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_browser_type_secret_should_accept_totp_field_when_autocomplete_is_one_time_code() {
+        // Same accept-key structural redaction uses (`AxNode::value`'s doc
+        // comment) — a `type="text" autocomplete="one-time-code"` field is
+        // the case that key exists specifically to catch.
+        assert!(accepts_secret_write(
+            CredentialField::Totp,
+            "text",
+            "one-time-code"
+        ));
+        assert!(!accepts_secret_write(
+            CredentialField::Password,
+            "text",
+            "one-time-code"
+        ));
+    }
+
+    // -- Story 3.4.2: unconditional own-node redaction --
+
+    #[test]
+    fn native_browser_type_secret_should_force_redact_acted_on_node_when_structural_key_would_not_match(
+    ) {
+        // A test-only field shaped so the *structural* redaction key
+        // (`type == "password"` or `autocomplete` in the TOTP-ish set)
+        // would NOT have redacted it — this node's `value` carries no such
+        // marker, it's just an ordinary node that happens to be the one
+        // `type_secret` just wrote a secret into. `redact_node_by_ref`
+        // must still force it to `REDACTED_PLACEHOLDER`, unconditionally.
+        let mut root = AxNode {
+            node_ref: "root".to_string(),
+            role: "WebArea".to_string(),
+            name: String::new(),
+            value: None,
+            children: vec![AxNode {
+                node_ref: "e5".to_string(),
+                role: "textbox".to_string(),
+                name: "Unusual field".to_string(),
+                value: Some("hunter2".to_string()),
+                children: vec![],
+            }],
+        };
+
+        let found = redact_node_by_ref(&mut root, "e5");
+
+        assert!(found, "must report finding the acted-on node");
+        assert_eq!(
+            root.children[0].value,
+            Some(REDACTED_PLACEHOLDER.to_string())
+        );
+    }
+
+    #[test]
+    fn redact_node_by_ref_should_return_false_when_ref_not_present_in_tree() {
+        let mut root = AxNode {
+            node_ref: "root".to_string(),
+            role: "WebArea".to_string(),
+            name: String::new(),
+            value: None,
+            children: vec![],
+        };
+        assert!(!redact_node_by_ref(&mut root, "e999"));
+    }
+
+    // -- Story 3.4.3: domain check against the live navigation URL --
+
+    #[test]
+    fn native_browser_type_secret_should_return_credential_domain_mismatch_when_live_url_does_not_match_requested_domain(
+    ) {
+        let store = FakeCredentialStore::with_response(Ok("hunter2".to_string()));
+
+        // `check_credential_domain` is called against the session's fresh
+        // `page.url()` *before* `type_secret`'s body ever reaches
+        // `self.credential_store.resolve(...)` — this test proves the gate
+        // itself rejects the mismatch, and that nothing in this test ever
+        // drove a call into the fake store, so its call-count stays zero
+        // exactly as the AC requires.
+        let result = check_credential_domain("https://evil-example.com/", "example.com");
+
+        match result {
+            Err(PortError::CredentialDomainMismatch(msg)) => {
+                assert!(msg.contains("evil-example.com"));
+                assert!(msg.contains("example.com"));
+            }
+            other => panic!("expected PortError::CredentialDomainMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            store.calls.borrow().len(),
+            0,
+            "CredentialStore::resolve must never be invoked on a domain mismatch"
+        );
+    }
+
+    #[test]
+    fn check_credential_domain_should_succeed_when_live_host_matches_requested_domain() {
+        assert!(check_credential_domain("https://example.com/login", "example.com").is_ok());
+    }
+
+    /// A1 regression test (mirrors `vault.rs`'s `465395e`-fixed
+    /// `native_credential_store_resolve_should_emit_log_line_when_uncached_domain_lookup_is_rejected`):
+    /// `type_secret`'s pre-resolve domain-mismatch gate must be just as
+    /// audit-visible as the resolve-layer rejection, not silently skip the
+    /// audit trail just because it rejects before ever calling
+    /// `CredentialStore::resolve`.
+    #[test]
+    fn log_domain_check_rejection_should_emit_log_line_for_pre_resolve_domain_mismatch() {
+        let mismatch = check_credential_domain("https://evil-example.com/", "example.com")
+            .expect_err("fixture host deliberately mismatches");
+
+        crate::vault::TEST_LOG_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+        let returned =
+            log_domain_check_rejection("example.com", CredentialField::Password, mismatch);
+        let lines = crate::vault::TEST_LOG_SINK.with(|s| s.borrow_mut().take().unwrap());
+
+        assert!(matches!(returned, PortError::CredentialDomainMismatch(_)));
+        assert_eq!(
+            lines.len(),
+            1,
+            "the pre-resolve domain-mismatch gate must log exactly like the resolve-layer chokepoint"
+        );
+        assert!(lines[0].contains("domain='example.com'"));
+        assert!(lines[0].contains("field=password"));
+        assert!(lines[0].contains("outcome=rejected-domain-mismatch"));
+    }
+
+    // -- Story 3.4.0: store injection, fail-closed with no store --
+
+    #[tokio::test]
+    async fn native_browser_type_secret_should_reach_injected_store_when_credential_store_set() {
+        // Exercises the exact mechanism `NativeBrowser::set_credential_store`
+        // / `type_secret` share: `resolve_via_injected_store` reads the same
+        // `RefCell<Option<Rc<dyn DynCredentialStore>>>` slot type the real
+        // struct field holds, populated the same way the setter populates
+        // it (an upcast to `Rc<dyn DynCredentialStore>`), without needing a
+        // live `NativeBrowser` (which needs a real Chromium binary to
+        // construct at all).
+        let slot: RefCell<Option<Rc<dyn DynCredentialStore>>> = RefCell::new(None);
+        let fake = Rc::new(FakeCredentialStore::with_response(Ok("123456".to_string())));
+        *slot.borrow_mut() = Some(fake.clone() as Rc<dyn DynCredentialStore>);
+
+        let store = resolve_via_injected_store(&slot).expect("store was just injected");
+        let secret = store
+            .resolve(&totp_ref("example.com"))
+            .await
+            .expect("fake store is configured to succeed");
+
+        assert_eq!(secret.expose(), "123456");
+        assert_eq!(fake.calls.borrow().len(), 1);
+        assert_eq!(fake.calls.borrow()[0], totp_ref("example.com"));
+    }
+
+    #[test]
+    fn native_browser_type_secret_should_return_error_not_panic_when_no_credential_store_injected()
+    {
+        // AC: "a freshly-`launch()`ed `NativeBrowser` with no
+        // `set_credential_store` call made ... returns
+        // `Err(PortError::CredentialUnauthenticated(...))` ... rather than
+        // panicking." A freshly-constructed slot (`RefCell::new(None)`) is
+        // exactly what `NativeBrowser::launch()` initializes
+        // `credential_store` to.
+        let slot: RefCell<Option<Rc<dyn DynCredentialStore>>> = RefCell::new(None);
+
+        let result = resolve_via_injected_store(&slot);
+
+        match result {
+            Err(PortError::CredentialUnauthenticated(_)) => {}
+            Err(other) => panic!("expected PortError::CredentialUnauthenticated, got {other:?}"),
+            Ok(_) => panic!("expected an error with no store injected, got Ok"),
+        }
+    }
+
+    // ---- B2 code review fix: `type_secret`'s full real sequence, against a
+    // real Chrome ----
+    //
+    // Every sub-function `type_secret` calls (`accepts_secret_write`,
+    // `check_credential_domain`, `redact_node_by_ref`,
+    // `resolve_via_injected_store`) is unit-tested in isolation above, but
+    // nothing previously drove the real method end to end: domain-check ->
+    // resolve -> verify-live -> DOM-write -> redact, in order, against an
+    // actual live DOM. `#[ignore]`d for the same reason as `ax.rs`'s real-Chrome
+    // tests (needs a real Chromium binary) — run with `cargo test -- --ignored`.
+
+    /// Minimal same-process HTTP server bound to `127.0.0.1`, serving `html`
+    /// for every request. A real bound host (unlike a `data:` URL, which
+    /// `Url::host_str()` never returns `Some` for) is required so
+    /// `check_credential_domain`'s live-URL gate has something to match
+    /// against — mirrors `crates/cli/tests/browser_session.rs`'s
+    /// `spawn_mock_site`, scaled down to the single fixed page this test
+    /// needs.
+    async fn spawn_single_page_site(
+        html: &'static str,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock site");
+        let addr = listener.local_addr().expect("mock site addr");
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { return };
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let _ = stream.read(&mut buf).await;
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                html.len(),
+                                html
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        (format!("http://{addr}/"), shutdown_tx)
+    }
+
+    fn find_node_by_role<'a>(node: &'a AxNode, role: &str) -> Option<&'a AxNode> {
+        if node.role == role {
+            return Some(node);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_node_by_role(child, role))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires a real Chrome; run with `cargo test -- --ignored`"]
+    async fn native_browser_type_secret_should_write_plaintext_to_live_dom_and_redact_returned_snapshot_against_real_chrome(
+    ) {
+        // `NativeBrowser::launch()` spawns its idle-session reaper via
+        // `tokio::task::spawn_local` (not `Send`, like every other `Rc`-based
+        // piece of this struct — see `spawn_reaper`), so this whole test must
+        // run inside a `LocalSet`, mirroring `vault.rs`'s
+        // `#[tokio::test(flavor = "current_thread")]` + `LocalSet` convention
+        // for the same reason.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let html =
+                    "<!doctype html><html><body><input type=\"password\" id=\"pw\"></body></html>";
+                let (site_url, _shutdown_site) = spawn_single_page_site(html).await;
+
+                let mut browser = NativeBrowser::launch()
+                    .await
+                    .expect("Chrome must be installed to run this ignored integration test");
+                browser.set_credential_store(Rc::new(FakeCredentialStore::with_response(Ok(
+                    "hunter2".to_string(),
+                ))));
+
+                let nav = browser
+                    .navigate(&site_url, None, Duration::from_secs(30))
+                    .await
+                    .expect("navigate should succeed against the local mock site");
+
+                let password_node = find_node_by_role(&nav.snapshot.root, "textbox")
+                    .expect("the password field should surface as a textbox in the AX tree");
+                let locator = Locator(password_node.node_ref.clone());
+
+                let credential_ref = CredentialRef {
+                    domain: "127.0.0.1".to_string(),
+                    field: CredentialField::Password,
+                };
+                let result_snapshot = browser
+                    .type_secret(
+                        &nav.session_id,
+                        &locator,
+                        &credential_ref,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("type_secret should succeed against a real password field");
+
+                // (b): the returned `AxSnapshot` shows the redaction placeholder,
+                // not the plaintext.
+                let redacted_node = find_node_by_role(&result_snapshot.root, "textbox")
+                    .expect("password field should still be present after type_secret");
+                assert_eq!(
+                    redacted_node.value.as_deref(),
+                    Some(stapler_mcp_core::ports::REDACTED_PLACEHOLDER),
+                    "the returned snapshot must redact the just-typed secret, never surface it"
+                );
+
+                // (a): the live DOM actually received the plaintext value — read
+                // back via a *separate* `evaluate()` call, never through the
+                // (deliberately redacted) snapshot.
+                let live_value = browser
+                    .evaluate(
+                        &nav.session_id,
+                        "() => document.getElementById('pw').value",
+                        None,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("evaluate should succeed");
+                assert_eq!(
+                    live_value.as_str(),
+                    Some("hunter2"),
+                    "the live DOM must actually have received the resolved secret's plaintext value"
+                );
+
+                browser.close().await;
+            })
+            .await;
+    }
+
     // ---- Epic 6 / Story 6.1: reaper eviction through the public tool API
     // (pre-mortem P2 item #4) ----
     //
@@ -3429,6 +4227,16 @@ mod tests {
         ) -> Result<AxSnapshot, PortError> {
             touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
             Ok(fake_ax_snapshot())
+        }
+
+        async fn type_secret(
+            &self,
+            _session_id: &SessionId,
+            _locator: &Locator,
+            _credential_ref: &CredentialRef,
+            _timeout: Duration,
+        ) -> Result<AxSnapshot, PortError> {
+            panic!("not exercised by this test");
         }
 
         async fn snapshot(

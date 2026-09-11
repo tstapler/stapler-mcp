@@ -21,11 +21,11 @@ use stapler_mcp_core::schema::{
     BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
     BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
     BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
-    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
-    FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
-    ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput, ReadWebsiteInput,
-    ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
-    SearchDocsOutput,
+    BrowserTypeInput, BrowserTypeSecretInput, BrowserWaitForInput, DownloadWebsiteInput,
+    DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput,
+    ListIndexedSourcesInput, ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput,
+    ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput,
+    SearchDocsInput, SearchDocsOutput,
 };
 use stapler_mcp_native::{
     NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
@@ -181,6 +181,19 @@ impl ThinClient {
         params: Parameters<BrowserTypeInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
         call_daemon("stapler_browser_type", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_type_secret",
+        description = "Use this instead of stapler_browser_type whenever a field is a password, TOTP/2FA code, or other secret you have a stored credential for. Types a credential resolved server-side from the daemon's configured vault into an element in an existing browser session, identified by a `ref` from a previous snapshot — the credential value never appears in this tool's request or in any returned accessibility-tree snapshot (a fixed [REDACTED] placeholder takes its place). Returns the accessibility-tree snapshot after typing, same as stapler_browser_type, with note set to confirm success since the visible value won't change to show it."
+    )]
+    async fn browser_type_secret(
+        &self,
+        params: Parameters<BrowserTypeSecretInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_type_secret", params.0)
             .await
             .map(Json)
     }

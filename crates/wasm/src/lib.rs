@@ -7,6 +7,7 @@ mod js_util;
 mod lock;
 mod process;
 mod socket;
+mod vault;
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use std::time::Duration;
 use wasm_bindgen::prelude::*;
 
 use stapler_mcp_core::client::{self, EnsureOptions};
-use stapler_mcp_core::daemon::{json_handler, Daemon};
+use stapler_mcp_core::daemon::{json_handler, Daemon, Handler};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{EnvPort, LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
@@ -23,11 +24,36 @@ use stapler_mcp_core::schema::{
     BrowserCloseSessionOutput, BrowserHoverInput, BrowserListSessionsInput,
     BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput,
     BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
-    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
-    FetchPageInput, FetchPageOutput, ReadSavedPageInput, ReadSavedPageOutput, ReadWebsiteInput,
-    ReadWebsiteOutput,
+    BrowserTypeInput, BrowserTypeSecretInput, BrowserWaitForInput, DownloadWebsiteInput,
+    DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, ReadSavedPageInput,
+    ReadSavedPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
 };
-use stapler_mcp_core::tools::{browser as browser_tools, fetch, search, webcrawl};
+use stapler_mcp_core::tools::{browser as browser_tools, credential, fetch, search, webcrawl};
+
+/// Epic 6.1 AC, verbatim — identical wording to the native entry point
+/// (`crates/cli/src/main.rs`) per Story 6.1.2's "same Risk Control
+/// guarantee" requirement.
+const VAULT_NOT_CONFIGURED_MESSAGE: &str =
+    "vault not configured: set OP_SERVICE_ACCOUNT_TOKEN in the daemon's environment and restart";
+
+/// The opt-out branch's handler: never references `browser` or constructs a
+/// `WasmCredentialStore`, mirroring `crates/cli/src/main.rs`'s
+/// `vault_not_configured_handler`.
+fn vault_not_configured_handler() -> Handler {
+    json_handler(|_input: BrowserTypeSecretInput| async {
+        Err::<BrowserActionOutput, String>(VAULT_NOT_CONFIGURED_MESSAGE.to_string())
+    })
+}
+
+/// The opt-in branch's handler: `browser` already carries the injected
+/// `WasmCredentialStore` (set once at startup below, mirroring native's
+/// `type_secret_handler`).
+fn type_secret_handler(browser: Rc<browser::WasmBrowser>) -> Handler {
+    json_handler(move |input: BrowserTypeSecretInput| {
+        let browser = browser.clone();
+        async move { credential::browser_type_secret(&*browser, input).await }
+    })
+}
 
 #[wasm_bindgen]
 pub async fn run_daemon() -> Result<(), JsValue> {
@@ -48,7 +74,21 @@ pub async fn run_daemon() -> Result<(), JsValue> {
 
     let http = Rc::new(http::WasmHttp);
     let fsstore = Rc::new(fs::WasmFs);
-    let browser = Rc::new(browser::WasmBrowser);
+    let browser = Rc::new(browser::WasmBrowser::new());
+    // Epic 6.1 (ADR-001 + Story 6.1.2): infrastructure-level opt-in, mirroring
+    // `crates/cli/src/main.rs` exactly — a `WasmCredentialStore` is only ever
+    // constructed (and injected into `browser`) when
+    // `OP_SERVICE_ACCOUNT_TOKEN` is present. When it is, `type_secret`'s
+    // internal `resolve()` call always goes through this single injected
+    // instance — required for ADR-003's in-flight dedup
+    // (`crates/wasm/src/glue/vault.js`'s `pending` map) to actually see
+    // every resolve request.
+    let credential_store_present = env
+        .var("OP_SERVICE_ACCOUNT_TOKEN")
+        .map(|_token| {
+            browser.set_credential_store(Rc::new(vault::WasmCredentialStore));
+        })
+        .is_some();
 
     let daemon = Daemon::new();
 
@@ -276,6 +316,15 @@ pub async fn run_daemon() -> Result<(), JsValue> {
                 async move { browser_tools::browser_wait_for(&*browser, input).await }
             }
         }),
+    );
+
+    daemon.register(
+        "stapler_browser_type_secret",
+        if credential_store_present {
+            type_secret_handler(browser.clone())
+        } else {
+            vault_not_configured_handler()
+        },
     );
 
     let socket = socket::WasmSocketFactory;
@@ -526,6 +575,59 @@ mod list_tools_tests {
             matched.len(),
             12,
             "expected exactly 12 browser tool descriptors, found {matched:?} in {names:?}"
+        );
+    }
+}
+
+/// Epic 6.1 / Story 6.1.2: validation.md's
+/// `wasm_daemon_should_return_vault_not_configured_error_when_op_service_account_token_unset`
+/// row is classified Integration, but `run_daemon`'s own body crosses several
+/// `wasm_bindgen(module = "...")` extern boundaries (`fs::js_ensure_dir`,
+/// `lock::WasmLock`, ...) that only resolve inside a real JS engine — not
+/// under a host-target `cargo test` run, which is how this crate's other 17
+/// tests (including `browser.rs`'s own `WasmBrowser` credential-store tests)
+/// already avoid calling `run_daemon` itself. A true Node/wasm-pack
+/// integration exercise is out of scope here; this test instead reaches the
+/// same Rust-level branch this file's `run_daemon` executes — a real
+/// `Daemon` + `vault_not_configured_handler`, mirroring
+/// `crates/cli/src/main.rs`'s own `credential_wiring_tests` module — which is
+/// the deepest level `cargo test -p stapler-mcp-wasm` can exercise without a
+/// JS host.
+#[cfg(test)]
+mod credential_wiring_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wasm_daemon_should_return_vault_not_configured_error_when_op_service_account_token_unset(
+    ) {
+        let daemon = Daemon::new();
+        daemon.register(
+            "stapler_browser_type_secret",
+            vault_not_configured_handler(),
+        );
+
+        let request = serde_json::json!({
+            "tool": "stapler_browser_type_secret",
+            "params": {
+                "sessionId": "sess-1",
+                "refId": "e1",
+                "credential": { "domain": "example.com", "field": "password" }
+            }
+        });
+        let bytes = daemon
+            .handle_request_bytes(request.to_string().as_bytes())
+            .await;
+        let resp: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("daemon response should be valid JSON");
+
+        assert_eq!(
+            resp["error"].as_str(),
+            Some(VAULT_NOT_CONFIGURED_MESSAGE),
+            "got: {resp:?}"
+        );
+        assert!(
+            resp.get("result").is_none() || resp["result"].is_null(),
+            "got: {resp:?}"
         );
     }
 }

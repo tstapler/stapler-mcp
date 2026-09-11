@@ -368,6 +368,7 @@ test("jsCloseBrowser_should_clear_reaper_interval_and_sessions_when_reaper_was_r
         goto: async () => {},
         url: () => "https://example.com/",
         ariaSnapshot: async () => "",
+        evaluate: async () => [],
     };
     const fakeBrowser = {
         newPage: async () => fakePage,
@@ -423,6 +424,7 @@ test("jsBrowserNavigate_should_clear_blocked_flag_when_reused_session_navigates_
             goto: async () => {},
             url: () => "https://example.com/safe",
             ariaSnapshot: async () => '- text "hi"',
+            evaluate: async () => [],
         },
         lastUsed: Date.now() - 1000,
         blocked: browserGlue.blockedHostMessage(id, "127.0.0.1"),
@@ -605,6 +607,7 @@ test("jsBrowserSnapshot_should_set_truncated_true_when_aria_snapshot_exceeds_nod
         page: {
             url: () => "https://example.com/",
             ariaSnapshot: async () => lines.join("\n"),
+            evaluate: async () => [],
         },
         lastUsed: Date.now(),
         blocked: undefined,
@@ -668,6 +671,10 @@ function makeMockPage(overrides = {}) {
         }),
         keyboard: { press: async () => {} },
         ariaSnapshot: async () => '- text "hi"',
+        // Default: no redactable fields on the live DOM (Epic 2.3's
+        // `collectRedactionInfo` pass) — tests exercising redaction itself
+        // override this via `overrides`.
+        evaluate: async () => [],
         getByText: () => ({
             first: () => ({
                 waitFor: async () => {},
@@ -1151,6 +1158,425 @@ test("jsBrowserResize_should_set_viewport_size_and_return_snapshot", async () =>
 
     assert.deepStrictEqual(receivedSize, { width: 1024, height: 768 });
     assert.ok(snapshot.root);
+
+    browserGlue.sessions.delete(id);
+});
+
+// ---------------------------------------------------------------------------
+// Epic 2.3 (credential-vault): structural snapshot redaction. Playwright's
+// `page.ariaSnapshot()` text carries no `type`/`autocomplete` attribute at
+// all, so `captureSnapshot` merges in a second `page.evaluate()` pass
+// (`collectRedactionInfo`) keyed by `ref`, with the identical redaction key
+// and fail-safe rule as native's `AxNode.value` doc comment
+// (`crates/core/src/ports.rs`): redact on `type === "password"` or
+// `autocomplete` in `one-time-code`/`current-password`/`new-password`, and
+// fail-safe-redact any textbox-like node the live-DOM pass couldn't resolve
+// at all.
+
+test("capture_snapshot_should_redact_value_when_dom_type_is_password", async () => {
+    const id = "sess-redact-password-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Password" [ref=e3]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e3");
+                return { evaluate: async () => ({ type: "password", autocomplete: "" }) };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.ref, "e3");
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+// A2 code review fix: Chromium can assign `searchbox`/`combobox` (not just
+// `textbox`) to a password/OTP-shaped `<input>` — `FORM_CONTROL_ROLES` must
+// cover both, matching native's `is_form_control_role`
+// (`crates/native/src/ax.rs`), or a field with one of these roles would
+// never even be probed for redaction.
+test("capture_snapshot_should_redact_value_when_role_is_searchbox_and_dom_type_is_password", async () => {
+    const id = "sess-redact-searchbox-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- searchbox "Password" [ref=e6]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e6");
+                return { evaluate: async () => ({ type: "password", autocomplete: "" }) };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("capture_snapshot_should_redact_value_when_role_is_combobox_and_dom_autocomplete_is_current_password", async () => {
+    const id = "sess-redact-combobox-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- combobox "Password" [ref=e7]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e7");
+                return { evaluate: async () => ({ type: "", autocomplete: "current-password" }) };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("capture_snapshot_should_redact_value_when_dom_autocomplete_is_one_time_code", async () => {
+    const id = "sess-redact-otc-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Code" [ref=e5]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e5");
+                return { evaluate: async () => ({ type: "", autocomplete: "one-time-code" }) };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("capture_snapshot_should_leave_value_unset_when_dom_pass_reports_ordinary_text_field", async () => {
+    const id = "sess-redact-ordinary-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Name" [ref=e7]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e7");
+                return { evaluate: async () => ({ type: "text", autocomplete: "" }) };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, undefined);
+
+    browserGlue.sessions.delete(id);
+});
+
+// Fail-safe (Task 2.3.1b): a node the aria-snapshot parse assigned a
+// form-control role but whose `aria-ref=` locator can't be resolved on the
+// live DOM (e.g. removed between the two calls) must be redacted rather than
+// left as whatever `ariaSnapshot()` reported — "can't confirm it's safe"
+// redacts, it never leaks.
+test("capture_snapshot_should_redact_value_when_textbox_ref_missing_from_live_dom_pass", async () => {
+    const id = "sess-redact-missing-ref-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Password" [ref=e3]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e3");
+                return {
+                    evaluate: async () => {
+                        throw new Error("no node found for selector"); // ref gone by probe time
+                    },
+                };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+// Fail-safe (Task 2.3.2b): a closed shadow root's contents never appear as
+// nodes in `ariaSnapshot()`'s tree at all — Playwright's own snapshot/ref
+// engine only crosses *open* shadow boundaries — so in practice such a field
+// is invisible to `parseAriaSnapshot` from the start and is never revealed
+// as plaintext by this path. This covers the defense-in-depth case where a
+// textbox node ends up in the tree regardless but its `aria-ref=` locator
+// can't be resolved live: same missing-ref fail-safe rule as above, redact
+// rather than leak.
+test("capture_snapshot_should_redact_value_when_closed_shadow_root_hides_password_field_from_live_dom_pass", async () => {
+    const id = "sess-redact-closed-shadow-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Password" [ref=e9]',
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e9");
+                return {
+                    evaluate: async () => {
+                        throw new Error("no node found for selector"); // closed shadow content: unresolvable
+                    },
+                };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 7, Story 7.1.2: the literal acceptance test `requirements.md`'s
+// Success Metrics section names — "verified by a test that autofills a
+// password field out-of-band and then calls `stapler_browser_snapshot`."
+// A real password-manager/browser autofill write reaches the live DOM the
+// same way this mock's `type: "password"` shape does (never through
+// `jsBrowserTypeSecret`), so `collectRedactionInfo` resolving that shape via
+// `aria-ref=` is exactly what this scenario looks like from
+// `captureSnapshot`'s side — this test's job is to prove the resulting
+// snapshot value is redacted regardless.
+test("snapshot_should_redact_value_when_field_was_autofilled_out_of_band", async () => {
+    const id = "sess-autofill-redact-1";
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            ariaSnapshot: async () => '- textbox "Password" [ref=e3]',
+            // Standing in for a password-manager/browser autofill write that
+            // never went through jsBrowserTypeSecret.
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e3");
+                return { evaluate: async () => ({ type: "password", autocomplete: "" }) };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserSnapshot(id, 5000);
+
+    assert.strictEqual(snapshot.root.value, "[REDACTED]");
+
+    browserGlue.sessions.delete(id);
+});
+
+// Exercises `collectRedactionInfo` directly (not just `captureSnapshot`'s
+// merge). Playwright's `ariaSnapshot()`/`aria-ref=` machinery already
+// crosses *open* shadow boundaries when building the ref-annotated tree
+// (Task 2.3.2a), so a textbox that lives inside an open shadow root is
+// indistinguishable in `root`'s shape from any other textbox — proving
+// `collectRedactionInfo` resolves it is exactly proving it resolves any ref
+// via the shared `refLocator` mechanism.
+test("collect_redaction_info_should_find_password_field_when_shadow_root_is_open", async () => {
+    const root = {
+        role: "generic",
+        name: "",
+        ref: "root",
+        children: [{ role: "textbox", name: "Password", ref: "e9", children: [] }],
+    };
+    const page = {
+        locator: (selector) => {
+            assert.strictEqual(selector, "aria-ref=e9");
+            return { evaluate: async () => ({ type: "password", autocomplete: "" }) };
+        },
+    };
+
+    const info = await browserGlue.collectRedactionInfo(page, root);
+
+    assert.deepStrictEqual(info, [{ ref: "e9", redact: true }]);
+});
+
+// ---------------------------------------------------------------------------
+// Epic 4.3 (credential-vault): `type_secret` dispatch support —
+// `jsBrowserCurrentUrl` (Task 4.3.3a) and `jsBrowserTypeSecret` (Task 4.3.2).
+// `WasmBrowser::type_secret` (`crates/wasm/src/browser.rs`) has already
+// resolved the credential and domain-checked it by the time it calls
+// `jsBrowserTypeSecret`, so these tests only exercise the dispatch-time
+// re-check and redaction — not domain checking, which lives entirely on the
+// Rust side against `jsBrowserCurrentUrl`'s return value.
+
+test("jsBrowserCurrentUrl_should_return_live_url_without_building_a_tree", async () => {
+    const id = "sess-current-url-1";
+    let ariaSnapshotCalls = 0;
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://evil-example.com/",
+            ariaSnapshot: async () => {
+                ariaSnapshotCalls += 1;
+                return "";
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const url = await browserGlue.jsBrowserCurrentUrl(id);
+
+    assert.strictEqual(url, "https://evil-example.com/");
+    assert.strictEqual(ariaSnapshotCalls, 0, "jsBrowserCurrentUrl must not build a snapshot tree");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("js_browser_type_secret_should_refuse_write_when_live_dom_type_is_plain_text", async () => {
+    const id = "sess-secret-refuse-1";
+    let fillCalls = 0;
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e14");
+                return {
+                    evaluate: async () => ({ type: "text", autocomplete: "" }),
+                    fill: async () => {
+                        fillCalls += 1;
+                    },
+                };
+            },
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserTypeSecret(id, "e14", "hunter2", 5000),
+        (err) => {
+            assert.match(
+                err.message,
+                /^type_secret refused: ref "e14" resolves to a plain text field \(role=textbox, no protected\/password state\)/,
+            );
+            return true;
+        },
+    );
+    assert.strictEqual(fillCalls, 0, "fill must never be called when the dispatch-time re-check refuses the write");
+
+    browserGlue.sessions.delete(id);
+});
+
+test("js_browser_type_secret_should_accept_totp_shaped_field_with_one_time_code_autocomplete", async () => {
+    const id = "sess-secret-totp-1";
+    let filledValue;
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            locator: () => ({
+                evaluate: async () => ({ type: "text", autocomplete: "one-time-code" }),
+                fill: async (value) => {
+                    filledValue = value;
+                },
+            }),
+            ariaSnapshot: async () => '- textbox "Code" [ref=e2]',
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserTypeSecret(id, "e2", "123456", 5000);
+
+    assert.strictEqual(filledValue, "123456");
+    assert.strictEqual(snapshot.root.value, browserGlue.REDACTED_PLACEHOLDER);
+
+    browserGlue.sessions.delete(id);
+});
+
+// The dispatch-time re-check (before fill) must see a password-shaped field
+// to accept the write at all, but the *general* redaction pass that runs
+// afterward inside `captureSnapshot` must NOT be what causes the redaction
+// here — otherwise this test can't tell force-redaction apart from the
+// general pass doing its ordinary job. So the mock's second `evaluate()`
+// call (the general pass, post-fill) reports a non-secret shape — as a real
+// password-visibility-toggle widget would, flipping `type` from "password"
+// back to "text" once filled — and the assertion still expects `[REDACTED]`,
+// which is only possible because `forceRedactByRef` (Task 4.3.2c) overwrites
+// the acted-on node unconditionally.
+test("js_browser_type_secret_should_force_redact_acted_on_node_unconditionally", async () => {
+    const id = "sess-secret-redact-1";
+    let filledValue;
+    let evaluateCalls = 0;
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            locator: (selector) => {
+                assert.strictEqual(selector, "aria-ref=e1");
+                return {
+                    evaluate: async () => {
+                        evaluateCalls += 1;
+                        return evaluateCalls === 1
+                            ? { type: "password", autocomplete: "" } // dispatch-time re-check
+                            : { type: "text", autocomplete: "" }; // general pass: NOT secret-shaped
+                    },
+                    fill: async (value) => {
+                        filledValue = value;
+                    },
+                };
+            },
+            ariaSnapshot: async () => '- textbox "Password" [ref=e1]',
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    const snapshot = await browserGlue.jsBrowserTypeSecret(id, "e1", "hunter2", 5000);
+
+    assert.strictEqual(filledValue, "hunter2");
+    assert.strictEqual(snapshot.root.ref, "e1");
+    assert.strictEqual(snapshot.root.value, browserGlue.REDACTED_PLACEHOLDER);
+
+    browserGlue.sessions.delete(id);
+});
+
+test("js_browser_type_secret_should_reject_with_actionable_ref_error_when_locator_fill_rejects_stale_ref", async () => {
+    const id = "sess-secret-stale-1";
+    const lowLevelError = new Error("locator.fill: Error: element is not attached to the DOM");
+    browserGlue.sessions.set(id, {
+        page: {
+            url: () => "https://example.com/",
+            locator: () => ({
+                evaluate: async () => ({ type: "password", autocomplete: "" }),
+                fill: async () => {
+                    throw lowLevelError;
+                },
+            }),
+        },
+        lastUsed: Date.now(),
+        blocked: undefined,
+    });
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserTypeSecret(id, "e3", "hunter2", 5000),
+        (err) => {
+            assert.match(err.message, /^ref 'e3' not found or no longer attached:/);
+            return true;
+        },
+    );
 
     browserGlue.sessions.delete(id);
 });

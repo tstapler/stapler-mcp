@@ -384,6 +384,46 @@ pub struct BrowserTypeInput {
     pub timeout_seconds: Option<u32>,
 }
 
+/// Wire-level counterpart of `crate::ports::CredentialField` — mirrors the
+/// existing `BrowserHistoryAction` (wire) / `HistoryAction` (port) split: same
+/// 3-way vocabulary, two types, one exhaustive conversion at the tool layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialFieldInput {
+    Username,
+    Password,
+    Totp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRefInput {
+    /// The site's domain (e.g. "github.com") — matched against the
+    /// current page's origin. Wrong or ambiguous matches are rejected,
+    /// never guessed.
+    pub domain: String,
+    /// Which credential to type. Field names must match 1Password's
+    /// field labels for the item; `totp` requests the item's
+    /// current TOTP/2FA code (generated fresh by 1Password, never
+    /// cached). `username` is dispatch-gated identically to `password`: the
+    /// target must still look password-shaped to the live DOM (`type=
+    /// "password"`, or a `current-password`/`new-password` autocomplete) —
+    /// a typical username field (`type="text" autocomplete="username"`) is
+    /// refused, not silently typed as plaintext.
+    pub field: CredentialFieldInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTypeSecretInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`.
+    pub ref_id: String,
+    pub credential: CredentialRefInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserSnapshotInput {
@@ -1253,6 +1293,72 @@ mod tests {
                     "sessionId": "sess-2",
                     "error": "session sess-2 not found",
                 }],
+            })
+        );
+    }
+
+    #[test]
+    fn credential_field_input_json_schema_should_enumerate_exactly_three_values() {
+        let schema = schemars::schema_for!(CredentialFieldInput);
+        let value = serde_json::to_value(&schema).unwrap();
+
+        assert_eq!(
+            value.get("enum").expect("schema must have an enum keyword"),
+            &serde_json::json!(["username", "password", "totp"]),
+            "expected a closed 3-value enum, got: {value}"
+        );
+    }
+
+    #[test]
+    fn browser_type_secret_input_should_have_no_free_text_secret_field_when_fields_enumerated() {
+        // Story 7.1.1's acceptance test, added here (Epic 5.1) while the
+        // types are fresh: `BrowserTypeSecretInput` must carry only a
+        // `CredentialRef` (domain + closed field enum) — never a free-text
+        // value field an LLM could be tricked into putting a literal secret
+        // into.
+        let schema = schemars::schema_for!(BrowserTypeSecretInput);
+        let value = serde_json::to_value(&schema).unwrap();
+        let properties = value
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("schema must have properties");
+
+        assert_eq!(
+            properties
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "sessionId",
+                "refId",
+                "credential",
+                "timeoutSeconds"
+            ]),
+        );
+        assert!(
+            !properties.contains_key("value"),
+            "must not carry a free-text secret value field"
+        );
+    }
+
+    #[test]
+    fn browser_type_secret_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1","refId":"e5","credential":{"domain":"github.com","field":"password"}}"#;
+
+        let input: BrowserTypeSecretInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+        assert_eq!(input.ref_id, "e5");
+        assert_eq!(input.credential.domain, "github.com");
+        assert_eq!(input.credential.field, CredentialFieldInput::Password);
+        assert_eq!(input.timeout_seconds, None);
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "refId": "e5",
+                "credential": {"domain": "github.com", "field": "password"},
             })
         );
     }
