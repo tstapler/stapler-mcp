@@ -842,9 +842,8 @@ mod tests {
     #[test]
     fn port_error_credential_domain_mismatch_display_should_start_with_credential_rejected_prefix()
     {
-        let err = PortError::CredentialDomainMismatch(
-            "no vault entry for domain \"example.com\"".into(),
-        );
+        let err =
+            PortError::CredentialDomainMismatch("no vault entry for domain \"example.com\"".into());
         assert!(format!("{err}").starts_with("credential rejected: "));
     }
 
@@ -855,8 +854,8 @@ mod tests {
     }
 
     #[test]
-    fn port_error_credential_unauthenticated_display_should_start_with_vault_unauthenticated_prefix()
-     {
+    fn port_error_credential_unauthenticated_display_should_start_with_vault_unauthenticated_prefix(
+    ) {
         let err = PortError::CredentialUnauthenticated("1Password CLI not signed in".into());
         assert!(format!("{err}").starts_with("vault unauthenticated: "));
     }

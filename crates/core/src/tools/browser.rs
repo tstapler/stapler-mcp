@@ -1619,9 +1619,9 @@ mod tests {
 
     #[tokio::test]
     async fn fake_browser_driver_should_return_configured_result_when_type_secret_called() {
-        let driver = FakeBrowserDriver::new().with_type_secret(Err(
-            PortError::CredentialExpired("TOTP code for example.com expired".to_string()),
-        ));
+        let driver = FakeBrowserDriver::new().with_type_secret(Err(PortError::CredentialExpired(
+            "TOTP code for example.com expired".to_string(),
+        )));
 
         let err = driver
             .type_secret(

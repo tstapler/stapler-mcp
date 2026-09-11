@@ -887,7 +887,9 @@ async fn dispatch_type(
 /// credential past this check).
 fn check_credential_domain(live_url: &str, requested_domain: &str) -> Result<(), PortError> {
     let live = Url::parse(live_url).map_err(|_| {
-        PortError::Other(format!("current page url \"{live_url}\" could not be parsed"))
+        PortError::Other(format!(
+            "current page url \"{live_url}\" could not be parsed"
+        ))
     })?;
     // A bare host has no scheme; `same_host` only compares `Url::host_str()`
     // (mirrors `vault.rs::lookup_domain`'s identical construction).

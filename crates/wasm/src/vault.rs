@@ -5,7 +5,9 @@
 //! `map_js_error`'s message-substring dispatch — one crate-boundary crossing
 //! per `resolve()` call, same as every other wasm port adapter.
 
-use stapler_mcp_core::ports::{CredentialField, CredentialRef, CredentialStore, PortError, SecretValue};
+use stapler_mcp_core::ports::{
+    CredentialField, CredentialRef, CredentialStore, PortError, SecretValue,
+};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -92,7 +94,8 @@ mod tests {
     /// `PortError::CredentialAmbiguous`, carrying the `ux.md` §4 example-2
     /// verbatim message through unchanged.
     #[test]
-    fn wasm_credential_store_resolve_should_map_ambiguous_error_when_sdk_rejects_with_multiple_matches() {
+    fn wasm_credential_store_resolve_should_map_ambiguous_error_when_sdk_rejects_with_multiple_matches(
+    ) {
         let message = "2 vault items match domain \"example.com\" — ambiguous, not typed. Ask the user which item to use, or scope the request further. Candidates: Example Login A, Example Login B".to_string();
 
         let err = map_vault_js_error(message.clone());

@@ -121,7 +121,8 @@ impl<T: CredentialStore> DynCredentialStore for T {
     fn resolve<'a>(
         &'a self,
         credential_ref: &'a CredentialRef,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SecretValue, PortError>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SecretValue, PortError>> + 'a>>
+    {
         Box::pin(CredentialStore::resolve(self, credential_ref))
     }
 }
@@ -150,7 +151,9 @@ fn resolve_via_injected_store(
 /// this check).
 fn check_credential_domain(live_url: &str, requested_domain: &str) -> Result<(), PortError> {
     let live = Url::parse(live_url).map_err(|_| {
-        PortError::Other(format!("current page url \"{live_url}\" could not be parsed"))
+        PortError::Other(format!(
+            "current page url \"{live_url}\" could not be parsed"
+        ))
     })?;
     // A bare host has no scheme; `same_host` only compares `Url::host_str()`
     // (mirrors native's identical construction in `crates/native/src/vault.rs`
@@ -926,7 +929,9 @@ mod tests {
             self.calls.borrow_mut().push(credential_ref.clone());
             match &self.response {
                 Ok(value) => Ok(SecretValue::new(value.clone())),
-                Err(_) => Err(PortError::Other("FakeCredentialStore configured error".to_string())),
+                Err(_) => Err(PortError::Other(
+                    "FakeCredentialStore configured error".to_string(),
+                )),
             }
         }
     }
@@ -941,11 +946,13 @@ mod tests {
     #[tokio::test]
     async fn wasm_browser_type_secret_should_reach_injected_store_when_credential_store_set() {
         let browser = WasmBrowser::new();
-        let fake = Rc::new(FakeCredentialStore::with_response(Ok("hunter2".to_string())));
+        let fake = Rc::new(FakeCredentialStore::with_response(
+            Ok("hunter2".to_string()),
+        ));
         browser.set_credential_store(Rc::clone(&fake));
 
-        let store = resolve_via_injected_store(&browser.credential_store)
-            .expect("store was just injected");
+        let store =
+            resolve_via_injected_store(&browser.credential_store).expect("store was just injected");
         let secret = store
             .resolve(&password_ref("example.com"))
             .await

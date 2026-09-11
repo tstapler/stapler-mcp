@@ -64,7 +64,15 @@ impl<S: ProcessSpawner> State<S> {
     async fn lookup_domain(&self, domain: &str) -> Result<(String, String), PortError> {
         let output = self
             .spawner
-            .spawn_and_capture(&["op", "item", "list", "--categories", "Login", "--format", "json"])
+            .spawn_and_capture(&[
+                "op",
+                "item",
+                "list",
+                "--categories",
+                "Login",
+                "--format",
+                "json",
+            ])
             .await?;
 
         let stdout = match output {
@@ -73,7 +81,9 @@ impl<S: ProcessSpawner> State<S> {
                 exit_code: 0,
                 ..
             } => stdout,
-            ProcessOutput { stderr, .. } => return Err(build_op_error(&self.spawner, &stderr).await),
+            ProcessOutput { stderr, .. } => {
+                return Err(build_op_error(&self.spawner, &stderr).await)
+            }
         };
 
         // A bare host has no scheme; `same_host` only compares `Url::host_str()`,
@@ -342,7 +352,9 @@ const UNAUTHENTICATED_MESSAGE: &str = "1Password CLI reports not signed in — n
 const RATE_LIMIT_UNSPECIFIED_DELAY: &str = "retry after an unspecified delay";
 
 fn stderr_contains(stderr_text: &str, needle: &str) -> bool {
-    stderr_text.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+    stderr_text
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
 }
 
 /// Maps a failed `op` invocation's `stderr` to one of the 5 vault
@@ -352,10 +364,14 @@ fn stderr_contains(stderr_text: &str, needle: &str) -> bool {
 async fn build_op_error<S: ProcessSpawner>(spawner: &S, stderr: &[u8]) -> PortError {
     let stderr_text = String::from_utf8_lossy(stderr);
 
-    if stderr_contains(&stderr_text, "not currently signed in") || stderr_contains(&stderr_text, "op signin") {
+    if stderr_contains(&stderr_text, "not currently signed in")
+        || stderr_contains(&stderr_text, "op signin")
+    {
         return PortError::CredentialUnauthenticated(UNAUTHENTICATED_MESSAGE.to_string());
     }
-    if stderr_contains(&stderr_text, "too many requests") || stderr_contains(&stderr_text, "rate limit") {
+    if stderr_contains(&stderr_text, "too many requests")
+        || stderr_contains(&stderr_text, "rate limit")
+    {
         let detail = rate_limit_retry_after(spawner).await;
         return PortError::CredentialRateLimited(detail);
     }
@@ -414,7 +430,11 @@ thread_local! {
 /// `SecretValue`'s non-leaking `Debug` rather than manually formatting the
 /// exposed value. A rejection is logged identically to a success (`ux.md`
 /// §3: both are equally audit-worthy).
-fn log_resolve_outcome(domain: &str, field: CredentialField, result: &Result<SecretValue, PortError>) {
+fn log_resolve_outcome(
+    domain: &str,
+    field: CredentialField,
+    result: &Result<SecretValue, PortError>,
+) {
     let field_str = match field {
         CredentialField::Username => "username",
         CredentialField::Password => "password",
@@ -543,11 +563,10 @@ mod tests {
         vault_id: &str,
         item_id: &str,
     ) {
-        store
-            .state
-            .id_cache
-            .borrow_mut()
-            .insert(domain.to_string(), (vault_id.to_string(), item_id.to_string()));
+        store.state.id_cache.borrow_mut().insert(
+            domain.to_string(),
+            (vault_id.to_string(), item_id.to_string()),
+        );
     }
 
     fn password_ref(domain: &str) -> CredentialRef {
@@ -571,7 +590,10 @@ mod tests {
     #[test]
     fn native_credential_store_resolve_should_build_op_item_get_otp_argv_when_field_is_totp() {
         let argv = build_argv(CredentialField::Totp, "v1", "i1");
-        assert_eq!(argv, vec!["op", "item", "get", "--vault", "v1", "i1", "--otp"]);
+        assert_eq!(
+            argv,
+            vec!["op", "item", "get", "--vault", "v1", "i1", "--otp"]
+        );
     }
 
     // -- Story 3.2.4: error mapping --
@@ -648,11 +670,10 @@ mod tests {
     #[test]
     fn id_cache_should_only_hold_identifiers_when_typed_as_hash_map_of_string_pairs() {
         let store = NativeCredentialStore::new(FakeProcessSpawner::default(), "token".to_string());
-        store
-            .state
-            .id_cache
-            .borrow_mut()
-            .insert("example.com".to_string(), ("vault1".to_string(), "item1".to_string()));
+        store.state.id_cache.borrow_mut().insert(
+            "example.com".to_string(),
+            ("vault1".to_string(), "item1".to_string()),
+        );
 
         let cached = store.state.id_cache.borrow().get("example.com").cloned();
         assert_eq!(cached, Some(("vault1".to_string(), "item1".to_string())));
@@ -796,16 +817,18 @@ mod tests {
                 seed_cache(&store, "example.com", "v1", "i1");
 
                 let store1 = Rc::clone(&store);
-                let task1 =
-                    tokio::task::spawn_local(async move { store1.resolve(&password_ref("example.com")).await });
+                let task1 = tokio::task::spawn_local(async move {
+                    store1.resolve(&password_ref("example.com")).await
+                });
 
                 // Wait until the first call is actually blocked inside
                 // `spawn_and_capture` before starting the second.
                 started.notified().await;
 
                 let store2 = Rc::clone(&store);
-                let task2 =
-                    tokio::task::spawn_local(async move { store2.resolve(&password_ref("example.com")).await });
+                let task2 = tokio::task::spawn_local(async move {
+                    store2.resolve(&password_ref("example.com")).await
+                });
 
                 // Let task2 run far enough to hit the `pending` dedup check
                 // (and start awaiting the shared future) before releasing
@@ -858,11 +881,13 @@ mod tests {
                 seed_cache(&store, "b.example", "vb", "ib");
 
                 let store_a = Rc::clone(&store);
-                let task_a =
-                    tokio::task::spawn_local(async move { store_a.resolve(&password_ref("a.example")).await });
+                let task_a = tokio::task::spawn_local(async move {
+                    store_a.resolve(&password_ref("a.example")).await
+                });
                 let store_b = Rc::clone(&store);
-                let task_b =
-                    tokio::task::spawn_local(async move { store_b.resolve(&password_ref("b.example")).await });
+                let task_b = tokio::task::spawn_local(async move {
+                    store_b.resolve(&password_ref("b.example")).await
+                });
 
                 let (ra, rb) = tokio::join!(task_a, task_b);
                 ra.unwrap().unwrap();
@@ -870,8 +895,12 @@ mod tests {
 
                 let calls = store.state.spawner.calls.borrow();
                 assert_eq!(calls.len(), 2, "distinct refs must not be deduped together");
-                assert!(calls.iter().any(|c| c.contains(&"op://va/ia/password".to_string())));
-                assert!(calls.iter().any(|c| c.contains(&"op://vb/ib/password".to_string())));
+                assert!(calls
+                    .iter()
+                    .any(|c| c.contains(&"op://va/ia/password".to_string())));
+                assert!(calls
+                    .iter()
+                    .any(|c| c.contains(&"op://vb/ib/password".to_string())));
             })
             .await;
     }
@@ -951,7 +980,9 @@ mod tests {
     // redacted snapshot" half of the AC is still exercised for real: a
     // resolved value is written into a live Chrome page and read back via a
     // second, independent `evaluate()` call.
-    async fn launch_headless_chrome_page_for_totp_test(html: &str) -> (chromiumoxide::Browser, Page) {
+    async fn launch_headless_chrome_page_for_totp_test(
+        html: &str,
+    ) -> (chromiumoxide::Browser, Page) {
         let user_data_dir = std::env::temp_dir().join(format!(
             "stapler-mcp-vault-totp-test-{}-{}",
             std::process::id(),
@@ -993,8 +1024,8 @@ mod tests {
             );
             return;
         };
-        let domain =
-            std::env::var("STAPLER_MCP_TEST_TOTP_DOMAIN").unwrap_or_else(|_| "example.com".to_string());
+        let domain = std::env::var("STAPLER_MCP_TEST_TOTP_DOMAIN")
+            .unwrap_or_else(|_| "example.com".to_string());
 
         tokio::task::LocalSet::new()
             .run_until(async move {
@@ -1110,10 +1141,18 @@ mod tests {
     fn outcome_matches(err: &PortError, expected: ParityOutcome) -> bool {
         matches!(
             (err, expected),
-            (PortError::CredentialDomainMismatch(_), ParityOutcome::DomainMismatch)
-                | (PortError::CredentialAmbiguous(_), ParityOutcome::Ambiguous)
-                | (PortError::CredentialUnauthenticated(_), ParityOutcome::Unauthenticated)
-                | (PortError::CredentialRateLimited(_), ParityOutcome::RateLimited)
+            (
+                PortError::CredentialDomainMismatch(_),
+                ParityOutcome::DomainMismatch
+            ) | (PortError::CredentialAmbiguous(_), ParityOutcome::Ambiguous)
+                | (
+                    PortError::CredentialUnauthenticated(_),
+                    ParityOutcome::Unauthenticated
+                )
+                | (
+                    PortError::CredentialRateLimited(_),
+                    ParityOutcome::RateLimited
+                )
         )
     }
 

@@ -841,8 +841,12 @@ mod tests {
             &HashMap::new(),
         );
 
-        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &FakeProbe(Ok(true)))
-            .await;
+        redact_form_control_values(
+            &mut capture.snapshot.root,
+            &capture.refs,
+            &FakeProbe(Ok(true)),
+        )
+        .await;
 
         assert_eq!(
             capture.snapshot.root.children[0].value,
@@ -896,8 +900,12 @@ mod tests {
             &HashMap::new(),
         );
 
-        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &FakeProbe(Ok(true)))
-            .await;
+        redact_form_control_values(
+            &mut capture.snapshot.root,
+            &capture.refs,
+            &FakeProbe(Ok(true)),
+        )
+        .await;
 
         assert_eq!(
             capture.snapshot.root.children[0].value,
@@ -922,8 +930,12 @@ mod tests {
             &HashMap::new(),
         );
 
-        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &FakeProbe(Err(())))
-            .await;
+        redact_form_control_values(
+            &mut capture.snapshot.root,
+            &capture.refs,
+            &FakeProbe(Err(())),
+        )
+        .await;
 
         assert_eq!(
             capture.snapshot.root.children[0].value,
@@ -945,8 +957,12 @@ mod tests {
             &HashMap::new(),
         );
 
-        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &FakeProbe(Ok(true)))
-            .await;
+        redact_form_control_values(
+            &mut capture.snapshot.root,
+            &capture.refs,
+            &FakeProbe(Ok(true)),
+        )
+        .await;
 
         assert_eq!(
             capture.snapshot.root.children[0].value,
@@ -1165,7 +1181,9 @@ customElements.define('my-login', class extends HTMLElement {
                 X11 display for the headed half — run with \
                 `cargo test -- --ignored snapshot_should_match_headless_and_headed_ax_output`"]
     async fn snapshot_should_match_headless_and_headed_ax_output_for_password_field() {
-        use chromiumoxide::cdp::browser_protocol::accessibility::{AxNode as CdpAxNode, GetFullAxTreeParams};
+        use chromiumoxide::cdp::browser_protocol::accessibility::{
+            AxNode as CdpAxNode, GetFullAxTreeParams,
+        };
 
         let html = r#"<!doctype html><html><body>
 <input id="pw" type="password" value="hunter2">
@@ -1183,7 +1201,9 @@ customElements.define('my-login', class extends HTMLElement {
             tree.result
                 .nodes
                 .iter()
-                .find(|n| n.role.as_ref().and_then(ax_value_to_string).as_deref() == Some("textbox"))
+                .find(|n| {
+                    n.role.as_ref().and_then(ax_value_to_string).as_deref() == Some("textbox")
+                })
                 .cloned()
         }
 
