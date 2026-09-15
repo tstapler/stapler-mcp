@@ -70,6 +70,20 @@ pub struct ReadWebsiteInput {
     /// 10, capped at 50.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_pages: Option<u32>,
+    /// Override how much Markdown (in characters, summed across every page
+    /// this call returns) comes back inline before the rest is saved to
+    /// disk instead — see `ReadWebsitePage.savedPath`. Defaults to 60,000;
+    /// capped at 200,000. Set `alwaysSaveToFile: true` instead of `0` here
+    /// to force every page to disk regardless of size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inline_chars: Option<usize>,
+    /// Skip the inline budget entirely and always save every page's
+    /// Markdown to disk (only a short preview plus `savedPath` comes back
+    /// inline) — useful when you already plan to read/grep the saved files
+    /// and want this call's own response to stay minimal regardless of
+    /// page size. Defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_save_to_file: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -77,8 +91,63 @@ pub struct ReadWebsiteInput {
 pub struct ReadWebsitePage {
     pub url: String,
     pub title: String,
-    /// Main content extracted via Readability-style extraction, converted to Markdown.
+    /// Main content extracted via Readability-style extraction, converted to
+    /// Markdown. A preview (not the full page) when `savedPath` is set — see
+    /// its doc comment.
     pub markdown: String,
+    /// Set when this page's full Markdown exceeded the inline size cap and
+    /// was written to this local file instead — `markdown` above is only a
+    /// preview in that case. Pass this to `read_saved_page` to search or
+    /// page through the full content — that works even when the caller
+    /// isn't on the same machine as this daemon (this file's own path may
+    /// not be), and supports searching with surrounding context instead of
+    /// paging through blindly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSavedPageInput {
+    /// A `savedPath` value previously returned by `read_website` in a
+    /// page's `savedPath` field. Must be exactly one of those — this tool
+    /// intentionally can't read arbitrary files.
+    pub saved_path: String,
+    /// Case-insensitive substring to search for. When set, returns every
+    /// matching line plus `contextLines` of surrounding context instead of
+    /// a plain paginated read — use this to find a specific section in a
+    /// large saved page without paging through it blindly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Lines of context to include before/after each match when `query` is
+    /// set. Defaults to 3, capped at 50. Ignored when `query` is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_lines: Option<usize>,
+    /// 1-based line number to start a plain paginated read from (ignored
+    /// when `query` is set). Defaults to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    /// Maximum lines to return for a plain paginated read (ignored when
+    /// `query` is set). Defaults to 500, capped at 2,000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSavedPageOutput {
+    /// Line-numbered text ("<lineNumber>: <line>", one per line) — either
+    /// the requested page range, or every match plus its surrounding
+    /// context with a "--" separator between non-adjacent matches (the
+    /// same shape `grep -n -C` produces) when `query` was set.
+    pub content: String,
+    /// Total lines in the saved file, regardless of how much `content`
+    /// covers.
+    pub total_lines: usize,
+    /// True when a plain paginated read didn't reach `totalLines` — call
+    /// again with a higher `offset` to continue. Always false for a search
+    /// (`query` set), since every match is returned in one call.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -315,6 +384,46 @@ pub struct BrowserTypeInput {
     pub timeout_seconds: Option<u32>,
 }
 
+/// Wire-level counterpart of `crate::ports::CredentialField` — mirrors the
+/// existing `BrowserHistoryAction` (wire) / `HistoryAction` (port) split: same
+/// 3-way vocabulary, two types, one exhaustive conversion at the tool layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialFieldInput {
+    Username,
+    Password,
+    Totp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRefInput {
+    /// The site's domain (e.g. "github.com") — matched against the
+    /// current page's origin. Wrong or ambiguous matches are rejected,
+    /// never guessed.
+    pub domain: String,
+    /// Which credential to type. Field names must match 1Password's
+    /// field labels for the item; `totp` requests the item's
+    /// current TOTP/2FA code (generated fresh by 1Password, never
+    /// cached). `username` is dispatch-gated identically to `password`: the
+    /// target must still look password-shaped to the live DOM (`type=
+    /// "password"`, or a `current-password`/`new-password` autocomplete) —
+    /// a typical username field (`type="text" autocomplete="username"`) is
+    /// refused, not silently typed as plaintext.
+    pub field: CredentialFieldInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTypeSecretInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`.
+    pub ref_id: String,
+    pub credential: CredentialRefInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserSnapshotInput {
@@ -544,6 +653,26 @@ pub struct BrowserEvaluateOutput {
     /// `function`'s return value, JSON-serialized. `null` if `function`
     /// returned `undefined` or nothing.
     pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserGetHtmlInput {
+    pub session_id: String,
+    /// A `ref` from a previous `AxSnapshotOutput`; when given, returns that
+    /// element's `outerHTML` instead of the whole page's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserGetHtmlOutput {
+    /// The page's (or, with `refId`, the element's) rendered HTML —
+    /// `document.documentElement.outerHTML` / `element.outerHTML`.
+    pub html: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1164,6 +1293,72 @@ mod tests {
                     "sessionId": "sess-2",
                     "error": "session sess-2 not found",
                 }],
+            })
+        );
+    }
+
+    #[test]
+    fn credential_field_input_json_schema_should_enumerate_exactly_three_values() {
+        let schema = schemars::schema_for!(CredentialFieldInput);
+        let value = serde_json::to_value(&schema).unwrap();
+
+        assert_eq!(
+            value.get("enum").expect("schema must have an enum keyword"),
+            &serde_json::json!(["username", "password", "totp"]),
+            "expected a closed 3-value enum, got: {value}"
+        );
+    }
+
+    #[test]
+    fn browser_type_secret_input_should_have_no_free_text_secret_field_when_fields_enumerated() {
+        // Story 7.1.1's acceptance test, added here (Epic 5.1) while the
+        // types are fresh: `BrowserTypeSecretInput` must carry only a
+        // `CredentialRef` (domain + closed field enum) — never a free-text
+        // value field an LLM could be tricked into putting a literal secret
+        // into.
+        let schema = schemars::schema_for!(BrowserTypeSecretInput);
+        let value = serde_json::to_value(&schema).unwrap();
+        let properties = value
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("schema must have properties");
+
+        assert_eq!(
+            properties
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "sessionId",
+                "refId",
+                "credential",
+                "timeoutSeconds"
+            ]),
+        );
+        assert!(
+            !properties.contains_key("value"),
+            "must not carry a free-text secret value field"
+        );
+    }
+
+    #[test]
+    fn browser_type_secret_input_should_round_trip_when_deserialized_from_camelcase_json() {
+        let json = r#"{"sessionId":"sess-1","refId":"e5","credential":{"domain":"github.com","field":"password"}}"#;
+
+        let input: BrowserTypeSecretInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id, "sess-1");
+        assert_eq!(input.ref_id, "e5");
+        assert_eq!(input.credential.domain, "github.com");
+        assert_eq!(input.credential.field, CredentialFieldInput::Password);
+        assert_eq!(input.timeout_seconds, None);
+
+        let round_tripped = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!({
+                "sessionId": "sess-1",
+                "refId": "e5",
+                "credential": {"domain": "github.com", "field": "password"},
             })
         );
     }

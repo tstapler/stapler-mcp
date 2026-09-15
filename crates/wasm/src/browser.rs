@@ -1,10 +1,15 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use stapler_mcp_core::ports::{
-    AxNode, AxSnapshot, BrowserDriver, HistoryAction, Locator, NavigateResult, PageExtract,
-    PortError, SessionId, SessionSummary, TabAction, TabInfo, TabsResult, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, CredentialRef, CredentialStore, HistoryAction, Locator,
+    NavigateResult, PageExtract, PortError, SecretValue, SessionId, SessionSummary, TabAction,
+    TabInfo, TabsResult, WaitCondition,
 };
+use stapler_mcp_core::tools::webcrawl::same_host;
+use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -82,11 +87,140 @@ extern "C" {
         height: u32,
         timeout_ms: f64,
     ) -> js_sys::Promise;
+
+    // Epic 4.3: `type_secret` dispatch support (see `crates/wasm/src/glue/
+    // browser.js`'s matching doc comments).
+    #[wasm_bindgen(js_name = jsBrowserCurrentUrl)]
+    fn js_browser_current_url(session_id: &str) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsBrowserTypeSecret)]
+    fn js_browser_type_secret(
+        session_id: &str,
+        ref_id: &str,
+        secret_value: &str,
+        timeout_ms: f64,
+    ) -> js_sys::Promise;
 }
 
-pub struct WasmBrowser;
+// A1 code review fix: the pre-resolve domain-mismatch gate below needs
+// `vault.js`'s audit-log chokepoint, not `browser.js`'s — a separate
+// `wasm_bindgen` extern block since each binds a different JS module.
+#[wasm_bindgen(module = "/src/glue/vault.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = jsLogResolveOutcome)]
+    fn js_log_resolve_outcome(domain: &str, field: &str, outcome: &str);
+}
+
+/// Object-safe erasure of `CredentialStore` for storage behind `dyn`, mirroring
+/// `crates/native/src/browser.rs`'s identically-named trait/impl/helper.
+/// `CredentialStore::resolve` is a native `async fn` in a trait (ports.rs's
+/// deliberate choice for every *other* port — generic callers, never `Box<dyn
+/// Port>`), which has no dyn-compatible vtable representation, so `dyn
+/// CredentialStore` cannot be named directly. Boxing the future once, at this
+/// boundary, is the standard shim for that mismatch — `WasmBrowser` needs a
+/// `Rc<dyn ...>` field so `set_credential_store` can inject a concrete store
+/// post-construction without making `WasmBrowser` generic over it.
+trait DynCredentialStore {
+    fn resolve<'a>(
+        &'a self,
+        credential_ref: &'a CredentialRef,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SecretValue, PortError>> + 'a>>;
+}
+
+impl<T: CredentialStore> DynCredentialStore for T {
+    fn resolve<'a>(
+        &'a self,
+        credential_ref: &'a CredentialRef,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SecretValue, PortError>> + 'a>>
+    {
+        Box::pin(CredentialStore::resolve(self, credential_ref))
+    }
+}
+
+/// Story 4.3.0's fail-closed lookup: `None` (no `set_credential_store` call
+/// ever made) becomes `PortError::CredentialUnauthenticated`, not a panic —
+/// pulled out of `type_secret`'s body so it's unit-testable against a bare
+/// `RefCell` slot, mirroring native's `resolve_via_injected_store`.
+fn resolve_via_injected_store(
+    slot: &RefCell<Option<Rc<dyn DynCredentialStore>>>,
+) -> Result<Rc<dyn DynCredentialStore>, PortError> {
+    slot.borrow().clone().ok_or_else(|| {
+        PortError::CredentialUnauthenticated(
+            "no credential store is configured for this browser session — not typed".to_string(),
+        )
+    })
+}
+
+/// Story 3.4.3's `check_credential_domain`, reproduced verbatim for wasm
+/// (`crates/native/src/browser.rs` has the native copy): rejects
+/// `type_secret` when the session's freshly-queried live URL doesn't match
+/// `credential_ref`'s requested domain — checked *before*
+/// `CredentialStore::resolve` is ever called, closing the same
+/// same-call-redirect staleness class `6b6b56a` already fixed for the SSRF
+/// guard (a cached URL would let a same-call redirect slip a credential past
+/// this check).
+fn check_credential_domain(live_url: &str, requested_domain: &str) -> Result<(), PortError> {
+    let live = Url::parse(live_url).map_err(|_| {
+        PortError::Other(format!(
+            "current page url \"{live_url}\" could not be parsed"
+        ))
+    })?;
+    // A bare host has no scheme; `same_host` only compares `Url::host_str()`
+    // (mirrors native's identical construction in `crates/native/src/vault.rs`
+    // and `crates/wasm/src/glue/vault.js`'s `sameHost`).
+    let requested = Url::parse(&format!("https://{requested_domain}"))
+        .map_err(|_| PortError::Other(format!("invalid domain \"{requested_domain}\"")))?;
+    if same_host(&live, &requested) {
+        return Ok(());
+    }
+    let current_host = live.host_str().unwrap_or(live_url);
+    Err(PortError::CredentialDomainMismatch(format!(
+        "current page is \"{current_host}\", but this credential is scoped to \"{requested_domain}\" — not typed; call stapler_browser_snapshot to confirm the current page, or use the correct domain"
+    )))
+}
+
+/// A1 code review fix: the wasm-side twin of native's `log_resolve_outcome`
+/// match arms, restricted to the two outcomes `check_credential_domain` can
+/// actually produce (a mismatch, or an unparsable URL/domain). Pulled out
+/// so the classification is unit-testable under plain `cargo test` — the
+/// `js_log_resolve_outcome` call itself is an extern JS binding only
+/// exercisable via the `wasm_pack_tests` Node harness below, same
+/// limitation as the rest of `type_secret`.
+fn domain_check_rejection_outcome(e: &PortError) -> &'static str {
+    match e {
+        PortError::CredentialDomainMismatch(_) => "rejected-domain-mismatch",
+        _ => "vault-lookup-failed",
+    }
+}
+
+pub struct WasmBrowser {
+    /// Injected post-construction via `set_credential_store` (Story 4.3.0) —
+    /// `None` until `crates/wasm/src/lib.rs`'s daemon wiring sets one, so
+    /// `type_secret` must fail closed rather than panic when it's unset.
+    credential_store: RefCell<Option<Rc<dyn DynCredentialStore>>>,
+}
+
+impl Default for WasmBrowser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl WasmBrowser {
+    pub fn new() -> Self {
+        WasmBrowser {
+            credential_store: RefCell::new(None),
+        }
+    }
+
+    /// Injects the `CredentialStore` `type_secret` resolves against — see
+    /// `DynCredentialStore`'s doc comment for why this takes `Rc<S>` (generic
+    /// over the concrete store type) rather than `Rc<dyn CredentialStore>`
+    /// directly. Callers write this the same either way
+    /// (`browser.set_credential_store(Rc::new(store))`).
+    pub fn set_credential_store<S: CredentialStore + 'static>(&self, store: Rc<S>) {
+        *self.credential_store.borrow_mut() = Some(store as Rc<dyn DynCredentialStore>);
+    }
+
     /// Must be called once, explicitly, at daemon shutdown — there is no
     /// synchronous `Drop` equivalent that can await a promise, so this can't
     /// just be a destructor.
@@ -251,6 +385,13 @@ fn map_js_error(message: String) -> PortError {
         || lower.contains("not found")
     {
         PortError::NotFound(message)
+    } else if lower.contains("type_secret refused") {
+        // `browser.js`'s `jsBrowserTypeSecret` throws this exact marker
+        // (`secretFieldShapeRefusal`, Task 4.3.2b) when its dispatch-time
+        // type/autocomplete re-check refuses the write — mirrors native's
+        // `secret_field_shape_refusal` variant choice
+        // (`PortError::NotActionable`, `crates/native/src/browser.rs`).
+        PortError::NotActionable(message)
     } else {
         PortError::Other(message)
     }
@@ -351,6 +492,64 @@ impl BrowserDriver for WasmBrowser {
             &session_id.0,
             &locator.0,
             text,
+            timeout.as_millis() as f64,
+        ))
+        .await
+        .map_err(js_reject_to_port_error)?;
+
+        let parsed: JsAxSnapshot =
+            serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))?;
+        Ok(parsed.into())
+    }
+
+    /// Epic 4.3: resolves `credential_ref` internally (never accepted as a
+    /// resolved value from a caller — see the trait doc comment) and types it
+    /// into `locator`. Two `wasm_bindgen` calls, in order, so the domain
+    /// check (Story 4.3.3) can gate resolution instead of following it: (1)
+    /// `jsBrowserCurrentUrl` fetches the session's fresh live URL — no
+    /// resolve has happened yet — and `check_credential_domain` rejects a
+    /// mismatch immediately, before `self.credential_store` is ever touched;
+    /// (2) only on a match, `self.credential_store.resolve(...)` runs, and
+    /// `jsBrowserTypeSecret` performs the actual DOM write (its own
+    /// dispatch-time type re-check and unconditional own-node redaction live
+    /// entirely in `crates/wasm/src/glue/browser.js`). This is the wasm-side
+    /// equivalent of native's domain-check -> resolve -> dispatch-time
+    /// re-check -> write ordering, reached via an extra JS round trip because
+    /// (unlike native) this side has no direct handle to the page object.
+    async fn type_secret(
+        &self,
+        session_id: &SessionId,
+        locator: &Locator,
+        credential_ref: &CredentialRef,
+        timeout: Duration,
+    ) -> Result<AxSnapshot, PortError> {
+        let live_url_value = JsFuture::from(js_browser_current_url(&session_id.0))
+            .await
+            .map_err(js_reject_to_port_error)?;
+        let live_url = live_url_value.as_string().ok_or_else(|| {
+            PortError::Other("jsBrowserCurrentUrl resolved with a non-string value".to_string())
+        })?;
+        // Logged through the same `vault.js::logResolveOutcome` chokepoint the
+        // resolve-layer rejection uses (A1 code review fix) — otherwise this
+        // early rejection would be silently missing from the audit trail,
+        // since `resolve()` (and its own logging) is never reached on this
+        // path.
+        if let Err(e) = check_credential_domain(&live_url, &credential_ref.domain) {
+            js_log_resolve_outcome(
+                &credential_ref.domain,
+                crate::vault::field_wire_string(credential_ref.field),
+                domain_check_rejection_outcome(&e),
+            );
+            return Err(e);
+        }
+
+        let store = resolve_via_injected_store(&self.credential_store)?;
+        let secret = store.resolve(credential_ref).await?;
+
+        let result = JsFuture::from(js_browser_type_secret(
+            &session_id.0,
+            &locator.0,
+            secret.expose(),
             timeout.as_millis() as f64,
         ))
         .await
@@ -696,6 +895,144 @@ mod tests {
             other => panic!("expected PortError::NotFound, got {other:?}"),
         }
     }
+
+    /// Task 4.3.2b: `browser.js`'s `jsBrowserTypeSecret` throws its
+    /// dispatch-time refusal with the `"type_secret refused"` marker (see
+    /// `secretFieldShapeRefusal`) — this must map to `PortError::NotActionable`,
+    /// matching native's variant choice for the identical situation.
+    #[test]
+    fn map_js_error_should_map_type_secret_refused_marker_to_not_actionable() {
+        let message = "type_secret refused: ref \"e14\" resolves to a plain text field (role=textbox, no protected/password state), not a password or TOTP input — use stapler_browser_type for non-secret fields, or re-snapshot if this field should be a password field.".to_string();
+
+        let err = map_js_error(message.clone());
+
+        match err {
+            PortError::NotActionable(m) => assert_eq!(m, message),
+            other => panic!("expected PortError::NotActionable, got {other:?}"),
+        }
+    }
+
+    // -- Story 3.4.3/4.3.3 parity: domain check against the live navigation URL --
+
+    /// Required test (validation.md): the domain-mismatch gate rejects
+    /// *before* `self.credential_store` is ever touched — `type_secret`
+    /// (see its doc comment above) calls `check_credential_domain` on the
+    /// freshly-fetched `jsBrowserCurrentUrl` result strictly before calling
+    /// `resolve_via_injected_store`/`store.resolve`, so proving the pure gate
+    /// itself rejects a mismatch is exactly what proves resolution is never
+    /// attempted on this path — mirrors native's identically-shaped test for
+    /// the same AC (`crates/native/src/browser.rs`).
+    #[test]
+    fn wasm_browser_type_secret_should_return_credential_domain_mismatch_when_live_url_mismatches_before_resolve_attempted(
+    ) {
+        let result = check_credential_domain("https://evil-example.com/", "example.com");
+
+        match result {
+            Err(PortError::CredentialDomainMismatch(msg)) => {
+                assert!(msg.contains("evil-example.com"), "msg = {msg}");
+                assert!(msg.contains("example.com"), "msg = {msg}");
+            }
+            other => panic!("expected PortError::CredentialDomainMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_credential_domain_should_succeed_when_live_host_matches_requested_domain() {
+        assert!(check_credential_domain("https://example.com/login", "example.com").is_ok());
+    }
+
+    /// A1 regression test: `type_secret`'s pre-resolve domain-mismatch gate
+    /// must classify a `CredentialDomainMismatch` into the same
+    /// "rejected-domain-mismatch" outcome native's `log_resolve_outcome`
+    /// uses for the equivalent resolve-layer rejection — the actual
+    /// `js_log_resolve_outcome` call this classification feeds is an extern
+    /// JS binding exercisable only under `wasm-pack test --node` (see the
+    /// `wasm_pack_tests` module doc comment), so this covers the
+    /// classification `type_secret` calls it with.
+    #[test]
+    fn domain_check_rejection_outcome_should_classify_mismatch_as_rejected_domain_mismatch() {
+        let e = check_credential_domain("https://evil-example.com/", "example.com")
+            .expect_err("fixture host deliberately mismatches");
+        assert_eq!(
+            domain_check_rejection_outcome(&e),
+            "rejected-domain-mismatch"
+        );
+    }
+
+    // -- Story 4.3.0: store injection, fail-closed with no store --
+
+    /// Hand-rolled `CredentialStore` test double, mirroring native's
+    /// `FakeCredentialStore` (`crates/native/src/browser.rs`).
+    struct FakeCredentialStore {
+        calls: RefCell<Vec<CredentialRef>>,
+        response: Result<String, PortError>,
+    }
+
+    impl FakeCredentialStore {
+        fn with_response(response: Result<String, PortError>) -> Self {
+            FakeCredentialStore {
+                calls: RefCell::new(Vec::new()),
+                response,
+            }
+        }
+    }
+
+    impl CredentialStore for FakeCredentialStore {
+        async fn resolve(&self, credential_ref: &CredentialRef) -> Result<SecretValue, PortError> {
+            self.calls.borrow_mut().push(credential_ref.clone());
+            match &self.response {
+                Ok(value) => Ok(SecretValue::new(value.clone())),
+                Err(_) => Err(PortError::Other(
+                    "FakeCredentialStore configured error".to_string(),
+                )),
+            }
+        }
+    }
+
+    fn password_ref(domain: &str) -> CredentialRef {
+        CredentialRef {
+            domain: domain.to_string(),
+            field: stapler_mcp_core::ports::CredentialField::Password,
+        }
+    }
+
+    #[tokio::test]
+    async fn wasm_browser_type_secret_should_reach_injected_store_when_credential_store_set() {
+        let browser = WasmBrowser::new();
+        let fake = Rc::new(FakeCredentialStore::with_response(
+            Ok("hunter2".to_string()),
+        ));
+        browser.set_credential_store(Rc::clone(&fake));
+
+        let store =
+            resolve_via_injected_store(&browser.credential_store).expect("store was just injected");
+        let secret = store
+            .resolve(&password_ref("example.com"))
+            .await
+            .expect("fake store is configured to succeed");
+
+        assert_eq!(secret.expose(), "hunter2");
+        assert_eq!(fake.calls.borrow().len(), 1);
+        assert_eq!(fake.calls.borrow()[0], password_ref("example.com"));
+    }
+
+    #[test]
+    fn wasm_browser_type_secret_should_return_error_not_panic_when_no_credential_store_injected() {
+        // AC (Task 4.3.0, mirroring native's Task 3.4.0b): a freshly
+        // `WasmBrowser::new()`-constructed browser with no
+        // `set_credential_store` call made returns
+        // `Err(PortError::CredentialUnauthenticated(...))` rather than
+        // panicking.
+        let browser = WasmBrowser::new();
+
+        let result = resolve_via_injected_store(&browser.credential_store);
+
+        match result {
+            Err(PortError::CredentialUnauthenticated(_)) => {}
+            Err(other) => panic!("expected PortError::CredentialUnauthenticated, got {other:?}"),
+            Ok(_) => panic!("expected an error with no store injected, got Ok"),
+        }
+    }
 }
 
 /// Task 4.3.1's AC-mandated `wasm-pack test` harness: exercises
@@ -746,7 +1083,7 @@ mod wasm_pack_tests {
     /// with a non-empty `session_id`.
     #[wasm_bindgen_test]
     async fn wasm_browser_navigate_returns_session_and_final_url_against_real_glue() {
-        let browser = WasmBrowser;
+        let browser = WasmBrowser::new();
 
         let result = browser
             .navigate("https://example.com", None, Duration::from_secs(30))
@@ -772,7 +1109,7 @@ mod wasm_pack_tests {
     /// least a root node — not just `navigate`'s `NavigateResult` path.
     #[wasm_bindgen_test]
     async fn wasm_browser_snapshot_round_trips_after_navigate_against_real_glue() {
-        let browser = WasmBrowser;
+        let browser = WasmBrowser::new();
 
         let nav = browser
             .navigate("https://example.com", None, Duration::from_secs(30))

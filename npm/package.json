@@ -17,6 +17,7 @@
     "test": "NODE_PATH=./node_modules node --test"
   },
   "dependencies": {
+    "@1password/sdk": "0.5.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "playwright-core": "^1.61.1"
   }

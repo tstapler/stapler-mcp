@@ -7,6 +7,7 @@ mod js_util;
 mod lock;
 mod process;
 mod socket;
+mod vault;
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use std::time::Duration;
 use wasm_bindgen::prelude::*;
 
 use stapler_mcp_core::client::{self, EnsureOptions};
-use stapler_mcp_core::daemon::{json_handler, Daemon};
+use stapler_mcp_core::daemon::{json_handler, Daemon, Handler};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::{EnvPort, LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
@@ -23,10 +24,36 @@ use stapler_mcp_core::schema::{
     BrowserCloseSessionOutput, BrowserHoverInput, BrowserListSessionsInput,
     BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput,
     BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
-    BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
-    FetchPageInput, FetchPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
+    BrowserTypeInput, BrowserTypeSecretInput, BrowserWaitForInput, DownloadWebsiteInput,
+    DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, ReadSavedPageInput,
+    ReadSavedPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
 };
-use stapler_mcp_core::tools::{browser as browser_tools, fetch, search, webcrawl};
+use stapler_mcp_core::tools::{browser as browser_tools, credential, fetch, search, webcrawl};
+
+/// Epic 6.1 AC, verbatim — identical wording to the native entry point
+/// (`crates/cli/src/main.rs`) per Story 6.1.2's "same Risk Control
+/// guarantee" requirement.
+const VAULT_NOT_CONFIGURED_MESSAGE: &str =
+    "vault not configured: set OP_SERVICE_ACCOUNT_TOKEN in the daemon's environment and restart";
+
+/// The opt-out branch's handler: never references `browser` or constructs a
+/// `WasmCredentialStore`, mirroring `crates/cli/src/main.rs`'s
+/// `vault_not_configured_handler`.
+fn vault_not_configured_handler() -> Handler {
+    json_handler(|_input: BrowserTypeSecretInput| async {
+        Err::<BrowserActionOutput, String>(VAULT_NOT_CONFIGURED_MESSAGE.to_string())
+    })
+}
+
+/// The opt-in branch's handler: `browser` already carries the injected
+/// `WasmCredentialStore` (set once at startup below, mirroring native's
+/// `type_secret_handler`).
+fn type_secret_handler(browser: Rc<browser::WasmBrowser>) -> Handler {
+    json_handler(move |input: BrowserTypeSecretInput| {
+        let browser = browser.clone();
+        async move { credential::browser_type_secret(&*browser, input).await }
+    })
+}
 
 #[wasm_bindgen]
 pub async fn run_daemon() -> Result<(), JsValue> {
@@ -47,7 +74,21 @@ pub async fn run_daemon() -> Result<(), JsValue> {
 
     let http = Rc::new(http::WasmHttp);
     let fsstore = Rc::new(fs::WasmFs);
-    let browser = Rc::new(browser::WasmBrowser);
+    let browser = Rc::new(browser::WasmBrowser::new());
+    // Epic 6.1 (ADR-001 + Story 6.1.2): infrastructure-level opt-in, mirroring
+    // `crates/cli/src/main.rs` exactly — a `WasmCredentialStore` is only ever
+    // constructed (and injected into `browser`) when
+    // `OP_SERVICE_ACCOUNT_TOKEN` is present. When it is, `type_secret`'s
+    // internal `resolve()` call always goes through this single injected
+    // instance — required for ADR-003's in-flight dedup
+    // (`crates/wasm/src/glue/vault.js`'s `pending` map) to actually see
+    // every resolve request.
+    let credential_store_present = env
+        .var("OP_SERVICE_ACCOUNT_TOKEN")
+        .map(|_token| {
+            browser.set_credential_store(Rc::new(vault::WasmCredentialStore));
+        })
+        .is_some();
 
     let daemon = Daemon::new();
 
@@ -85,17 +126,22 @@ pub async fn run_daemon() -> Result<(), JsValue> {
     let cache_dir = paths::cache_dir(&env);
     // Only ever set by this crate's own tests — see `NetworkPolicy`'s doc
     // comment in `crates/core`.
-    let network_policy =
-        webcrawl::NetworkPolicy::from_env(env.var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"));
+    let network_policy = webcrawl::NetworkPolicy::from_env(
+        env.var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"),
+        env.var("STAPLER_MCP_ALLOWED_PRIVATE_HOSTS"),
+    );
     daemon.register(
         "read_website",
         json_handler({
             let http = http.clone();
             let fsstore = fsstore.clone();
+            let cache_dir = cache_dir.clone();
+            let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
                 let fsstore = fsstore.clone();
                 let cache_dir = cache_dir.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     webcrawl::read_website(&*http, &*fsstore, &cache_dir, input, network_policy)
                         .await
@@ -105,13 +151,28 @@ pub async fn run_daemon() -> Result<(), JsValue> {
     );
 
     daemon.register(
+        "read_saved_page",
+        json_handler({
+            let fsstore = fsstore.clone();
+            let cache_dir = cache_dir.clone();
+            move |input: ReadSavedPageInput| {
+                let fsstore = fsstore.clone();
+                let cache_dir = cache_dir.clone();
+                async move { webcrawl::read_saved_page(&*fsstore, &cache_dir, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
         "download_website",
         json_handler({
             let http = http.clone();
             let fsstore = fsstore.clone();
+            let network_policy = network_policy.clone();
             move |input: DownloadWebsiteInput| {
                 let http = http.clone();
                 let fsstore = fsstore.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     webcrawl::download_website(&*http, &*fsstore, input, network_policy).await
                 }
@@ -123,8 +184,10 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         "stapler_browser_navigate",
         json_handler({
             let browser = browser.clone();
+            let network_policy = network_policy.clone();
             move |input: BrowserNavigateInput| {
                 let browser = browser.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     browser_tools::browser_navigate(&*browser, input, network_policy).await
                 }
@@ -202,8 +265,10 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         "stapler_browser_tabs",
         json_handler({
             let browser = browser.clone();
+            let network_policy = network_policy.clone();
             move |input: BrowserTabsInput| {
                 let browser = browser.clone();
+                let network_policy = network_policy.clone();
                 async move { browser_tools::browser_tabs(&*browser, input, network_policy).await }
             }
         }),
@@ -251,6 +316,15 @@ pub async fn run_daemon() -> Result<(), JsValue> {
                 async move { browser_tools::browser_wait_for(&*browser, input).await }
             }
         }),
+    );
+
+    daemon.register(
+        "stapler_browser_type_secret",
+        if credential_store_present {
+            type_secret_handler(browser.clone())
+        } else {
+            vault_not_configured_handler()
+        },
     );
 
     let socket = socket::WasmSocketFactory;
@@ -336,10 +410,18 @@ pub fn list_tools_json() -> Result<String, JsValue> {
         },
         ToolDescriptor {
             name: "read_website",
-            description: "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon.",
+            description: "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon. Once the combined Markdown across all pages returned passes ~60,000 characters (tunable via maxInlineChars, or force it for every page with alwaysSaveToFile), further pages come back as a short preview plus savedPath instead — use read_saved_page to search or page through the full content.",
             input_schema: serde_json::to_value(schemars::schema_for!(ReadWebsiteInput))
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
             output_schema: serde_json::to_value(schemars::schema_for!(ReadWebsiteOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
+        ToolDescriptor {
+            name: "read_saved_page",
+            description: "Search or page through a page's full Markdown previously saved by read_website (its savedPath). With query set, returns every matching line (case-insensitive) plus surrounding context, like grep -n -C; without it, returns a line-numbered page of content starting at offset. Works even when you're not on the same machine as the daemon.",
+            input_schema: serde_json::to_value(schemars::schema_for!(ReadSavedPageInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(ReadSavedPageOutput))
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
         },
         ToolDescriptor {
@@ -493,6 +575,59 @@ mod list_tools_tests {
             matched.len(),
             12,
             "expected exactly 12 browser tool descriptors, found {matched:?} in {names:?}"
+        );
+    }
+}
+
+/// Epic 6.1 / Story 6.1.2: validation.md's
+/// `wasm_daemon_should_return_vault_not_configured_error_when_op_service_account_token_unset`
+/// row is classified Integration, but `run_daemon`'s own body crosses several
+/// `wasm_bindgen(module = "...")` extern boundaries (`fs::js_ensure_dir`,
+/// `lock::WasmLock`, ...) that only resolve inside a real JS engine — not
+/// under a host-target `cargo test` run, which is how this crate's other 17
+/// tests (including `browser.rs`'s own `WasmBrowser` credential-store tests)
+/// already avoid calling `run_daemon` itself. A true Node/wasm-pack
+/// integration exercise is out of scope here; this test instead reaches the
+/// same Rust-level branch this file's `run_daemon` executes — a real
+/// `Daemon` + `vault_not_configured_handler`, mirroring
+/// `crates/cli/src/main.rs`'s own `credential_wiring_tests` module — which is
+/// the deepest level `cargo test -p stapler-mcp-wasm` can exercise without a
+/// JS host.
+#[cfg(test)]
+mod credential_wiring_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wasm_daemon_should_return_vault_not_configured_error_when_op_service_account_token_unset(
+    ) {
+        let daemon = Daemon::new();
+        daemon.register(
+            "stapler_browser_type_secret",
+            vault_not_configured_handler(),
+        );
+
+        let request = serde_json::json!({
+            "tool": "stapler_browser_type_secret",
+            "params": {
+                "sessionId": "sess-1",
+                "refId": "e1",
+                "credential": { "domain": "example.com", "field": "password" }
+            }
+        });
+        let bytes = daemon
+            .handle_request_bytes(request.to_string().as_bytes())
+            .await;
+        let resp: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("daemon response should be valid JSON");
+
+        assert_eq!(
+            resp["error"].as_str(),
+            Some(VAULT_NOT_CONFIGURED_MESSAGE),
+            "got: {resp:?}"
+        );
+        assert!(
+            resp.get("result").is_none() || resp["result"].is_null(),
+            "got: {resp:?}"
         );
     }
 }

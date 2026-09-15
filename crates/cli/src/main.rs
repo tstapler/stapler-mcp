@@ -7,23 +7,55 @@ use std::time::Duration;
 
 use rmcp::{transport::stdio, ServiceExt};
 
-use stapler_mcp_core::daemon::{json_handler, Daemon};
+use stapler_mcp_core::daemon::{json_handler, Daemon, Handler};
 use stapler_mcp_core::paths;
-use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
+use stapler_mcp_core::ports::{EnvPort, LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
     BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
-    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserHistoryInput,
-    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserPressKeyInput,
-    BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput,
-    DownloadWebsiteInput, FetchPageInput, IndexDocsInput, ListIndexedSourcesInput,
-    ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
+    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
+    BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
+    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
+    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
+    BrowserTypeSecretInput, BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput,
+    IndexDocsInput, ListIndexedSourcesInput, ReadSavedPageInput, ReadWebsiteInput,
+    RemoveIndexedSourceInput, SearchDocsInput,
 };
-use stapler_mcp_core::tools::{browser, docs, fetch, search, webcrawl};
+use stapler_mcp_core::tools::{browser, credential, docs, fetch, search, webcrawl};
 use stapler_mcp_native::{
-    NativeBrowser, NativeClock, NativeEmbedder, NativeEnv, NativeFs, NativeHttp, NativeLock,
-    NativeSocketFactory,
+    NativeBrowser, NativeClock, NativeCredentialStore, NativeEmbedder, NativeEnv, NativeFs,
+    NativeHttp, NativeLock, NativeSocketFactory, NativeSpawner,
 };
+
+/// Epic 6.1 AC: verbatim, so a caller sees exactly this string and a unit
+/// test (`credential_wiring_tests`, below) can assert against the same
+/// constant rather than a duplicated literal.
+const VAULT_NOT_CONFIGURED_MESSAGE: &str =
+    "vault not configured: set OP_SERVICE_ACCOUNT_TOKEN in the daemon's environment and restart";
+
+/// The opt-out branch's handler: never references `browser` or constructs a
+/// `NativeCredentialStore`, so registering it (the `OP_SERVICE_ACCOUNT_TOKEN`
+/// -unset path) is structurally incapable of touching either — the AC this
+/// function exists to make independently unit-testable without a live
+/// `NativeBrowser` (which needs a real Chromium binary to construct at all).
+fn vault_not_configured_handler() -> Handler {
+    json_handler(|_input: BrowserTypeSecretInput| async {
+        Err::<stapler_mcp_core::schema::BrowserActionOutput, String>(
+            VAULT_NOT_CONFIGURED_MESSAGE.to_string(),
+        )
+    })
+}
+
+/// The opt-in branch's handler: `browser` already carries the injected
+/// `NativeCredentialStore` (set once at startup below), so this reaches
+/// `NativeBrowser::type_secret` -> its own injected store's `resolve()` —
+/// this function itself never calls `CredentialStore::resolve` directly
+/// (Story 5.2.1).
+fn type_secret_handler(browser: Rc<NativeBrowser>) -> Handler {
+    json_handler(move |input: BrowserTypeSecretInput| {
+        let browser = browser.clone();
+        async move { credential::browser_type_secret(&*browser, input).await }
+    })
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -265,6 +297,18 @@ async fn run_daemon() {
             std::process::exit(1);
         }
     };
+    // Epic 6.1: infrastructure-level opt-in per requirements.md's Risk
+    // Control section — a `NativeCredentialStore` is only ever constructed
+    // (and injected into `browser`) when the token is present. Reading
+    // `OP_SERVICE_ACCOUNT_TOKEN` via `EnvPort` rather than `std::env`
+    // directly matches every other env read in this file (see
+    // `network_policy` below).
+    let credential_store_present = EnvPort::var(&env, "OP_SERVICE_ACCOUNT_TOKEN")
+        .map(|token| {
+            browser.set_credential_store(Rc::new(NativeCredentialStore::new(NativeSpawner, token)));
+        })
+        .is_some();
+
     let embedder = Rc::new(NativeEmbedder::new(paths::embedding_cache_dir(&env)));
     let clock = Rc::new(NativeClock);
     let source_locks = Rc::new(docs::SourceLocks::new());
@@ -310,22 +354,38 @@ async fn run_daemon() {
     // comment. Read once via `EnvPort` rather than `std::env` directly so
     // it's still exercised through the same seam as everything else in
     // `crates/core`.
-    let network_policy = webcrawl::NetworkPolicy::from_env(stapler_mcp_core::ports::EnvPort::var(
-        &env,
-        "STAPLER_MCP_ALLOW_PRIVATE_NETWORKS",
-    ));
+    let network_policy = webcrawl::NetworkPolicy::from_env(
+        stapler_mcp_core::ports::EnvPort::var(&env, "STAPLER_MCP_ALLOW_PRIVATE_NETWORKS"),
+        stapler_mcp_core::ports::EnvPort::var(&env, "STAPLER_MCP_ALLOWED_PRIVATE_HOSTS"),
+    );
     daemon.register(
         "read_website",
         json_handler({
             let http = http.clone();
             let fs = fs.clone();
+            let cache_dir = cache_dir.clone();
+            let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
                 let fs = fs.clone();
                 let cache_dir = cache_dir.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     webcrawl::read_website(&*http, &*fs, &cache_dir, input, network_policy).await
                 }
+            }
+        }),
+    );
+
+    daemon.register(
+        "read_saved_page",
+        json_handler({
+            let fs = fs.clone();
+            let cache_dir = cache_dir.clone();
+            move |input: ReadSavedPageInput| {
+                let fs = fs.clone();
+                let cache_dir = cache_dir.clone();
+                async move { webcrawl::read_saved_page(&*fs, &cache_dir, input).await }
             }
         }),
     );
@@ -335,9 +395,11 @@ async fn run_daemon() {
         json_handler({
             let http = http.clone();
             let fs = fs.clone();
+            let network_policy = network_policy.clone();
             move |input: DownloadWebsiteInput| {
                 let http = http.clone();
                 let fs = fs.clone();
+                let network_policy = network_policy.clone();
                 async move { webcrawl::download_website(&*http, &*fs, input, network_policy).await }
             }
         }),
@@ -347,8 +409,10 @@ async fn run_daemon() {
         "stapler_browser_navigate",
         json_handler({
             let browser = browser.clone();
+            let network_policy = network_policy.clone();
             move |input: BrowserNavigateInput| {
                 let browser = browser.clone();
+                let network_policy = network_policy.clone();
                 async move { browser::browser_navigate(&*browser, input, network_policy).await }
             }
         }),
@@ -424,8 +488,10 @@ async fn run_daemon() {
         "stapler_browser_tabs",
         json_handler({
             let browser = browser.clone();
+            let network_policy = network_policy.clone();
             move |input: BrowserTabsInput| {
                 let browser = browser.clone();
+                let network_policy = network_policy.clone();
                 async move { browser::browser_tabs(&*browser, input, network_policy).await }
             }
         }),
@@ -500,6 +566,17 @@ async fn run_daemon() {
     );
 
     daemon.register(
+        "stapler_browser_get_html",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BrowserGetHtmlInput| {
+                let browser = browser.clone();
+                async move { browser::browser_get_html(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
         "stapler_browser_fill_form",
         json_handler({
             let browser = browser.clone();
@@ -555,6 +632,15 @@ async fn run_daemon() {
     );
 
     daemon.register(
+        "stapler_browser_type_secret",
+        if credential_store_present {
+            type_secret_handler(browser.clone())
+        } else {
+            vault_not_configured_handler()
+        },
+    );
+
+    daemon.register(
         "stapler_index_docs",
         json_handler({
             let http = http.clone();
@@ -563,6 +649,7 @@ async fn run_daemon() {
             let clock = clock.clone();
             let source_locks = source_locks.clone();
             let docs_index_dir = docs_index_dir.clone();
+            let network_policy = network_policy.clone();
             move |input: IndexDocsInput| {
                 let http = http.clone();
                 let fs = fs.clone();
@@ -570,6 +657,7 @@ async fn run_daemon() {
                 let clock = clock.clone();
                 let source_locks = source_locks.clone();
                 let docs_index_dir = docs_index_dir.clone();
+                let network_policy = network_policy.clone();
                 async move {
                     docs::index_source(
                         &*http,
@@ -802,5 +890,55 @@ async fn shutdown_cleanup(daemon: Rc<Daemon>, mut browser: Rc<NativeBrowser>) {
         eprintln!("DEBUGTRACE: shutdown_cleanup: inner.close() returned");
     } else {
         eprintln!("DEBUGTRACE: shutdown_cleanup: Rc::get_mut failed, strong_count={}", Rc::strong_count(&browser));
+    }
+}
+
+/// Epic 6.1 / Story 6.1.1: validation.md's
+/// `daemon_should_return_vault_not_configured_error_when_op_service_account_token_unset`
+/// row is classified Unit — reachable here without a live `NativeBrowser`
+/// (which needs a real Chromium binary to construct at all) because
+/// `vault_not_configured_handler` never references `browser`. This routes
+/// the handler through a real `Daemon` (not called directly) so the
+/// assertion also proves the tool is actually *registered*, not merely
+/// constructible. The token-present path (`NativeBrowser::type_secret`
+/// reaching the injected `NativeCredentialStore::resolve`) needs a real
+/// daemon subprocess + Chromium + the `op` CLI, so it lives in
+/// `crates/cli/tests/browser_session.rs` instead, alongside this file's
+/// other `#[ignore]`d real-daemon integration tests.
+#[cfg(test)]
+mod credential_wiring_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn daemon_should_return_vault_not_configured_error_when_op_service_account_token_unset() {
+        let daemon = Daemon::new();
+        daemon.register(
+            "stapler_browser_type_secret",
+            vault_not_configured_handler(),
+        );
+
+        let request = serde_json::json!({
+            "tool": "stapler_browser_type_secret",
+            "params": {
+                "sessionId": "sess-1",
+                "refId": "e1",
+                "credential": { "domain": "example.com", "field": "password" }
+            }
+        });
+        let bytes = daemon
+            .handle_request_bytes(request.to_string().as_bytes())
+            .await;
+        let resp: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("daemon response should be valid JSON");
+
+        assert_eq!(
+            resp["error"].as_str(),
+            Some(VAULT_NOT_CONFIGURED_MESSAGE),
+            "got: {resp:?}"
+        );
+        assert!(
+            resp.get("result").is_none() || resp["result"].is_null(),
+            "got: {resp:?}"
+        );
     }
 }

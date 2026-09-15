@@ -12,15 +12,16 @@ use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
     BrowserCloseAllSessionsInput, BrowserCloseAllSessionsOutput, BrowserCloseSessionInput,
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
-    BrowserFindInput, BrowserFindOutput, BrowserHistoryInput, BrowserHoverInput,
-    BrowserListSessionsInput, BrowserListSessionsOutput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
-    BrowserScreenshotOutput, BrowserSelectOptionInput, BrowserSetCheckedInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
-    BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
-    FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
-    ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput,
-    RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
+    BrowserFindInput, BrowserFindOutput, BrowserGetHtmlInput, BrowserGetHtmlOutput,
+    BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserListSessionsOutput,
+    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
+    BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
+    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
+    BrowserTypeInput, BrowserTypeSecretInput, BrowserWaitForInput, DownloadWebsiteInput,
+    DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput,
+    ListIndexedSourcesInput, ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput,
+    ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput,
+    SearchDocsInput, SearchDocsOutput,
 };
 #[derive(Debug, Clone)]
 pub struct McpRouter<T: DaemonTransport = SocketTransport> {
@@ -98,7 +99,7 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
 
     #[tool(
         name = "read_website",
-        description = "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon."
+        description = "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon. Once the combined Markdown across all pages returned passes ~60,000 characters (tunable via maxInlineChars, or force it for every page with alwaysSaveToFile), further pages come back as a short preview plus savedPath instead — use read_saved_page to search or page through the full content."
     )]
     async fn read_website(
         &self,
@@ -109,6 +110,17 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
             .call("read_website", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
             .await?;
         serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+    }
+
+    #[tool(
+        name = "read_saved_page",
+        description = "Search or page through a page's full Markdown previously saved by read_website (its savedPath). With query set, returns every matching line (case-insensitive) plus surrounding context, like grep -n -C; without it, returns a line-numbered page of content starting at offset. Works even when you're not on the same machine as the daemon."
+    )]
+    async fn read_saved_page(
+        &self,
+        params: Parameters<ReadSavedPageInput>,
+    ) -> Result<Json<ReadSavedPageOutput>, String> {
+        call_daemon("read_saved_page", params.0).await.map(Json)
     }
 
     #[tool(
@@ -169,6 +181,19 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
             .call("stapler_browser_type", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
             .await?;
         serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_type_secret",
+        description = "Use this instead of stapler_browser_type whenever a field is a password, TOTP/2FA code, or other secret you have a stored credential for. Types a credential resolved server-side from the daemon's configured vault into an element in an existing browser session, identified by a `ref` from a previous snapshot — the credential value never appears in this tool's request or in any returned accessibility-tree snapshot (a fixed [REDACTED] placeholder takes its place). Returns the accessibility-tree snapshot after typing, same as stapler_browser_type, with note set to confirm success since the visible value won't change to show it."
+    )]
+    async fn browser_type_secret(
+        &self,
+        params: Parameters<BrowserTypeSecretInput>,
+    ) -> Result<Json<BrowserActionOutput>, String> {
+        call_daemon("stapler_browser_type_secret", params.0)
+            .await
+            .map(Json)
     }
 
     #[tool(
@@ -334,6 +359,19 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
             .call("stapler_browser_evaluate", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
             .await?;
         serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_get_html",
+        description = "Return the rendered HTML of an existing browser session's current page (document.documentElement.outerHTML), or of a single element's outerHTML when refId (a `ref` from a previous snapshot) is given. Complements stapler_browser_snapshot's accessibility-tree view when the exact markup is what's needed."
+    )]
+    async fn browser_get_html(
+        &self,
+        params: Parameters<BrowserGetHtmlInput>,
+    ) -> Result<Json<BrowserGetHtmlOutput>, String> {
+        call_daemon("stapler_browser_get_html", params.0)
+            .await
+            .map(Json)
     }
 
     #[tool(
