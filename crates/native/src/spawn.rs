@@ -164,11 +164,6 @@ mod tests {
         assert_eq!(result.stderr, b"err\n");
         assert_eq!(result.exit_code, 1);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn open_log_file_should_create_file_with_owner_only_mode() {

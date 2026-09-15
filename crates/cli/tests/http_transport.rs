@@ -4,7 +4,7 @@
 //! - **Real subprocess** (`spawn_http_daemon`): the actual `stapler-mcp`
 //!   binary, started with `STAPLER_MCP_HTTP_PORT` set, exercised over a real
 //!   `TcpListener` via `reqwest` — used wherever the test needs the real
-//!   fixed 27-tool set or real process lifecycle (auth, dual-transport,
+//!   fixed 30-tool set or real process lifecycle (auth, dual-transport,
 //!   concurrency, SIGTERM).
 //! - **In-process harness** (`spawn_in_process_harness`): a bare `Daemon` +
 //!   bridge channel + `transport::run_bridge_consumer` +
@@ -34,6 +34,13 @@ mod transport;
 mod mcp_router;
 #[path = "../src/http_server.rs"]
 mod http_server;
+
+/// `spawn_http_daemon` mutates process-global env vars (`STAPLER_MCP_HOME`,
+/// `STAPLER_MCP_HTTP_PORT`) to configure the subprocess it spawns. Rust's
+/// default test harness runs `#[tokio::test]` functions concurrently in the
+/// same process, so without this lock two daemon-spawning tests can race and
+/// hand each other's subprocess the wrong home dir/port.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct TestEnv {
     home: String,
@@ -124,6 +131,21 @@ async fn poll_until_nonempty_file(path: &str, timeout: Duration) -> String {
     }
 }
 
+/// True once `pid` has either exited (no `/proc/<pid>` entry) or terminated
+/// but not yet been reaped by its parent (`/proc/<pid>/stat`'s state field is
+/// `Z`) — see the SIGTERM test's own comment for why zombie counts as gone.
+fn process_exited_or_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    // Format: "pid (comm) state ...". `comm` can itself contain spaces/parens,
+    // so split on the last `) ` rather than whitespace-splitting from the start.
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .map(|state| state == "Z")
+        .unwrap_or(true)
+}
+
 async fn shutdown_daemon(socket: &NativeSocketFactory, sock_path: &str) {
     let _ = client::call(socket, sock_path, "shutdown", None, Duration::from_secs(2)).await;
 }
@@ -183,8 +205,9 @@ fn socket_and_channel_transport_should_register_identical_tool_schemas() {
     );
     assert_eq!(
         socket_tools.len(),
-        27,
-        "expected all 27 ThinClient-era tools to be registered"
+        30,
+        "expected all 30 tools (27 ThinClient-era + read_saved_page, \
+         stapler_browser_type_secret, stapler_browser_get_html merged from main) to be registered"
     );
 
     for socket_tool in &socket_tools {
@@ -205,6 +228,7 @@ fn socket_and_channel_transport_should_register_identical_tool_schemas() {
 
 #[tokio::test]
 async fn http_request_without_token_is_rejected_and_with_token_succeeds() {
+    let _env_guard = ENV_LOCK.lock().await;
     let (_tmp, env, port, token) = spawn_http_daemon().await;
 
     let (unauth_status, _) = http_call_tool(port, "wrong-token", "stapler_browser_list_sessions", json!({})).await;
@@ -224,6 +248,7 @@ async fn http_request_without_token_is_rejected_and_with_token_succeeds() {
 
 #[tokio::test]
 async fn stdio_and_http_calls_both_reach_the_same_running_daemon() {
+    let _env_guard = ENV_LOCK.lock().await;
     let (_tmp, env, port, token) = spawn_http_daemon().await;
     let socket = NativeSocketFactory;
     let sock_path = paths::socket_path(&env);
@@ -284,6 +309,7 @@ async fn stdio_and_http_calls_both_reach_the_same_running_daemon() {
 
 #[tokio::test]
 async fn two_concurrent_http_navigate_calls_both_succeed_with_distinct_session_ids() {
+    let _env_guard = ENV_LOCK.lock().await;
     let (_tmp, env, port, token) = spawn_http_daemon().await;
 
     let (result_a, result_b) = tokio::join!(
@@ -315,6 +341,7 @@ async fn two_concurrent_http_navigate_calls_both_succeed_with_distinct_session_i
 
 #[tokio::test]
 async fn session_id_from_one_http_request_is_reusable_by_a_second_independent_http_request() {
+    let _env_guard = ENV_LOCK.lock().await;
     let (_tmp, env, port, token) = spawn_http_daemon().await;
 
     let (nav_status, nav_body) = http_call_tool(
@@ -417,7 +444,7 @@ async fn wait_for_port_open(port: u16, timeout: Duration) {
 /// Registers a `"hang"` handler that never resolves and a `"boom"` handler
 /// that panics, on top of the always-present `PING_TOOL`/`SHUTDOWN_TOOL`
 /// built-ins — the minimal fixture Tasks 8.1.2c/8.1.3a/8.1.4a need, none of
-/// which the real binary's fixed 27-tool set can provide on demand.
+/// which the real binary's fixed 30-tool set can provide on demand.
 fn daemon_with_test_handlers() -> Daemon {
     let daemon = Daemon::new();
     #[derive(serde::Deserialize, serde::Serialize)]
@@ -551,6 +578,7 @@ fn burst_beyond_bridge_channel_capacity_resolves_every_request() {
 
 #[tokio::test]
 async fn sigterm_mid_request_lets_the_in_flight_request_resolve_and_the_daemon_exit_cleanly() {
+    let _env_guard = ENV_LOCK.lock().await;
     let (_tmp, env, port, token) = spawn_http_daemon().await;
     let lock_path = paths::lock_path(&env);
     let pid: u32 = std::fs::read_to_string(&lock_path)
@@ -585,17 +613,18 @@ async fn sigterm_mid_request_lets_the_in_flight_request_resolve_and_the_daemon_e
     let _ = tokio::time::timeout(Duration::from_secs(10), call_task).await;
 
     // The daemon process must actually exit within its shutdown grace period
-    // plus a margin, not linger.
+    // plus a margin, not linger. `spawn_daemon` deliberately never `.wait()`s
+    // the child (it must outlive its launcher — see spawn.rs), so once it
+    // exits it becomes a zombie until *this test process* (its parent) is
+    // reaped by init at process exit; `kill -0`/`/proc/<pid>` existence alone
+    // can't tell "exited, awaiting reap" from "still running" apart, since a
+    // zombie's PID entry (and `kill -0` success) persists either way. Reading
+    // `/proc/<pid>/stat`'s state field and treating `Z` (zombie) the same as
+    // "gone" avoids that false negative without this test taking over
+    // ownership of reaping (which would fight any real reaper in production).
     let exited = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            // Signal 0 probes for existence without actually signaling.
-            let alive = std::process::Command::new("kill")
-                .arg("-0")
-                .arg(pid.to_string())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !alive {
+            if process_exited_or_zombie(pid) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -604,7 +633,10 @@ async fn sigterm_mid_request_lets_the_in_flight_request_resolve_and_the_daemon_e
     .await;
     let log_debug = std::fs::read_to_string(paths::log_path(&env)).unwrap_or_default();
     eprintln!("DEBUG log contents:\n{log_debug}");
-    eprintln!("DEBUG kill -0 alive check after wait: {:?}", std::process::Command::new("kill").arg("-0").arg(pid.to_string()).status());
+    eprintln!(
+        "DEBUG process_exited_or_zombie after wait: {}",
+        process_exited_or_zombie(pid)
+    );
     assert!(exited.is_ok(), "daemon process (pid {pid}) did not exit within the grace period");
 
     let log = std::fs::read_to_string(paths::log_path(&env)).unwrap_or_default();

@@ -867,9 +867,7 @@ async fn await_with_shutdown_grace<F: std::future::Future>(
 /// forever after a clean shutdown.
 async fn shutdown_cleanup(daemon: Rc<Daemon>, mut browser: Rc<NativeBrowser>) {
     drop(daemon);
-    eprintln!("DEBUGTRACE: shutdown_cleanup: daemon dropped, strong_count(browser)={}", Rc::strong_count(&browser));
     if let Some(inner) = Rc::get_mut(&mut browser) {
-        eprintln!("DEBUGTRACE: shutdown_cleanup: got mut browser, aborting reaper");
         // Abort the session-idle reaper before closing the browser: a
         // still-running reaper mid-scan could otherwise race
         // `NativeBrowser::close()`. `handle.await`ing an aborted task
@@ -885,11 +883,16 @@ async fn shutdown_cleanup(daemon: Rc<Daemon>, mut browser: Rc<NativeBrowser>) {
                 }
             }
         }
-        eprintln!("DEBUGTRACE: shutdown_cleanup: calling inner.close()");
         inner.close().await;
-        eprintln!("DEBUGTRACE: shutdown_cleanup: inner.close() returned");
     } else {
-        eprintln!("DEBUGTRACE: shutdown_cleanup: Rc::get_mut failed, strong_count={}", Rc::strong_count(&browser));
+        // Every task that could hold an `Rc<NativeBrowser>` clone has already
+        // exited by the time the shutdown `tokio::join!` completes (see this
+        // function's doc comment), so this should be unreachable — logged
+        // rather than silently skipped in case that invariant ever breaks.
+        eprintln!(
+            "stapler-mcp: shutdown_cleanup: browser still has {} references, skipping close()",
+            Rc::strong_count(&browser)
+        );
     }
 }
 

@@ -120,7 +120,11 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
         &self,
         params: Parameters<ReadSavedPageInput>,
     ) -> Result<Json<ReadSavedPageOutput>, String> {
-        call_daemon("read_saved_page", params.0).await.map(Json)
+        let result = self
+            .transport
+            .call("read_saved_page", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .await?;
+        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
     }
 
     #[tool(
@@ -191,9 +195,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
         &self,
         params: Parameters<BrowserTypeSecretInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_type_secret", params.0)
-            .await
-            .map(Json)
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_type_secret",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
     }
 
     #[tool(
@@ -369,9 +378,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
         &self,
         params: Parameters<BrowserGetHtmlInput>,
     ) -> Result<Json<BrowserGetHtmlOutput>, String> {
-        call_daemon("stapler_browser_get_html", params.0)
-            .await
-            .map(Json)
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_get_html",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
     }
 
     #[tool(
