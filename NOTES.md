@@ -208,6 +208,30 @@ than failing the whole capture. Verified against real Chrome in
 `crates/cli/tests/browser_session.rs`'s
 `snapshot_should_include_iframe_content_when_same_origin_iframe_present`.
 
+### MCP Streamable HTTP transport on the daemon (issue #38) — process-count/RSS confirmation
+
+Added a Streamable HTTP transport (`crates/cli/src/http_server.rs` +
+`transport.rs`, bearer-token auth) so the daemon can serve tool calls
+directly over `http://127.0.0.1:<port>/mcp`, alongside the existing
+Unix-socket/stdio thin-client path — see
+`project_plans/mcp-streamable-http/` for the full requirements/plan.
+`plan.md` Story 9.1.2 calls for confirming the actual outcome metric (issue
+#37: process count, not per-process size) with a `pstree`/`ps` before/after
+capture. Real Claude Code sessions weren't available inside this sandbox, so
+this uses the same underlying mechanism instead — N `stapler-mcp` stdio
+thin-client processes (the literal binary Claude Code spawns per session,
+each with stdin held open like a real session) vs. N concurrent callers over
+the HTTP transport against the same daemon:
+
+- **Before** (5 stdio thin-client sessions against one `--daemon`): 5
+  separate `stapler-mcp` processes, ~122 MB combined RSS
+  (`ps --ppid <daemon-pid>`-style capture, run 2026-09-15).
+- **After** (5 concurrent HTTP `tools/list` calls against the same daemon,
+  same port persisted via `~/.stapler-mcp/http-port`): 0 additional
+  `stapler-mcp` processes — only the one `--daemon` process remains, RSS
+  ~45 MB (all 5 sessions served from that single process). All 5 calls
+  succeeded concurrently.
+
 ## Deferred
 
 One item below is narrow enough that it's tracked as a GitHub issue rather
