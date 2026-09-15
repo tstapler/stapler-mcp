@@ -46,7 +46,7 @@ rather than re-describing it.
 1. Start the daemon with HTTP enabled: `STAPLER_MCP_HTTP_PORT=47439 stapler-mcp --daemon` (surface 2).
 2. A bearer token is auto-generated on that first start and logged (path + permissions only, never the value) (surface 2).
 3. Run `stapler-mcp --print-config` to get the exact `mcp-servers.json`-shaped block, with the real token and port filled in (surface 3).
-4. Paste that block into the untracked, machine-local override file — never the git-tracked `mcp-servers.json` (surface 1).
+4. Paste that block into `~/.claude.json`'s user-scoped `mcpServers` entry — never the git-tracked `mcp-servers.json` — after confirming `~/.claude.json` itself isn't tracked by any dotfiles repo on this machine (surface 1).
 5. Optionally install the persistent systemd/launchd unit so the daemon survives reboots/logouts instead of needing a manual foreground start (surface 8).
 6. Verify everything is wired up with `stapler-mcp --status`, which confirms both the Unix socket and the HTTP port are live (surface 4).
 
@@ -58,11 +58,41 @@ If anything fails along the way, surface 5 (daemon not running) and surface 6 (b
 
 Config-file surface. The tracked file stays on stdio by default (Out of
 Scope: not removing the fallback); the HTTP block is assembled by the
-operator from `--print-config` output (surface 3) and pasted into a
-machine-local file, never the git-tracked one — because `mcp-servers.json`
+operator from `--print-config` output (surface 3) and pasted into
+`~/.claude.json`'s user-scoped `mcpServers` entry — Claude Code's real,
+verified user-level MCP config file (`code.claude.com/docs/en/mcp.md`; not
+a file inside the `~/.claude/` subdirectory, which this repo's own
+`CLAUDE.md` documents as a dotfiles-managed symlink and therefore unsafe
+for secrets) — never the git-tracked `mcp-servers.json`, because that file
 is `llm-sync`-mirrored and, per `research/ux.md` §3, Claude Code's
-`${ENV_VAR}` substitution inside `headers` is unreliable, so there is no
-safe way to keep the file generic and env-var-driven instead.
+`${ENV_VAR}` substitution inside `headers` was found unreliable at
+research time, so there is no safe way to keep the tracked file generic and
+env-var-driven instead. **Before first use, the operator must confirm
+`~/.claude.json` itself is not tracked** by any dotfiles repo they run on
+that machine, using this exact check (verified by execution against three
+real cases — outside the repo, inside and tracked, inside and untracked —
+during `pm:triad-review`, 2026-09-14; a naive `git -C <repo> ls-files
+--error-unmatch ~/.claude.json` is wrong here: it raises `fatal: ...
+is outside repository` instead of the intended "not tracked" message
+whenever the target isn't inside the repo's own working-tree directory,
+which is the common case for a dotfiles repo that lives at e.g. `~/dotfiles`
+and symlinks individual files into `$HOME`):
+
+```bash
+target=$(readlink -f ~/.claude.json); repo=$(readlink -f ~/dotfiles)
+case "$target" in
+  "$repo"/*) git -C "$repo" ls-files --error-unmatch -- "${target#$repo/}" \
+             && echo "TRACKED — unsafe, gitignore it or use headersHelper instead" \
+             || echo "inside the repo dir but untracked — safe for now" ;;
+  *) echo "outside the repo dir entirely — cannot be tracked, safe" ;;
+esac
+```
+
+(substitute the operator's actual dotfiles repo path for `~/dotfiles`); if
+it comes back tracked, add it to that repo's `.gitignore` first or use a
+`headersHelper` script path outside any tracked directory instead (Claude
+Code supports both a literal `headers` value and a `headersHelper` script —
+see README's token-distribution section, Task 7.2.1d).
 
 ```jsonc
 // mcp-servers.json (tracked, unchanged default — every machine keeps working
@@ -76,9 +106,10 @@ safe way to keep the file generic and env-var-driven instead.
   }
 }
 
-// ~/.claude/mcp-local-overrides.json (untracked, machine-specific — created
-// by pasting `stapler-mcp --print-config`'s output; exact override
-// mechanism/filename is Claude Code's, referenced generically here)
+// ~/.claude.json (Claude Code's own user-level config file, NOT inside
+// ~/.claude/ — verify untracked by any dotfiles repo before pasting a
+// token here; created/edited by pasting `stapler-mcp --print-config`'s
+// "mcpServers" block into this file's existing "mcpServers" key)
 {
   "mcpServers": {
     "stapler-mcp": {
@@ -93,7 +124,8 @@ safe way to keep the file generic and env-var-driven instead.
 **Acceptance criteria**
 - The tracked `mcp-servers.json` never contains a literal token — README (Task 7.2.1d) states this explicitly as a warning, not just an implication.
 - README explicitly names the `${ENV_VAR}`-in-`headers` substitution as unsafe to rely on, so a reader doesn't independently reach for it as a "cleaner" alternative and hit the same unresolved upstream bug.
-- Switching a machine from stdio to HTTP requires editing exactly one block (the `stapler-mcp` entry) in one untracked file — no changes to the tracked `mcp-servers.json` are needed to opt in.
+- README names `~/.claude.json` as the concrete file (not a generic "local override file") and includes the one-line command to verify it isn't dotfiles-tracked before pasting a token into it — this is a new, blocker-level UX finding (triad review, 2026-09-14), not present in the original surface design.
+- Switching a machine from stdio to HTTP requires editing exactly one block (the `stapler-mcp` entry) in `~/.claude.json` — no changes to the tracked `mcp-servers.json` are needed to opt in.
 - Reverting to stdio (rollback path) is deleting/reverting that one block — the tracked file was never touched, so there's nothing to undo there.
 
 ---

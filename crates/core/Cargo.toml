@@ -16,13 +16,17 @@ htmd = "0.5"
 texting_robots = "0.2"
 sha2 = "0.11"
 base64 = "0.22"
+subtle = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 text-splitter = { version = "0.32", features = ["markdown"] }
-# `rt` only: gives `tokio::task::yield_now()` for `index_source`'s
-# sub-batched-embed yielding (Story 4.1.3) without pulling in a reactor/IO
-# driver this crate never needs.
-tokio = { version = "1", features = ["rt"] }
+# `rt` + `macros`: gives `tokio::task::yield_now()` for `index_source`'s
+# sub-batched-embed yielding (Story 4.1.3), plus `tokio::select!` and a
+# `CancellationToken` field used by later Phase 1 work, without pulling in a
+# reactor/IO driver this crate never needs. `time`: `Daemon::handle_request`'s
+# per-call `tokio::time::timeout` (Phase 2), still no reactor/IO driver.
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }

@@ -7,6 +7,7 @@ mod embed;
 mod env;
 mod fs;
 mod http;
+pub mod http_token;
 mod lock;
 mod sleep;
 mod socket;

@@ -28,6 +28,14 @@ pub fn log_path<E: EnvPort>(env: &E) -> String {
     format!("{}/daemon.log", base_dir(env))
 }
 
+pub fn http_port_path<E: EnvPort>(env: &E) -> String {
+    format!("{}/http-port", base_dir(env))
+}
+
+pub fn http_token_path<E: EnvPort>(env: &E) -> String {
+    format!("{}/http-token", base_dir(env))
+}
+
 pub fn cache_dir<E: EnvPort>(env: &E) -> String {
     format!("{}/cache", base_dir(env))
 }
@@ -93,5 +101,27 @@ mod tests {
         let result = docs_index_dir(&env);
 
         assert_eq!(result, "/home/testuser/.stapler-mcp/docs-index");
+    }
+
+    #[test]
+    fn should_build_http_port_path_under_home_override() {
+        let env = MockEnv {
+            home_override: Some("/tmp/test-home".to_string()),
+        };
+
+        let result = http_port_path(&env);
+
+        assert_eq!(result, "/tmp/test-home/http-port");
+    }
+
+    #[test]
+    fn should_build_http_token_path_under_home_override() {
+        let env = MockEnv {
+            home_override: Some("/tmp/test-home".to_string()),
+        };
+
+        let result = http_token_path(&env);
+
+        assert_eq!(result, "/tmp/test-home/http-token");
     }
 }
