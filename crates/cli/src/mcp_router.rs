@@ -77,9 +77,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<FetchPageOutput>, String> {
         let result = self
             .transport
-            .call("fetch_page", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "fetch_page",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -92,9 +97,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BraveSearchOutput>, String> {
         let result = self
             .transport
-            .call("brave_web_search", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "brave_web_search",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -107,9 +117,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<ReadWebsiteOutput>, String> {
         let result = self
             .transport
-            .call("read_website", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "read_website",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -122,9 +137,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<ReadSavedPageOutput>, String> {
         let result = self
             .transport
-            .call("read_saved_page", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "read_saved_page",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -137,9 +157,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<DownloadWebsiteOutput>, String> {
         let result = self
             .transport
-            .call("download_website", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "download_website",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -152,9 +177,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserNavigateOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_navigate", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_navigate",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -167,9 +197,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_click", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_click",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -182,9 +217,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_type", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_type",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -202,7 +242,9 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
                 serde_json::to_value(params.0).map_err(|e| e.to_string())?,
             )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -215,9 +257,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_snapshot", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_snapshot",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -230,9 +277,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserCloseSessionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_close_session", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_close_session",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -245,9 +297,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserListSessionsOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_list_sessions", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_list_sessions",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -260,9 +317,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserCloseAllSessionsOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_close_all_sessions", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_close_all_sessions",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -275,9 +337,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserTabsOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_tabs", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_tabs",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -290,9 +357,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_hover", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_hover",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -305,9 +377,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_select_option", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_select_option",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -320,9 +397,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_press_key", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_press_key",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -335,9 +417,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_wait_for", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_wait_for",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -350,9 +437,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserScreenshotOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_screenshot", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_screenshot",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -365,9 +457,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserEvaluateOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_evaluate", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_evaluate",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -385,7 +482,9 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
                 serde_json::to_value(params.0).map_err(|e| e.to_string())?,
             )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -398,9 +497,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_fill_form", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_fill_form",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -413,9 +517,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_set_checked", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_set_checked",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -428,9 +537,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_history", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_history",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -443,9 +557,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserActionOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_resize", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_resize",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -458,9 +577,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<BrowserFindOutput>, String> {
         let result = self
             .transport
-            .call("stapler_browser_find", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_browser_find",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -473,9 +597,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<IndexDocsOutput>, String> {
         let result = self
             .transport
-            .call("stapler_index_docs", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_index_docs",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -488,9 +617,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<SearchDocsOutput>, String> {
         let result = self
             .transport
-            .call("stapler_search_docs", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_search_docs",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -503,9 +637,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<ListIndexedSourcesOutput>, String> {
         let result = self
             .transport
-            .call("stapler_list_indexed_sources", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_list_indexed_sources",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -518,9 +657,14 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     ) -> Result<Json<RemoveIndexedSourceOutput>, String> {
         let result = self
             .transport
-            .call("stapler_remove_indexed_source", serde_json::to_value(params.0).map_err(|e| e.to_string())?)
+            .call(
+                "stapler_remove_indexed_source",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
             .await?;
-        serde_json::from_value(result).map_err(|e| e.to_string()).map(Json)
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 }
 

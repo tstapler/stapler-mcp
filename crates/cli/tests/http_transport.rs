@@ -28,12 +28,12 @@ use stapler_mcp_core::paths;
 use stapler_mcp_core::ports::EnvPort;
 use stapler_mcp_native::{NativeClock, NativeSleeper, NativeSocketFactory, NativeSpawner};
 
-#[path = "../src/transport.rs"]
-mod transport;
-#[path = "../src/mcp_router.rs"]
-mod mcp_router;
 #[path = "../src/http_server.rs"]
 mod http_server;
+#[path = "../src/mcp_router.rs"]
+mod mcp_router;
+#[path = "../src/transport.rs"]
+mod transport;
 
 /// `spawn_http_daemon` mutates process-global env vars (`STAPLER_MCP_HOME`,
 /// `STAPLER_MCP_HTTP_PORT`) to configure the subprocess it spawns. Rust's
@@ -152,7 +152,12 @@ async fn shutdown_daemon(socket: &NativeSocketFactory, sock_path: &str) {
 
 /// POSTs one MCP `tools/call` JSON-RPC request to `port`'s `/mcp` endpoint
 /// and returns the parsed JSON-RPC response body.
-async fn http_call_tool(port: u16, token: &str, tool: &str, arguments: Value) -> (reqwest::StatusCode, Value) {
+async fn http_call_tool(
+    port: u16,
+    token: &str,
+    tool: &str,
+    arguments: Value,
+) -> (reqwest::StatusCode, Value) {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://127.0.0.1:{port}/mcp"))
@@ -214,7 +219,12 @@ fn socket_and_channel_transport_should_register_identical_tool_schemas() {
         let channel_tool = channel_tools
             .iter()
             .find(|t| t.name == socket_tool.name)
-            .unwrap_or_else(|| panic!("tool `{}` missing from ChannelTransport router", socket_tool.name));
+            .unwrap_or_else(|| {
+                panic!(
+                    "tool `{}` missing from ChannelTransport router",
+                    socket_tool.name
+                )
+            });
         assert_eq!(socket_tool.description, channel_tool.description);
         assert_eq!(
             socket_tool.input_schema, channel_tool.input_schema,
@@ -231,12 +241,22 @@ async fn http_request_without_token_is_rejected_and_with_token_succeeds() {
     let _env_guard = ENV_LOCK.lock().await;
     let (_tmp, env, port, token) = spawn_http_daemon().await;
 
-    let (unauth_status, _) = http_call_tool(port, "wrong-token", "stapler_browser_list_sessions", json!({})).await;
+    let (unauth_status, _) = http_call_tool(
+        port,
+        "wrong-token",
+        "stapler_browser_list_sessions",
+        json!({}),
+    )
+    .await;
     assert_eq!(unauth_status, reqwest::StatusCode::UNAUTHORIZED);
 
-    let (auth_status, body) = http_call_tool(port, &token, "stapler_browser_list_sessions", json!({})).await;
+    let (auth_status, body) =
+        http_call_tool(port, &token, "stapler_browser_list_sessions", json!({})).await;
     assert_eq!(auth_status, reqwest::StatusCode::OK, "got: {body:?}");
-    assert!(!is_tool_error(&body), "expected a successful call, got: {body:?}");
+    assert!(
+        !is_tool_error(&body),
+        "expected a successful call, got: {body:?}"
+    );
     let value = tool_result_value(&body);
     assert!(value["sessions"].as_array().is_some(), "got: {body:?}");
 
@@ -263,15 +283,21 @@ async fn stdio_and_http_calls_both_reach_the_same_running_daemon() {
     )
     .await
     .expect("stdio navigate should succeed");
-    let stdio_session_id = stdio_result["sessionId"].as_str().expect("sessionId present").to_string();
+    let stdio_session_id = stdio_result["sessionId"]
+        .as_str()
+        .expect("sessionId present")
+        .to_string();
 
     // The same daemon's session list is now visible over the HTTP path.
-    let (status, body) = http_call_tool(port, &token, "stapler_browser_list_sessions", json!({})).await;
+    let (status, body) =
+        http_call_tool(port, &token, "stapler_browser_list_sessions", json!({})).await;
     assert_eq!(status, reqwest::StatusCode::OK, "got: {body:?}");
     let value = tool_result_value(&body);
     let sessions = value["sessions"].as_array().expect("sessions array");
     assert!(
-        sessions.iter().any(|s| s["sessionId"].as_str() == Some(stdio_session_id.as_str())),
+        sessions
+            .iter()
+            .any(|s| s["sessionId"].as_str() == Some(stdio_session_id.as_str())),
         "expected the stdio-opened session to be visible over HTTP, got: {value:?}"
     );
 
@@ -285,7 +311,10 @@ async fn stdio_and_http_calls_both_reach_the_same_running_daemon() {
     .await;
     assert_eq!(nav_status, reqwest::StatusCode::OK, "got: {nav_body:?}");
     let nav_value = tool_result_value(&nav_body);
-    let http_session_id = nav_value["sessionId"].as_str().expect("sessionId present").to_string();
+    let http_session_id = nav_value["sessionId"]
+        .as_str()
+        .expect("sessionId present")
+        .to_string();
 
     let list_result = client::call(
         &socket,
@@ -298,7 +327,9 @@ async fn stdio_and_http_calls_both_reach_the_same_running_daemon() {
     .expect("stdio list_sessions should succeed");
     let stdio_sessions = list_result["sessions"].as_array().expect("sessions array");
     assert!(
-        stdio_sessions.iter().any(|s| s["sessionId"].as_str() == Some(http_session_id.as_str())),
+        stdio_sessions
+            .iter()
+            .any(|s| s["sessionId"].as_str() == Some(http_session_id.as_str())),
         "expected the HTTP-opened session to be visible over stdio, got: {list_result:?}"
     );
 
@@ -331,9 +362,18 @@ async fn two_concurrent_http_navigate_calls_both_succeed_with_distinct_session_i
     let (status_b, body_b) = result_b;
     assert_eq!(status_a, reqwest::StatusCode::OK, "got: {body_a:?}");
     assert_eq!(status_b, reqwest::StatusCode::OK, "got: {body_b:?}");
-    let session_a = tool_result_value(&body_a)["sessionId"].as_str().expect("sessionId present").to_string();
-    let session_b = tool_result_value(&body_b)["sessionId"].as_str().expect("sessionId present").to_string();
-    assert_ne!(session_a, session_b, "each concurrent call should get its own session");
+    let session_a = tool_result_value(&body_a)["sessionId"]
+        .as_str()
+        .expect("sessionId present")
+        .to_string();
+    let session_b = tool_result_value(&body_b)["sessionId"]
+        .as_str()
+        .expect("sessionId present")
+        .to_string();
+    assert_ne!(
+        session_a, session_b,
+        "each concurrent call should get its own session"
+    );
 
     let socket = NativeSocketFactory;
     shutdown_daemon(&socket, &paths::socket_path(&env)).await;
@@ -353,7 +393,10 @@ async fn session_id_from_one_http_request_is_reusable_by_a_second_independent_ht
     .await;
     assert_eq!(nav_status, reqwest::StatusCode::OK, "got: {nav_body:?}");
     let nav_value = tool_result_value(&nav_body);
-    let session_id = nav_value["sessionId"].as_str().expect("sessionId present").to_string();
+    let session_id = nav_value["sessionId"]
+        .as_str()
+        .expect("sessionId present")
+        .to_string();
 
     // A second, independent HTTP request (no shared connection state, since
     // `stateful_mode: false`) reuses that same sessionId successfully.
@@ -364,7 +407,11 @@ async fn session_id_from_one_http_request_is_reusable_by_a_second_independent_ht
         json!({ "sessionId": session_id }),
     )
     .await;
-    assert_eq!(snapshot_status, reqwest::StatusCode::OK, "got: {snapshot_body:?}");
+    assert_eq!(
+        snapshot_status,
+        reqwest::StatusCode::OK,
+        "got: {snapshot_body:?}"
+    );
     assert!(!is_tool_error(&snapshot_body), "got: {snapshot_body:?}");
 
     let socket = NativeSocketFactory;
@@ -407,14 +454,23 @@ async fn spawn_in_process_harness(daemon: Daemon) -> InProcessHarness {
 
     let consumer_daemon = daemon.clone();
     let consumer_cancel = cancel.clone();
-    tokio::task::spawn_local(transport::run_bridge_consumer(consumer_daemon, bridge_rx, consumer_cancel));
+    tokio::task::spawn_local(transport::run_bridge_consumer(
+        consumer_daemon,
+        bridge_rx,
+        consumer_cancel,
+    ));
 
     let port = free_tcp_port();
     let token = stapler_mcp_core::http_auth::BearerToken::new("test-harness-token".to_string());
     let server_bridge_tx = bridge_tx.clone();
     let server_token = token.clone();
     let server_cancel = cancel.clone();
-    tokio::task::spawn(http_server::run_http_server(server_bridge_tx, port, server_token, server_cancel));
+    tokio::task::spawn(http_server::run_http_server(
+        server_bridge_tx,
+        port,
+        server_token,
+        server_cancel,
+    ));
 
     // Give the listener a moment to actually bind before the first request.
     wait_for_port_open(port, Duration::from_secs(5)).await;
@@ -431,7 +487,10 @@ async fn spawn_in_process_harness(daemon: Daemon) -> InProcessHarness {
 async fn wait_for_port_open(port: u16, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -470,7 +529,10 @@ fn daemon_with_test_handlers() -> Daemon {
 
 #[test]
 fn hung_tool_call_does_not_block_unrelated_concurrent_http_callers() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("build runtime");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         let harness = spawn_in_process_harness(daemon_with_test_handlers()).await;
@@ -493,8 +555,14 @@ fn hung_tool_call_does_not_block_unrelated_concurrent_http_callers() {
             tokio::time::timeout(fast_bound, harness.call("ping", json!({}))),
             tokio::time::timeout(fast_bound, harness.call("ping", json!({}))),
         );
-        assert_eq!(ping_a.expect("ping A should not be starved by the hung call"), Ok(json!({"pong": true})));
-        assert_eq!(ping_b.expect("ping B should not be starved by the hung call"), Ok(json!({"pong": true})));
+        assert_eq!(
+            ping_a.expect("ping A should not be starved by the hung call"),
+            Ok(json!({"pong": true}))
+        );
+        assert_eq!(
+            ping_b.expect("ping B should not be starved by the hung call"),
+            Ok(json!({"pong": true}))
+        );
 
         // The hung call itself eventually resolves to the core-level request
         // timeout rather than hanging this test forever.
@@ -513,15 +581,20 @@ fn hung_tool_call_does_not_block_unrelated_concurrent_http_callers() {
 
 #[test]
 fn panicking_tool_handler_produces_clean_error_and_transport_keeps_serving() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("build runtime");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         let harness = spawn_in_process_harness(daemon_with_test_handlers()).await;
 
-        let boom_result = tokio::time::timeout(Duration::from_secs(5), harness.call("boom", json!({})))
-            .await
-            .expect("panicking call should not hang");
-        let err = boom_result.expect_err("a panicking handler must produce a clean error, not a hang");
+        let boom_result =
+            tokio::time::timeout(Duration::from_secs(5), harness.call("boom", json!({})))
+                .await
+                .expect("panicking call should not hang");
+        let err =
+            boom_result.expect_err("a panicking handler must produce a clean error, not a hang");
         assert!(
             err.contains("panicked"),
             "expected the bridge consumer's panic-translation message, got: {err}"
@@ -529,9 +602,10 @@ fn panicking_tool_handler_produces_clean_error_and_transport_keeps_serving() {
 
         // The bridge consumer (and the mpsc::Receiver it owns) must still be
         // alive: a second, unrelated call still succeeds.
-        let ping_result = tokio::time::timeout(Duration::from_secs(5), harness.call("ping", json!({})))
-            .await
-            .expect("ping after a panic should not hang");
+        let ping_result =
+            tokio::time::timeout(Duration::from_secs(5), harness.call("ping", json!({})))
+                .await
+                .expect("ping after a panic should not hang");
         assert_eq!(ping_result, Ok(json!({"pong": true})));
 
         harness.shutdown();
@@ -542,7 +616,10 @@ fn panicking_tool_handler_produces_clean_error_and_transport_keeps_serving() {
 
 #[test]
 fn burst_beyond_bridge_channel_capacity_resolves_every_request() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("build runtime");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         let harness = spawn_in_process_harness(daemon_with_test_handlers()).await;
@@ -557,7 +634,11 @@ fn burst_beyond_bridge_channel_capacity_resolves_every_request() {
                 cancel: harness.cancel.clone(),
             };
             async move {
-                tokio::time::timeout(Duration::from_secs(35), harness_call.call("ping", json!({}))).await
+                tokio::time::timeout(
+                    Duration::from_secs(35),
+                    harness_call.call("ping", json!({})),
+                )
+                .await
             }
         });
 
@@ -565,7 +646,8 @@ fn burst_beyond_bridge_channel_capacity_resolves_every_request() {
         for (i, result) in results.into_iter().enumerate() {
             let call_result = result.unwrap_or_else(|_| panic!("call #{i} hung past its bound"));
             assert!(
-                call_result == Ok(json!({"pong": true})) || call_result.is_err_and(|e| e.contains("timed out")),
+                call_result == Ok(json!({"pong": true}))
+                    || call_result.is_err_and(|e| e.contains("timed out")),
                 "call #{i}: expected a normal reply or a clean timeout"
             );
         }
@@ -637,9 +719,18 @@ async fn sigterm_mid_request_lets_the_in_flight_request_resolve_and_the_daemon_e
         "DEBUG process_exited_or_zombie after wait: {}",
         process_exited_or_zombie(pid)
     );
-    assert!(exited.is_ok(), "daemon process (pid {pid}) did not exit within the grace period");
+    assert!(
+        exited.is_ok(),
+        "daemon process (pid {pid}) did not exit within the grace period"
+    );
 
     let log = std::fs::read_to_string(paths::log_path(&env)).unwrap_or_default();
-    let sigterm_lines = log.lines().filter(|l| l.contains("received SIGTERM")).count();
-    assert_eq!(sigterm_lines, 1, "expected exactly one SIGTERM shutdown sequence, got log:\n{log}");
+    let sigterm_lines = log
+        .lines()
+        .filter(|l| l.contains("received SIGTERM"))
+        .count();
+    assert_eq!(
+        sigterm_lines, 1,
+        "expected exactly one SIGTERM shutdown sequence, got log:\n{log}"
+    );
 }

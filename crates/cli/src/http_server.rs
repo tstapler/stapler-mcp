@@ -105,7 +105,11 @@ fn build_router(bridge_tx: mpsc::Sender<BridgeMessage>, token: BearerToken) -> a
 /// which `ConnectInfo` does not.)
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-async fn log_http_connection(ConnectInfo(addr): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
+async fn log_http_connection(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
     let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let peer = addr.to_string();
 
@@ -137,7 +141,9 @@ async fn require_bearer_token(
     next: Next,
 ) -> Response {
     let Some(header_value) = headers.get(axum::http::header::AUTHORIZATION) else {
-        eprintln!("stapler-mcp: rejected unauthenticated HTTP request — missing Authorization header");
+        eprintln!(
+            "stapler-mcp: rejected unauthenticated HTTP request — missing Authorization header"
+        );
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "missing Authorization header" })),
@@ -167,7 +173,11 @@ async fn require_bearer_token(
 fn build_mcp_service(
     bridge_tx: mpsc::Sender<BridgeMessage>,
 ) -> StreamableHttpService<McpRouter<ChannelTransport>, LocalSessionManager> {
-    let service_factory = move || Ok(McpRouter::with_transport(ChannelTransport::new(bridge_tx.clone())));
+    let service_factory = move || {
+        Ok(McpRouter::with_transport(ChannelTransport::new(
+            bridge_tx.clone(),
+        )))
+    };
 
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`, so it can't be
     // built with struct-update syntax outside rmcp's own crate — start from
@@ -176,7 +186,11 @@ fn build_mcp_service(
     config.stateful_mode = false;
     config.json_response = true;
 
-    StreamableHttpService::new(service_factory, Arc::new(LocalSessionManager::default()), config)
+    StreamableHttpService::new(
+        service_factory,
+        Arc::new(LocalSessionManager::default()),
+        config,
+    )
 }
 
 #[cfg(test)]
@@ -187,7 +201,8 @@ mod tests {
     use super::*;
 
     fn test_bridge() -> mpsc::Sender<BridgeMessage> {
-        let (bridge_tx, _bridge_rx) = mpsc::channel::<BridgeMessage>(crate::transport::BRIDGE_CHANNEL_CAPACITY);
+        let (bridge_tx, _bridge_rx) =
+            mpsc::channel::<BridgeMessage>(crate::transport::BRIDGE_CHANNEL_CAPACITY);
         bridge_tx
     }
 
@@ -288,9 +303,17 @@ mod tests {
         };
 
         let id_before = NEXT_REQUEST_ID.load(Ordering::Relaxed);
-        let response = router.clone().oneshot(make_request()).await.expect("call router");
+        let response = router
+            .clone()
+            .oneshot(make_request())
+            .await
+            .expect("call router");
         let id_after_first = NEXT_REQUEST_ID.load(Ordering::Relaxed);
-        let _response2 = router.clone().oneshot(make_request()).await.expect("call router");
+        let _response2 = router
+            .clone()
+            .oneshot(make_request())
+            .await
+            .expect("call router");
         let id_after_second = NEXT_REQUEST_ID.load(Ordering::Relaxed);
 
         // The middleware consumed exactly one id per request, and never

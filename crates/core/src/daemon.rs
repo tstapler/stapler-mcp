@@ -105,9 +105,9 @@ impl Daemon {
                     Some(fut) => match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
                         Ok(Ok(v)) => Response::ok(v),
                         Ok(Err(e)) => Response::err(e),
-                        Err(_elapsed) => {
-                            Response::err(format!("tool call {other:?} timed out after {REQUEST_TIMEOUT:?}"))
-                        }
+                        Err(_elapsed) => Response::err(format!(
+                            "tool call {other:?} timed out after {REQUEST_TIMEOUT:?}"
+                        )),
                     },
                     // wasm32 has no `tokio` dependency to bound the call with a
                     // timeout — a single JS-driven call per handler, not an
@@ -343,8 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_cancellable_should_return_ok_promptly_when_cancelled_with_no_pending_connection()
-    {
+    async fn run_cancellable_should_return_ok_promptly_when_cancelled_with_no_pending_connection() {
         let daemon = Daemon::new();
         let socket = PendingSocketFactory;
 
@@ -357,7 +356,10 @@ mod tests {
         };
 
         let (run_result, ()) = tokio::time::timeout(Duration::from_millis(200), async {
-            tokio::join!(daemon.run_cancellable(&socket, "irrelevant"), cancel_once_polling_starts)
+            tokio::join!(
+                daemon.run_cancellable(&socket, "irrelevant"),
+                cancel_once_polling_starts
+            )
         })
         .await
         .expect("run_cancellable should return promptly once cancelled");
@@ -370,7 +372,9 @@ mod tests {
         let daemon = Daemon::new();
         daemon.register(
             "hang",
-            Box::new(|_params| Box::pin(std::future::pending()) as LocalBoxFuture<'static, HandlerResult>),
+            Box::new(|_params| {
+                Box::pin(std::future::pending()) as LocalBoxFuture<'static, HandlerResult>
+            }),
         );
 
         let resp = tokio::time::timeout(
@@ -383,7 +387,9 @@ mod tests {
         .await
         .expect("handle_request should itself return once its internal timeout fires");
 
-        let err = resp.error.expect("a hung handler should produce an error response");
+        let err = resp
+            .error
+            .expect("a hung handler should produce an error response");
         assert!(err.contains("timed out"), "unexpected error message: {err}");
     }
 
@@ -392,7 +398,9 @@ mod tests {
         let daemon = Daemon::new();
         daemon.register(
             "hang",
-            Box::new(|_params| Box::pin(std::future::pending()) as LocalBoxFuture<'static, HandlerResult>),
+            Box::new(|_params| {
+                Box::pin(std::future::pending()) as LocalBoxFuture<'static, HandlerResult>
+            }),
         );
 
         let timed_out = daemon

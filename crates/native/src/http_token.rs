@@ -72,7 +72,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&path).expect("stat token file").permissions().mode();
+            let mode = fs::metadata(&path)
+                .expect("stat token file")
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
     }

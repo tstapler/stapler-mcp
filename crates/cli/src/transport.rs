@@ -11,7 +11,9 @@ use futures::FutureExt;
 use stapler_mcp_core::client::{self, EnsureOptions};
 use stapler_mcp_core::daemon::Daemon;
 use stapler_mcp_core::paths;
-use stapler_mcp_native::{NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner};
+use stapler_mcp_native::{
+    NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
+};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -27,7 +29,11 @@ pub trait DaemonTransport {
 pub struct SocketTransport;
 
 impl DaemonTransport for SocketTransport {
-    async fn call(&self, tool: &'static str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn call(
+        &self,
+        tool: &'static str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let env = NativeEnv;
         let socket = NativeSocketFactory;
         let spawner = NativeSpawner;
@@ -209,12 +215,13 @@ mod tests {
     use stapler_mcp_core::daemon::Daemon;
 
     #[tokio::test]
-    async fn channel_transport_call_should_complete_independently_when_two_clones_call_concurrently()
-    {
+    async fn channel_transport_call_should_complete_independently_when_two_clones_call_concurrently(
+    ) {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let daemon = Daemon::new();
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<BridgeMessage>(BRIDGE_CHANNEL_CAPACITY);
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<BridgeMessage>(BRIDGE_CHANNEL_CAPACITY);
 
                 tokio::task::spawn_local(async move {
                     while let Some((req, reply_tx)) = rx.recv().await {
@@ -260,7 +267,8 @@ mod tests {
             .expect("fill the channel's single slot");
 
         let transport = ChannelTransport::new(tx);
-        let call_task = tokio::spawn(async move { transport.call("ping", serde_json::json!({})).await });
+        let call_task =
+            tokio::spawn(async move { transport.call("ping", serde_json::json!({})).await });
 
         // Let `call`'s `send` future register as pending against the full
         // channel before advancing the virtual clock past the warning
@@ -274,7 +282,10 @@ mod tests {
         let (blocker_req, _blocker_tx) = rx.recv().await.expect("recv blocker message");
         assert_eq!(blocker_req.tool, "blocker");
 
-        let (real_req, real_reply_tx) = rx.recv().await.expect("recv real message after backpressure");
+        let (real_req, real_reply_tx) = rx
+            .recv()
+            .await
+            .expect("recv real message after backpressure");
         assert_eq!(real_req.tool, "ping");
         real_reply_tx
             .send(stapler_mcp_core::protocol::Response {

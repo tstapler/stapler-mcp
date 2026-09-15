@@ -36,10 +36,10 @@ use stapler_mcp_core::schema::{
     SearchDocsInput,
 };
 
-#[path = "../src/transport.rs"]
-mod transport;
 #[path = "../src/mcp_router.rs"]
 mod mcp_router;
+#[path = "../src/transport.rs"]
+mod transport;
 
 #[tokio::test]
 async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_input_schema_when_tools_list_called(

@@ -160,7 +160,11 @@ async fn print_http_status(env: &NativeEnv) {
 
     let addr = format!("127.0.0.1:{port}");
     let reachable = matches!(
-        tokio::time::timeout(STATUS_TCP_PROBE_TIMEOUT, tokio::net::TcpStream::connect(&addr)).await,
+        tokio::time::timeout(
+            STATUS_TCP_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect(&addr)
+        )
+        .await,
         Ok(Ok(_))
     );
     if reachable {
@@ -267,7 +271,9 @@ async fn run_daemon() {
         None => {
             if let Err(e) = std::fs::remove_file(&http_port_path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("stapler-mcp: failed to remove stale HTTP port file {http_port_path}: {e}");
+                    eprintln!(
+                        "stapler-mcp: failed to remove stale HTTP port file {http_port_path}: {e}"
+                    );
                 }
             }
         }
@@ -775,13 +781,14 @@ async fn run_daemon() {
     // joined into the `tokio::join!` below.
     let sigterm_daemon = daemon.clone();
     tokio::task::spawn_local(async move {
-        let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("stapler-mcp: failed to install SIGTERM handler: {e}");
-                return;
-            }
-        };
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("stapler-mcp: failed to install SIGTERM handler: {e}");
+                    return;
+                }
+            };
         sigterm.recv().await;
         eprintln!("stapler-mcp: received SIGTERM, shutting down");
         sigterm_daemon.request_shutdown();
@@ -812,9 +819,13 @@ async fn run_daemon() {
     // residual risk (see the timeout branches inside the helper).
     let (run_result, _bridge_result, _http_result) = tokio::join!(
         async {
-            await_with_shutdown_grace(daemon.run_cancellable(&socket, &sock_path), &cancel_token, "accept loop")
-                .await
-                .unwrap_or(Ok(()))
+            await_with_shutdown_grace(
+                daemon.run_cancellable(&socket, &sock_path),
+                &cancel_token,
+                "accept loop",
+            )
+            .await
+            .unwrap_or(Ok(()))
         },
         await_with_shutdown_grace(bridge_consumer_handle, &cancel_token, "bridge consumer"),
         async {
