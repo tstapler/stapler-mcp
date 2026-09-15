@@ -1,17 +1,13 @@
-//! The stdio MCP server Claude Code actually launches. Holds no heavyweight
-//! state itself — every tool call proxies to the shared daemon via
-//! `stapler_mcp_core::client`, auto-starting it on first use.
-
-use std::time::Duration;
+//! The MCP tool router Claude Code actually launches (over stdio, and later
+//! Streamable HTTP). Holds no heavyweight state itself — every tool call
+//! proxies to the shared daemon via a `DaemonTransport`, auto-starting the
+//! daemon on first use for the default `SocketTransport`.
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, Json, ServerHandler};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 
-use stapler_mcp_core::client::{self, EnsureOptions};
-use stapler_mcp_core::paths;
+use crate::transport::{DaemonTransport, SocketTransport};
 use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
     BrowserCloseAllSessionsInput, BrowserCloseAllSessionsOutput, BrowserCloseSessionInput,
@@ -27,46 +23,9 @@ use stapler_mcp_core::schema::{
     ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput,
     SearchDocsInput, SearchDocsOutput,
 };
-use stapler_mcp_native::{
-    NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
-};
-
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
-
-async fn call_daemon<In: Serialize, Out: DeserializeOwned>(
-    tool: &str,
-    input: In,
-) -> Result<Out, String> {
-    let env = NativeEnv;
-    let socket = NativeSocketFactory;
-    let spawner = NativeSpawner;
-    let sleeper = NativeSleeper;
-    let clock = NativeClock;
-
-    let sock_path = paths::socket_path(&env);
-    let log_path = paths::log_path(&env);
-
-    client::ensure_daemon(
-        &socket,
-        &spawner,
-        &sleeper,
-        &clock,
-        &sock_path,
-        &log_path,
-        EnsureOptions::default(),
-    )
-    .await
-    .map_err(|e| format!("ensure daemon: {e}"))?;
-
-    let params = serde_json::to_value(input).map_err(|e| e.to_string())?;
-    let result = client::call(&socket, &sock_path, tool, Some(params), CALL_TIMEOUT)
-        .await
-        .map_err(|e| e.to_string())?;
-    serde_json::from_value(result).map_err(|e| e.to_string())
-}
-
 #[derive(Debug, Clone)]
-pub struct ThinClient {
+pub struct McpRouter<T: DaemonTransport = SocketTransport> {
+    transport: T,
     // `#[tool_handler]` below reads this field from its macro-generated
     // `call_tool` impl, which rustc's dead-code analysis doesn't see through —
     // verified working end-to-end (tools/list and tools/call both dispatch
@@ -75,22 +34,39 @@ pub struct ThinClient {
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
-impl ThinClient {
+impl McpRouter<SocketTransport> {
     pub fn new() -> Self {
         Self {
+            transport: SocketTransport,
             tool_router: Self::tool_router(),
         }
     }
 }
 
-impl Default for ThinClient {
+impl Default for McpRouter<SocketTransport> {
     fn default() -> Self {
         Self::new()
     }
 }
 
+impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
+    /// Constructs a router over a non-default transport — used by
+    /// `http_server::build_mcp_service` to build a fresh
+    /// `McpRouter<ChannelTransport>` per HTTP session.
+    // `tests/tool_schema.rs` pulls this file in via `#[path]` into a
+    // separate compilation unit that only calls `registered_tools()`, where
+    // dead-code analysis can't see `http_server.rs`'s real call site.
+    #[allow(dead_code)]
+    pub fn with_transport(transport: T) -> Self {
+        Self {
+            transport,
+            tool_router: Self::tool_router(),
+        }
+    }
+}
+
 #[tool_router]
-impl ThinClient {
+impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     #[tool(
         name = "fetch_page",
         description = "Render a URL in a headless browser and return its title and extracted text (optionally saving the rendered HTML to a local file). Backed by the shared stapler-mcp daemon's browser pool."
@@ -99,7 +75,16 @@ impl ThinClient {
         &self,
         params: Parameters<FetchPageInput>,
     ) -> Result<Json<FetchPageOutput>, String> {
-        call_daemon("fetch_page", params.0).await.map(Json)
+        let result = self
+            .transport
+            .call(
+                "fetch_page",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -110,7 +95,16 @@ impl ThinClient {
         &self,
         params: Parameters<BraveSearchInput>,
     ) -> Result<Json<BraveSearchOutput>, String> {
-        call_daemon("brave_web_search", params.0).await.map(Json)
+        let result = self
+            .transport
+            .call(
+                "brave_web_search",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -121,7 +115,16 @@ impl ThinClient {
         &self,
         params: Parameters<ReadWebsiteInput>,
     ) -> Result<Json<ReadWebsiteOutput>, String> {
-        call_daemon("read_website", params.0).await.map(Json)
+        let result = self
+            .transport
+            .call(
+                "read_website",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -132,7 +135,16 @@ impl ThinClient {
         &self,
         params: Parameters<ReadSavedPageInput>,
     ) -> Result<Json<ReadSavedPageOutput>, String> {
-        call_daemon("read_saved_page", params.0).await.map(Json)
+        let result = self
+            .transport
+            .call(
+                "read_saved_page",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -143,7 +155,16 @@ impl ThinClient {
         &self,
         params: Parameters<DownloadWebsiteInput>,
     ) -> Result<Json<DownloadWebsiteOutput>, String> {
-        call_daemon("download_website", params.0).await.map(Json)
+        let result = self
+            .transport
+            .call(
+                "download_website",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -154,8 +175,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserNavigateInput>,
     ) -> Result<Json<BrowserNavigateOutput>, String> {
-        call_daemon("stapler_browser_navigate", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_navigate",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -167,8 +195,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserClickInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_click", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_click",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -180,8 +215,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserTypeInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_type", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_type",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -193,8 +235,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserTypeSecretInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_type_secret", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_type_secret",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -206,8 +255,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserSnapshotInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_snapshot", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_snapshot",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -219,8 +275,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserCloseSessionInput>,
     ) -> Result<Json<BrowserCloseSessionOutput>, String> {
-        call_daemon("stapler_browser_close_session", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_close_session",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -232,8 +295,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserListSessionsInput>,
     ) -> Result<Json<BrowserListSessionsOutput>, String> {
-        call_daemon("stapler_browser_list_sessions", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_list_sessions",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -245,8 +315,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserCloseAllSessionsInput>,
     ) -> Result<Json<BrowserCloseAllSessionsOutput>, String> {
-        call_daemon("stapler_browser_close_all_sessions", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_close_all_sessions",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -258,8 +335,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserTabsInput>,
     ) -> Result<Json<BrowserTabsOutput>, String> {
-        call_daemon("stapler_browser_tabs", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_tabs",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -271,8 +355,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserHoverInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_hover", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_hover",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -284,8 +375,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserSelectOptionInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_select_option", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_select_option",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -297,8 +395,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserPressKeyInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_press_key", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_press_key",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -310,8 +415,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserWaitForInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_wait_for", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_wait_for",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -323,8 +435,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserScreenshotInput>,
     ) -> Result<Json<BrowserScreenshotOutput>, String> {
-        call_daemon("stapler_browser_screenshot", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_screenshot",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -336,8 +455,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserEvaluateInput>,
     ) -> Result<Json<BrowserEvaluateOutput>, String> {
-        call_daemon("stapler_browser_evaluate", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_evaluate",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -349,8 +475,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserGetHtmlInput>,
     ) -> Result<Json<BrowserGetHtmlOutput>, String> {
-        call_daemon("stapler_browser_get_html", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_get_html",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -362,8 +495,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserFillFormInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_fill_form", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_fill_form",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -375,8 +515,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserSetCheckedInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_set_checked", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_set_checked",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -388,8 +535,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserHistoryInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_history", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_history",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -401,8 +555,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserResizeInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
-        call_daemon("stapler_browser_resize", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_resize",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -414,8 +575,15 @@ impl ThinClient {
         &self,
         params: Parameters<BrowserFindInput>,
     ) -> Result<Json<BrowserFindOutput>, String> {
-        call_daemon("stapler_browser_find", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_browser_find",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -427,7 +595,16 @@ impl ThinClient {
         &self,
         params: Parameters<IndexDocsInput>,
     ) -> Result<Json<IndexDocsOutput>, String> {
-        call_daemon("stapler_index_docs", params.0).await.map(Json)
+        let result = self
+            .transport
+            .call(
+                "stapler_index_docs",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -438,7 +615,16 @@ impl ThinClient {
         &self,
         params: Parameters<SearchDocsInput>,
     ) -> Result<Json<SearchDocsOutput>, String> {
-        call_daemon("stapler_search_docs", params.0).await.map(Json)
+        let result = self
+            .transport
+            .call(
+                "stapler_search_docs",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
     }
 
     #[tool(
@@ -449,8 +635,15 @@ impl ThinClient {
         &self,
         params: Parameters<ListIndexedSourcesInput>,
     ) -> Result<Json<ListIndexedSourcesOutput>, String> {
-        call_daemon("stapler_list_indexed_sources", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_list_indexed_sources",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 
@@ -462,13 +655,20 @@ impl ThinClient {
         &self,
         params: Parameters<RemoveIndexedSourceInput>,
     ) -> Result<Json<RemoveIndexedSourceOutput>, String> {
-        call_daemon("stapler_remove_indexed_source", params.0)
-            .await
+        let result = self
+            .transport
+            .call(
+                "stapler_remove_indexed_source",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
             .map(Json)
     }
 }
 
-impl ThinClient {
+impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     /// Test-only accessor exposing this router's registered tool metadata
     /// (name, description, `inputSchema`) — the same data `tools/list`
     /// serves — without needing a live stdio MCP client. Used by
@@ -488,7 +688,7 @@ impl ThinClient {
 }
 
 #[tool_handler]
-impl ServerHandler for ThinClient {
+impl<T: DaemonTransport + Send + Sync + 'static> ServerHandler for McpRouter<T> {
     fn get_info(&self) -> ServerInfo {
         // `Implementation::from_build_env()` (the `ServerInfo::new` default)
         // expands `env!("CARGO_CRATE_NAME")` inside rmcp's own source, so it

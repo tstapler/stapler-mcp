@@ -1,6 +1,9 @@
-mod thin_client;
+mod http_server;
+mod mcp_router;
+mod transport;
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use rmcp::{transport::stdio, ServiceExt};
 
@@ -55,7 +58,14 @@ fn type_secret_handler(browser: Rc<NativeBrowser>) -> Handler {
 }
 
 fn main() {
-    let is_daemon = std::env::args().any(|a| a == "--daemon");
+    let args: Vec<String> = std::env::args().collect();
+    // `--status`/`--print-config` are checked before `--daemon` deliberately:
+    // both are read-only diagnostics meant to run from an ordinary shell
+    // against an already-running (often systemd/launchd-started) daemon, so
+    // neither may spawn one as a side effect.
+    let is_status = args.iter().any(|a| a == "--status");
+    let is_print_config = args.iter().any(|a| a == "--print-config");
+    let is_daemon = args.iter().any(|a| a == "--daemon");
 
     // Deliberately single-threaded: this daemon's work is I/O-bound, not
     // CPU-bound, and a `current_thread` runtime + `LocalSet` lets the exact
@@ -67,15 +77,158 @@ fn main() {
         .expect("build current-thread runtime");
     let local = tokio::task::LocalSet::new();
 
-    if is_daemon {
+    if is_status {
+        let code = local.block_on(&rt, run_status());
+        std::process::exit(code);
+    } else if is_print_config {
+        let code = local.block_on(&rt, run_print_config());
+        std::process::exit(code);
+    } else if is_daemon {
         local.block_on(&rt, run_daemon());
+        // `run_daemon`'s own `tokio::join!` already bounds the accept loop,
+        // bridge consumer, and HTTP server tasks individually via
+        // `await_with_shutdown_grace` — but giving up on a `JoinHandle`
+        // doesn't abort the underlying `tokio::spawn`ed task (e.g. the HTTP
+        // server can still be draining a lingering keep-alive connection).
+        // Dropping `rt` normally (the `else` branches below fall off the end
+        // of `main` and do exactly that) blocks *indefinitely* on any such
+        // straggler, since `Runtime`'s destructor waits for every spawned
+        // task with no timeout. `shutdown_timeout` bounds that final wait and
+        // force-cancels stragglers past it, so SIGTERM/`SHUTDOWN_TOOL` always
+        // produce a bounded process exit.
+        rt.shutdown_timeout(SHUTDOWN_GRACE_TIMEOUT);
     } else {
         local.block_on(&rt, run_thin_client());
     }
 }
 
+/// Short timeout for `--status`'s liveness ping — this must never trigger
+/// `ensure_daemon`'s auto-spawn behavior, so it calls `client::ping` directly
+/// rather than going through the thin client's usual `ensure_daemon` path.
+const STATUS_PING_TIMEOUT: Duration = Duration::from_secs(2);
+const STATUS_TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `stapler-mcp --status`: reports whether the shared daemon is reachable
+/// and, separately, whether its optional HTTP transport is configured and
+/// listening. Read-only — never spawns a daemon. Returns the process exit
+/// code (0 if the daemon itself is running, regardless of HTTP state).
+async fn run_status() -> i32 {
+    let env = NativeEnv;
+    let socket = NativeSocketFactory;
+    let sock_path = paths::socket_path(&env);
+
+    let ping_result =
+        stapler_mcp_core::client::ping(&socket, &sock_path, STATUS_PING_TIMEOUT).await;
+    if ping_result.is_err() {
+        println!("daemon: not running");
+        println!("try: systemctl --user start stapler-mcp   (or: stapler-mcp --daemon)");
+        return 1;
+    }
+
+    print_daemon_pid(&env);
+    print_http_status(&env).await;
+    0
+}
+
+/// Prints the `daemon: running (pid ...)` line, reading the PID directly out
+/// of the lock file (`write_pid`'s only externally-visible form — flock is
+/// advisory, so reading it without acquiring the lock is safe).
+fn print_daemon_pid(env: &NativeEnv) {
+    let lock_path = paths::lock_path(env);
+    match std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(pid) => println!("daemon: running (pid {pid})"),
+        None => println!("daemon: running (pid unknown)"),
+    }
+}
+
+/// Prints the `http: ...` status line, sourced from the persisted
+/// `http-port` file rather than this process's own environment — the
+/// systemd/launchd-started daemon case never has `STAPLER_MCP_HTTP_PORT` set
+/// in the shell that later runs `--status`.
+async fn print_http_status(env: &NativeEnv) {
+    let http_port_path = paths::http_port_path(env);
+    let Some(port) = std::fs::read_to_string(&http_port_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+    else {
+        println!("http: not configured (STAPLER_MCP_HTTP_PORT not set on last daemon start)");
+        return;
+    };
+
+    let addr = format!("127.0.0.1:{port}");
+    let reachable = matches!(
+        tokio::time::timeout(
+            STATUS_TCP_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect(&addr)
+        )
+        .await,
+        Ok(Ok(_))
+    );
+    if reachable {
+        println!("http: listening on 127.0.0.1:{port}");
+    } else {
+        println!("http: not listening on 127.0.0.1:{port} (configured but unreachable)");
+    }
+}
+
+/// `stapler-mcp --print-config`: prints an MCP client config block for the
+/// HTTP transport, sourced entirely from files the daemon itself already
+/// persisted (`http-token`/`http-port`) — never generates a token or port
+/// itself. Purely deterministic reads, so running this twice in a row
+/// against unchanged state produces byte-identical output.
+async fn run_print_config() -> i32 {
+    let env = NativeEnv;
+    let token = read_nonempty_file(&paths::http_token_path(&env));
+    let port = read_nonempty_file(&paths::http_port_path(&env));
+
+    match (token, port) {
+        (Some(token), Some(port)) => {
+            println!("{}", print_config_json(&token, &port));
+            0
+        }
+        (None, _) => {
+            println!(
+                "stapler-mcp: the daemon hasn't started with HTTP enabled yet. Start it with: STAPLER_MCP_HTTP_PORT=<port> stapler-mcp --daemon"
+            );
+            1
+        }
+        (Some(_), None) => {
+            println!(
+                "stapler-mcp: HTTP isn't currently enabled on the running daemon (its last startup had STAPLER_MCP_HTTP_PORT unset). Restart it with STAPLER_MCP_HTTP_PORT=<port> set to enable HTTP."
+            );
+            1
+        }
+    }
+}
+
+fn read_nonempty_file(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn print_config_json(token: &str, port: &str) -> String {
+    let config = serde_json::json!({
+        "type": "http",
+        "url": format!("http://127.0.0.1:{port}/mcp"),
+        "headers": {
+            "Authorization": format!("Bearer {token}")
+        }
+    });
+    serde_json::to_string(&config).expect("serialize print-config JSON")
+}
+
+/// Grace period each of the accept loop / bridge consumer / HTTP server gets
+/// to notice cancellation and finish its own in-flight work before shutdown
+/// cleanup proceeds regardless. See `run_daemon`'s `tokio::join!` below.
+const SHUTDOWN_GRACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn run_thin_client() {
-    let client = thin_client::ThinClient::new();
+    let client = mcp_router::McpRouter::new();
     let service = match client.serve(stdio()).await {
         Ok(s) => s,
         Err(e) => {
@@ -100,6 +253,32 @@ async fn run_daemon() {
         std::process::exit(1);
     }
 
+    // `STAPLER_MCP_HTTP_PORT` records configuration *intent*, not liveness —
+    // written unconditionally here regardless of whether the bind below
+    // later succeeds, so a `--status`/`--print-config` command can report
+    // what this invocation was asked to do. Stale from a prior HTTP-enabled
+    // run, it's removed so a later non-HTTP invocation doesn't leak it.
+    let http_port: Option<u16> = std::env::var("STAPLER_MCP_HTTP_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok());
+    let http_port_path = paths::http_port_path(&env);
+    match http_port {
+        Some(port) => {
+            if let Err(e) = std::fs::write(&http_port_path, port.to_string()) {
+                eprintln!("stapler-mcp: failed to write HTTP port file {http_port_path}: {e}");
+            }
+        }
+        None => {
+            if let Err(e) = std::fs::remove_file(&http_port_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "stapler-mcp: failed to remove stale HTTP port file {http_port_path}: {e}"
+                    );
+                }
+            }
+        }
+    }
+
     let lock = NativeLock;
     let mut guard = match lock.acquire_exclusive(&lock_path).await {
         Ok(g) => g,
@@ -117,7 +296,7 @@ async fn run_daemon() {
 
     let http = Rc::new(NativeHttp::new());
     let fs = Rc::new(NativeFs);
-    let mut browser = match NativeBrowser::launch().await {
+    let browser = match NativeBrowser::launch().await {
         Ok(b) => Rc::new(b),
         Err(e) => {
             eprintln!("stapler-mcp: failed to launch browser: {e}");
@@ -141,7 +320,10 @@ async fn run_daemon() {
     let source_locks = Rc::new(docs::SourceLocks::new());
     let docs_index_dir = paths::docs_index_dir(&env);
 
-    let daemon = Daemon::new();
+    // `Rc`-wrapped from construction: registration below only needs `&self`
+    // (works fine through `Deref`), and the bridge consumer spawned after
+    // registration needs its own clone of the same daemon.
+    let daemon = Rc::new(Daemon::new());
 
     daemon.register(
         "fetch_page",
@@ -544,14 +726,157 @@ async fn run_daemon() {
         }),
     );
 
-    let socket = NativeSocketFactory;
-    let run_result = daemon.run(&socket, &sock_path).await;
+    // Bridges the daemon's `!Send` core to a `Send`-bounded in-process
+    // channel, so the HTTP server below can reach it without ever touching
+    // `Rc<RefCell<...>>` state directly.
+    let (bridge_tx, bridge_rx) =
+        tokio::sync::mpsc::channel::<transport::BridgeMessage>(transport::BRIDGE_CHANNEL_CAPACITY);
 
-    // Drop the daemon (and the `Rc<NativeBrowser>` clones its handler
-    // closures held) so `browser` becomes the sole remaining reference,
-    // making `Rc::get_mut` succeed — then explicitly close it. Without this,
-    // the Chrome subprocess and its CDP connection keep the process alive
-    // forever after a clean `shutdown`, whatever `daemon.run` returned.
+    // `tokio::task::spawn`, not `spawn_local`: the HTTP server side must stay
+    // `Send`-capable (the whole point of the bridge-channel architecture) —
+    // it only ever touches the `Send` `bridge_tx` and axum/tokio types, never
+    // the `!Send` `Rc<Daemon>` directly. `spawn` works fine from this
+    // `current_thread` runtime too. The `JoinHandle` is joined into the
+    // shutdown `tokio::join!` below.
+    let http_server_handle = match http_port {
+        Some(port) => {
+            let http_token_path = paths::http_token_path(&env);
+            match stapler_mcp_native::http_token::generate_or_load(&http_token_path).await {
+                Ok((token, freshly_generated)) => {
+                    if freshly_generated {
+                        eprintln!(
+                            "stapler-mcp: generated new HTTP bearer token at {http_token_path} (0600)"
+                        );
+                    }
+                    eprintln!("stapler-mcp: HTTP transport listening on 127.0.0.1:{port}/mcp");
+                    Some(tokio::task::spawn(http_server::run_http_server(
+                        bridge_tx.clone(),
+                        port,
+                        token,
+                        daemon.cancellation_token(),
+                    )))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "stapler-mcp: failed to generate/load HTTP bearer token at {http_token_path}: {e} — continuing with stdio/socket transport only"
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            eprintln!("stapler-mcp: HTTP transport disabled (STAPLER_MCP_HTTP_PORT not set)");
+            None
+        }
+    };
+
+    // Runs on the `LocalSet` (not `tokio::spawn`) because it needs an
+    // `Rc<Daemon>` clone alive across an `.await`. It does no cleanup itself
+    // — just flips the shutdown flag/cancels the token — and completes in
+    // the very same poll that fires cancellation (no `.await` after
+    // `request_shutdown()`), so on this single-threaded cooperative runtime
+    // it's guaranteed to finish before any of the three loops joined below
+    // (each of which needs at least one more wakeup to notice cancellation)
+    // resolve their own handles. That's why its own handle isn't explicitly
+    // joined into the `tokio::join!` below.
+    let sigterm_daemon = daemon.clone();
+    tokio::task::spawn_local(async move {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("stapler-mcp: failed to install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+        sigterm.recv().await;
+        eprintln!("stapler-mcp: received SIGTERM, shutting down");
+        sigterm_daemon.request_shutdown();
+    });
+
+    let bridge_daemon = daemon.clone();
+    let bridge_cancel = bridge_daemon.cancellation_token();
+    let bridge_consumer_handle = tokio::task::spawn_local(transport::run_bridge_consumer(
+        bridge_daemon,
+        bridge_rx,
+        bridge_cancel,
+    ));
+
+    let socket = NativeSocketFactory;
+    let cancel_token = daemon.cancellation_token();
+
+    // One joined shutdown sequence for both shutdown triggers (SIGTERM and
+    // the `SHUTDOWN_TOOL` RPC): both ultimately call `daemon.request_shutdown()`,
+    // which cancels `cancel_token` and unblocks all three of these
+    // concurrently. Each is raced against `await_with_shutdown_grace`, which
+    // only starts its `SHUTDOWN_GRACE_TIMEOUT` countdown once `cancel_token`
+    // actually fires — these three futures otherwise run for the daemon's
+    // entire normal (potentially hours-long) operating lifetime, so a flat
+    // `tokio::time::timeout` around each one would wrongly cut that lifetime
+    // short instead of bounding only the post-shutdown wind-down. On a
+    // timeout the underlying task is left running (not aborted) rather than
+    // risking a partial-state abort mid-request — an accepted, documented
+    // residual risk (see the timeout branches inside the helper).
+    let (run_result, _bridge_result, _http_result) = tokio::join!(
+        async {
+            await_with_shutdown_grace(
+                daemon.run_cancellable(&socket, &sock_path),
+                &cancel_token,
+                "accept loop",
+            )
+            .await
+            .unwrap_or(Ok(()))
+        },
+        await_with_shutdown_grace(bridge_consumer_handle, &cancel_token, "bridge consumer"),
+        async {
+            if let Some(handle) = http_server_handle {
+                await_with_shutdown_grace(handle, &cancel_token, "HTTP server").await;
+            }
+        },
+    );
+
+    shutdown_cleanup(daemon, browser).await;
+
+    if let Err(e) = run_result {
+        eprintln!("stapler-mcp: daemon run error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Awaits `fut` to completion, unless `cancel` fires first and then
+/// `SHUTDOWN_GRACE_TIMEOUT` elapses without `fut` resolving — in which case
+/// this returns `None` and logs which task exceeded its grace period.
+/// Bounds only the wind-down phase *after* shutdown is requested; before
+/// `cancel` fires, `fut` is awaited with no timeout at all, since these
+/// tasks are meant to run for the daemon's whole normal lifetime.
+async fn await_with_shutdown_grace<F: std::future::Future>(
+    fut: F,
+    cancel: &tokio_util::sync::CancellationToken,
+    label: &str,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    tokio::select! {
+        result = &mut fut => Some(result),
+        _ = async {
+            cancel.cancelled().await;
+            tokio::time::sleep(SHUTDOWN_GRACE_TIMEOUT).await;
+        } => {
+            eprintln!(
+                "stapler-mcp: shutdown grace period ({SHUTDOWN_GRACE_TIMEOUT:?}) exceeded waiting on {label}, proceeding to cleanup anyway"
+            );
+            None
+        }
+    }
+}
+
+/// Post-shutdown cleanup, run exactly once after `run_daemon`'s joined
+/// shutdown sequence completes, regardless of which of SIGTERM/`SHUTDOWN_TOOL`
+/// triggered it. Drops `daemon` (and the `Rc<NativeBrowser>` clones its
+/// handler closures held) so `browser` becomes the sole remaining reference,
+/// making `Rc::get_mut` succeed — then explicitly closes it. Without this,
+/// the Chrome subprocess and its CDP connection keep the process alive
+/// forever after a clean shutdown.
+async fn shutdown_cleanup(daemon: Rc<Daemon>, mut browser: Rc<NativeBrowser>) {
     drop(daemon);
     if let Some(inner) = Rc::get_mut(&mut browser) {
         // Abort the session-idle reaper before closing the browser: a
@@ -570,11 +895,15 @@ async fn run_daemon() {
             }
         }
         inner.close().await;
-    }
-
-    if let Err(e) = run_result {
-        eprintln!("stapler-mcp: daemon run error: {e}");
-        std::process::exit(1);
+    } else {
+        // Every task that could hold an `Rc<NativeBrowser>` clone has already
+        // exited by the time the shutdown `tokio::join!` completes (see this
+        // function's doc comment), so this should be unreachable — logged
+        // rather than silently skipped in case that invariant ever breaks.
+        eprintln!(
+            "stapler-mcp: shutdown_cleanup: browser still has {} references, skipping close()",
+            Rc::strong_count(&browser)
+        );
     }
 }
 

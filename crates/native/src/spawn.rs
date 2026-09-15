@@ -1,9 +1,34 @@
+use std::fs::File;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use stapler_mcp_core::ports::{PortError, ProcessOutput, ProcessSpawner};
 
 pub struct NativeSpawner;
+
+/// Opens (creating if needed) the daemon's stdout/stderr redirect target,
+/// returning two independent handles to the same file. Split out from
+/// `spawn_daemon` so the mode-0600 behavior can be unit-tested without
+/// actually spawning a process.
+fn open_log_file(log_path: &str) -> Result<(File, File), PortError> {
+    if let Some(parent) = std::path::Path::new(log_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // `daemon.log` may carry request/response detail from the daemon's
+    // stdout/stderr, so it gets the same owner-only mode as `daemon.lock`
+    // (see `lock.rs`) rather than relying on the umask default.
+    let log_out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(log_path)
+        .map_err(|e| PortError::Io(e.to_string()))?;
+    let log_err = log_out
+        .try_clone()
+        .map_err(|e| PortError::Io(e.to_string()))?;
+    Ok((log_out, log_err))
+}
 
 impl ProcessSpawner for NativeSpawner {
     async fn spawn_daemon(&self, exe_hint: Option<&str>, log_path: &str) -> Result<(), PortError> {
@@ -15,17 +40,7 @@ impl ProcessSpawner for NativeSpawner {
                 .to_string(),
         };
 
-        if let Some(parent) = std::path::Path::new(log_path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let log_out = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .map_err(|e| PortError::Io(e.to_string()))?;
-        let log_err = log_out
-            .try_clone()
-            .map_err(|e| PortError::Io(e.to_string()))?;
+        let (log_out, log_err) = open_log_file(log_path)?;
 
         // `Command` inherits the parent's environment by default — this is how
         // `STAPLER_MCP_HOME` propagates to the spawned daemon.
@@ -148,5 +163,22 @@ mod tests {
         assert_eq!(result.stdout, b"out\n");
         assert_eq!(result.stderr, b"err\n");
         assert_eq!(result.exit_code, 1);
+    }
+
+    #[test]
+    fn open_log_file_should_create_file_with_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let log_path = dir.path().join("daemon.log");
+        let log_path_str = log_path.to_str().expect("utf8 path").to_string();
+
+        open_log_file(&log_path_str).expect("open log file");
+
+        let mode = std::fs::metadata(&log_path)
+            .expect("stat log file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
