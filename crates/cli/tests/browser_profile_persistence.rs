@@ -255,13 +255,16 @@ async fn cookie_set_before_restart_survives_daemon_restart_with_persistent_profi
     .await;
 }
 
-/// Story 1.3.2: two concurrent `NativeBrowser::launch(Some(dir))` calls
-/// against the same real, existing `dir` — the second returns an `Err`
-/// whose message names both the profile dir and `SingletonLock`, per
-/// `describe_launch_error`.
+/// Story 1.3.2: a second `NativeBrowser::launch(Some(dir))` call against the
+/// same real, existing `dir`, made while a first `launch()` against that
+/// `dir` is still held open (not a race between two simultaneous launches —
+/// the first is fully awaited before the second starts, mirroring how a
+/// real second daemon would find the lock already held) — the second
+/// returns an `Err` whose message names both the profile dir and
+/// `SingletonLock`, per `describe_launch_error`.
 #[tokio::test]
 #[ignore]
-async fn concurrent_launch_against_same_profile_dir_reports_singleton_lock_collision() {
+async fn second_launch_against_held_profile_dir_reports_singleton_lock_collision() {
     // `NativeBrowser` spawns a `!Send` idle-session reaper via
     // `tokio::task::spawn_local` at `launch()` time, so this test needs its
     // own `LocalSet`, same as `browser_session.rs`'s
@@ -278,7 +281,7 @@ async fn concurrent_launch_against_same_profile_dir_reports_singleton_lock_colli
             let second = NativeBrowser::launch(Some(dir.path().to_path_buf())).await;
             let err = match second {
                 Ok(_) => {
-                    panic!("second concurrent launch against the same profile dir should fail")
+                    panic!("second launch against the still-held profile dir should fail")
                 }
                 Err(e) => e.to_string(),
             };
