@@ -205,12 +205,49 @@ verbatim — never hand-authored twice.
 | `stapler_browser_wait_for` | Wait until given text appears/disappears and/or a minimum time elapses before returning the next snapshot. |
 | `stapler_browser_list_sessions` | List all open sessions daemon-wide (session id, tab count, idle time in milliseconds, and `blocked`/`crashed` diagnostic flags) — useful for finding sessions leaked by a crashed subagent. |
 | `stapler_browser_close_all_sessions` | Close every open session daemon-wide and report which succeeded/failed. Closes are attempted concurrently so one wedged session doesn't block the rest. **No per-caller scoping**: this closes sessions daemon-wide regardless of which caller opened them — safe for a single-agent daemon, but a multi-tenant daemon would need real authorization before exposing it. |
+| `stapler_daemon_status` | Report daemon-wide status not tied to any one session — currently the active browser profile persistence mode (`ephemeral` or `persistent at <path>`) and, if set, an unsafe-location warning. See "Persistent browser profile" below. |
 
 All tools are verified end-to-end against real dependencies (a real headless
 Chrome, a real mock/live HTTP server) rather than mocked ports — on both
 adapters, except docs-index, which is native-only. See
 [`NOTES.md`](./NOTES.md) for the phase-by-phase verification detail and the
 real bugs each round of testing found.
+
+### Persistent browser profile
+
+By default, every browser session opened during one daemon's lifetime already
+shares a single Chrome profile (cookies, login state) — that's unaffected by
+this section. What doesn't survive by default is a **daemon restart**: each
+new daemon process launches Chrome against a fresh, ephemeral
+`user_data_dir`, so cookies/login state are lost on upgrade, crash, or reboot.
+
+To make that survive a restart, set `STAPLER_MCP_BROWSER_PROFILE_DIR` to an
+absolute path (a leading `~/` is expanded) in the **daemon's** environment
+before starting it:
+
+```bash
+STAPLER_MCP_BROWSER_PROFILE_DIR=~/.stapler-mcp/browser-profile stapler-mcp --daemon
+```
+
+This is a daemon-startup-only setting, not a per-call `stapler_browser_navigate`
+parameter — `user_data_dir` is a Chrome launch-time flag consumed once, before
+any session exists. Leaving the variable unset, empty, or set to a relative
+path falls back to today's ephemeral behavior (a warning is logged for a
+rejected relative path). The directory is chmod'd `0700` on Unix; a
+non-blocking warning is logged (and surfaced via `stapler_daemon_status` /
+`--status` below) if its resolved path looks like it's inside a git
+repository or a cloud-synced folder (Dropbox/iCloud Drive/Syncthing) — this
+directory holds near-plaintext browser credentials. A second daemon pointed
+at the same directory fails to launch with an error naming the directory and
+the likely cause (`SingletonLock` collision) rather than raw chromiumoxide
+error text.
+
+Verify whether persistence is actually active — without reading
+`daemon.log` — via the `stapler_daemon_status` MCP tool or:
+
+```bash
+stapler-mcp --status
+```
 
 ## Deferred
 

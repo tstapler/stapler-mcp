@@ -16,8 +16,8 @@ use stapler_mcp_core::schema::{
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
     BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
     BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
-    BrowserTypeSecretInput, BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput,
-    IndexDocsInput, ListIndexedSourcesInput, ReadSavedPageInput, ReadWebsiteInput,
+    BrowserTypeSecretInput, BrowserWaitForInput, DaemonStatusOutput, DownloadWebsiteInput,
+    FetchPageInput, IndexDocsInput, ListIndexedSourcesInput, ReadSavedPageInput, ReadWebsiteInput,
     RemoveIndexedSourceInput, SearchDocsInput,
 };
 use stapler_mcp_core::tools::{browser, credential, docs, fetch, search, webcrawl};
@@ -117,17 +117,97 @@ async fn run_status() -> i32 {
     let socket = NativeSocketFactory;
     let sock_path = paths::socket_path(&env);
 
-    let ping_result =
-        stapler_mcp_core::client::ping(&socket, &sock_path, STATUS_PING_TIMEOUT).await;
-    if ping_result.is_err() {
+    let ping_result = stapler_mcp_core::client::call(
+        &socket,
+        &sock_path,
+        stapler_mcp_core::protocol::PING_TOOL,
+        None,
+        STATUS_PING_TIMEOUT,
+    )
+    .await;
+    let Ok(ping_result) = ping_result else {
         println!("daemon: not running");
         println!("try: systemctl --user start stapler-mcp   (or: stapler-mcp --daemon)");
         return 1;
-    }
+    };
 
     print_daemon_pid(&env);
+    print_browser_profile_status(&ping_result);
     print_http_status(&env).await;
     0
+}
+
+/// Computes the `browser profile: ...` line (and, if present, a hazard
+/// warning line) from a `DaemonStatusOutput` — the same typed struct
+/// `stapler_daemon_status`'s `daemon_status()` deserializes from `ping`'s
+/// response (`Daemon::set_status_extra`, wired in `run_daemon`). Going
+/// through the shared type rather than raw `serde_json::Value::get(...)`
+/// calls means a wire-key mismatch is a deserialization miss on a named
+/// field, not two independently-typed string literals that could silently
+/// drift apart.
+fn browser_profile_status_lines(status: &DaemonStatusOutput) -> Vec<String> {
+    let mode = status
+        .browser_profile_mode
+        .as_deref()
+        .unwrap_or("ephemeral");
+    let mut lines = vec![format!("browser profile: {mode}")];
+    if let Some(warning) = &status.browser_profile_warning {
+        lines.push(format!("warning: {warning}"));
+    }
+    lines
+}
+
+/// `ping_result` is `--status`'s raw `client::call` response; deserializing
+/// it into `DaemonStatusOutput` here (rather than reading `.get("...")`
+/// keys directly) fails to `None` fields, not silently wrong values, if
+/// `run_daemon`'s wire format ever drifts from this struct.
+fn print_browser_profile_status(ping_result: &serde_json::Value) {
+    let status: DaemonStatusOutput =
+        serde_json::from_value(ping_result.clone()).unwrap_or(DaemonStatusOutput {
+            pong: false,
+            browser_profile_mode: None,
+            browser_profile_warning: None,
+        });
+    for line in browser_profile_status_lines(&status) {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod browser_profile_status_tests {
+    use super::*;
+
+    #[test]
+    fn should_default_to_ephemeral_when_mode_absent() {
+        let status = DaemonStatusOutput {
+            pong: true,
+            browser_profile_mode: None,
+            browser_profile_warning: None,
+        };
+        assert_eq!(
+            browser_profile_status_lines(&status),
+            vec!["browser profile: ephemeral".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_print_persistent_mode_and_warning_when_present() {
+        let status = DaemonStatusOutput {
+            pong: true,
+            browser_profile_mode: Some(
+                "persistent at /home/alice/.stapler-mcp/browser-profile".to_string(),
+            ),
+            browser_profile_warning: Some("looks unsafe".to_string()),
+        };
+        assert_eq!(
+            browser_profile_status_lines(&status),
+            vec![
+                "browser profile: persistent at /home/alice/.stapler-mcp/browser-profile"
+                    .to_string(),
+                "warning: looks unsafe".to_string(),
+            ]
+        );
+    }
 }
 
 /// Prints the `daemon: running (pid ...)` line, reading the PID directly out
@@ -296,7 +376,25 @@ async fn run_daemon() {
 
     let http = Rc::new(NativeHttp::new());
     let fs = Rc::new(NativeFs);
-    let browser = match NativeBrowser::launch().await {
+    // Opt-in, daemon-startup-only: read once here, not per-call, since
+    // `user_data_dir` is consumed once at `Browser::launch()` — a
+    // `stapler_browser_navigate` tool parameter would silently no-op after
+    // the daemon's first `navigate`. See `paths::browser_profile_dir`.
+    let persistent_profile_dir = paths::browser_profile_dir(&env).map(std::path::PathBuf::from);
+    let browser_profile_mode = match &persistent_profile_dir {
+        Some(dir) => format!("persistent at {}", dir.display()),
+        None => "ephemeral".to_string(),
+    };
+    match &persistent_profile_dir {
+        Some(dir) => eprintln!(
+            "stapler-mcp: browser profile: persistent at {}",
+            dir.display()
+        ),
+        None => eprintln!(
+            "stapler-mcp: browser profile: ephemeral (temp dir, does not survive daemon restart)"
+        ),
+    }
+    let browser = match NativeBrowser::launch(persistent_profile_dir).await {
         Ok(b) => Rc::new(b),
         Err(e) => {
             eprintln!("stapler-mcp: failed to launch browser: {e}");
@@ -324,6 +422,14 @@ async fn run_daemon() {
     // (works fine through `Deref`), and the bridge consumer spawned after
     // registration needs its own clone of the same daemon.
     let daemon = Rc::new(Daemon::new());
+    // Echoed on every `ping` (and therefore `stapler_daemon_status` /
+    // `--status`) response so an operator/agent can positively verify
+    // `STAPLER_MCP_BROWSER_PROFILE_DIR` took effect, rather than inferring it
+    // from whether cookies survived a restart.
+    daemon.set_status_extra(serde_json::json!({
+        "browserProfileMode": browser_profile_mode,
+        "browserProfileWarning": browser.unsafe_profile_warning(),
+    }));
 
     daemon.register(
         "fetch_page",

@@ -40,6 +40,12 @@ pub struct Daemon {
     // `cancellation_token`, `run_cancellable`.
     #[cfg(not(target_arch = "wasm32"))]
     cancel: CancellationToken,
+    /// Extra fields merged into every `ping` response's `result` object —
+    /// e.g. `browserProfileMode`/`browserProfileWarning` (native `run_daemon`
+    /// only; the wasm adapter never calls `set_status_extra`, so its `ping`
+    /// response stays `{"pong": true}`). Set at most once, before `run()`'s
+    /// accept loop starts — single-writer, read-only afterward.
+    status_extra: RefCell<serde_json::Value>,
 }
 
 impl Daemon {
@@ -49,11 +55,18 @@ impl Daemon {
             shutdown: Rc::new(Cell::new(false)),
             #[cfg(not(target_arch = "wasm32"))]
             cancel: CancellationToken::new(),
+            status_extra: RefCell::new(serde_json::json!({})),
         }
     }
 
     pub fn register(&self, name: &'static str, handler: Handler) {
         self.handlers.borrow_mut().insert(name, handler);
+    }
+
+    /// Stores fields to merge into every future `ping` response's `result`
+    /// object. Intended to be called at most once, at startup.
+    pub fn set_status_extra(&self, extra: serde_json::Value) {
+        *self.status_extra.borrow_mut() = extra;
     }
 
     /// Sets the shutdown flag `run`/`run_cancellable` poll after each
@@ -88,7 +101,15 @@ impl Daemon {
 
     pub async fn handle_request(&self, req: Request) -> Response {
         match req.tool.as_str() {
-            PING_TOOL => Response::ok(serde_json::json!({"pong": true})),
+            PING_TOOL => {
+                let mut pong = serde_json::json!({"pong": true});
+                if let (serde_json::Value::Object(extra), serde_json::Value::Object(pong_obj)) =
+                    (&*self.status_extra.borrow(), &mut pong)
+                {
+                    pong_obj.extend(extra.clone());
+                }
+                Response::ok(pong)
+            }
             SHUTDOWN_TOOL => {
                 self.request_shutdown();
                 Response::ok(serde_json::json!({}))
@@ -265,6 +286,31 @@ mod tests {
 
         assert_eq!(resp.result, Some(serde_json::json!({"pong": true})));
         assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_request_should_merge_status_extra_fields_into_ping_response() {
+        let daemon = Daemon::new();
+        daemon.set_status_extra(serde_json::json!({
+            "browserProfileMode": "persistent at /tmp/x",
+            "browserProfileWarning": serde_json::Value::Null,
+        }));
+
+        let resp = daemon
+            .handle_request(Request {
+                tool: PING_TOOL.to_string(),
+                params: None,
+            })
+            .await;
+
+        assert_eq!(
+            resp.result,
+            Some(serde_json::json!({
+                "pong": true,
+                "browserProfileMode": "persistent at /tmp/x",
+                "browserProfileWarning": null,
+            }))
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -47,6 +50,99 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_millis() as u64
+}
+
+/// Detects whether a persistent profile directory sits somewhere it shouldn't:
+/// under a git-tracked working tree, or inside a folder synced to the cloud.
+/// Either makes this near-plaintext-at-rest credential store (cookies, login
+/// state) reachable by `git add -A`/a sync client, not just the local disk.
+/// Non-blocking by design (ADR-0001) — the caller warns, it doesn't refuse.
+fn unsafe_profile_location_reason(dir: &Path) -> Option<&'static str> {
+    for ancestor in dir.ancestors() {
+        if ancestor.join(".git").exists() {
+            return Some("appears to be inside a git repository");
+        }
+    }
+    const SYNC_FOLDER_NAMES: [&str; 3] = ["Dropbox", "iCloud Drive", "Syncthing"];
+    for component in dir.components() {
+        if let Some(s) = component.as_os_str().to_str() {
+            if SYNC_FOLDER_NAMES.contains(&s) {
+                return Some("appears to be inside a cloud-synced folder");
+            }
+        }
+    }
+    None
+}
+
+/// Pulled out of `launch()` so it's independently unit-testable without a
+/// real Chrome process. `None` whenever `persistent_dir` is `None` — the
+/// ephemeral pid+timestamp-scoped dir this item doesn't change is never a
+/// standing credential store worth warning about.
+fn compute_unsafe_profile_warning(persistent_dir: Option<&Path>) -> Option<String> {
+    let dir = persistent_dir?;
+    let reason = unsafe_profile_location_reason(dir)?;
+    Some(format!(
+        "browser profile dir {} {reason} — this directory holds near-plaintext browser credentials; consider moving it",
+        dir.display()
+    ))
+}
+
+/// Chmods a persistent profile directory to `0700` so its cookies/login state
+/// aren't readable by other local users. Only ever called on the
+/// `persistent_profile_dir` branch — the pre-existing ephemeral dir's
+/// permissions (umask-derived) are unchanged, out of this item's scope.
+///
+/// Refuses a symlink rather than chmod'ing through it: `set_permissions`
+/// follows symlinks, so a misconfigured or swapped `STAPLER_MCP_BROWSER_PROFILE_DIR`
+/// pointing at (or replaced by) a symlink would otherwise silently 0700 an
+/// unrelated target directory instead of the intended profile dir.
+#[cfg(unix)]
+fn harden_persistent_dir_permissions(dir: &Path) -> Result<(), PortError> {
+    if std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(PortError::Other(format!(
+            "browser profile dir {} is a symlink — refusing to use it as a persistent profile dir",
+            dir.display()
+        )));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| PortError::Other(e.to_string()))
+}
+
+/// Runs once, only for a persistent profile dir: hardens its permissions and
+/// computes (printing, if present) its unsafe-location warning. One seam over
+/// `harden_persistent_dir_permissions` + `compute_unsafe_profile_warning` so
+/// `launch()` stays a thin sequence of named steps rather than inlining both.
+fn prepare_persistent_profile_dir(dir: &Path) -> Result<Option<String>, PortError> {
+    #[cfg(unix)]
+    harden_persistent_dir_permissions(dir)?;
+    let warning = compute_unsafe_profile_warning(Some(dir));
+    if let Some(msg) = &warning {
+        eprintln!("stapler-mcp: warning: {msg}");
+    }
+    Ok(warning)
+}
+
+/// Wraps a `Browser::launch` failure with a friendlier message when it's
+/// almost certainly a `SingletonLock` collision (a second daemon already
+/// holding the configured persistent profile dir) — detected by checking the
+/// underlying error text for `"SingletonLock"` (the literal substring Chrome's
+/// own `ProcessSingleton` failure includes, e.g. `Failed to create
+/// <dir>/SingletonLock: File exists (17)`) rather than blindly relabeling
+/// every persistent-mode launch failure, which would misdiagnose an unrelated
+/// failure (corrupted profile, missing Chrome binary, disk full) as a lock
+/// collision.
+fn describe_launch_error(e: impl std::fmt::Display, persistent_dir: Option<&Path>) -> PortError {
+    let msg = e.to_string();
+    match persistent_dir {
+        Some(dir) if msg.contains("SingletonLock") => PortError::Other(format!(
+            "browser profile dir {} appears to be in use by another stapler-mcp daemon (SingletonLock): {msg}",
+            dir.display()
+        )),
+        _ => PortError::Other(msg),
+    }
 }
 
 /// Actionable error text for an id with no live entry in the session map —
@@ -359,6 +455,12 @@ pub struct NativeBrowser {
     /// `DynCredentialStore`'s doc comment for why the latter can't be named
     /// at all.
     credential_store: RefCell<Option<Rc<dyn DynCredentialStore>>>,
+    /// Set once at `launch()` time from `compute_unsafe_profile_warning` —
+    /// `Some` only when a persistent profile dir's location looks unsafe
+    /// (inside a git repo or a cloud-synced folder). Surfaced via the `ping`
+    /// RPC / `stapler_daemon_status` tool / `stapler-mcp --status`, not just
+    /// `daemon.log`, so it's discoverable without an operator tailing logs.
+    unsafe_profile_warning: Option<String>,
 }
 
 /// Object-safe erasure of `CredentialStore` for storage behind `dyn`.
@@ -433,21 +535,35 @@ impl Drop for NewSessionSlotGuard<'_> {
 }
 
 impl NativeBrowser {
-    pub async fn launch() -> Result<Self, PortError> {
+    /// `persistent_profile_dir`: `None` (the default) launches Chrome against
+    /// a fresh, ephemeral pid+timestamp-scoped `user_data_dir`, unchanged from
+    /// this function's original zero-arg behavior. `Some(dir)` instead points
+    /// Chrome at `dir` as a durable profile that survives daemon restarts —
+    /// see `paths::browser_profile_dir` for how an operator opts in.
+    pub async fn launch(persistent_profile_dir: Option<PathBuf>) -> Result<Self, PortError> {
         // chromiumoxide's own default, when `user_data_dir` is left unset, is
         // a single fixed shared path (`$TMPDIR/chromiumoxide-runner`) rather
         // than a fresh directory per launch. Every daemon process on a
         // machine would then point Chrome at the same profile directory —
         // the second one to start finds it locked (Chrome's own
-        // `SingletonLock`) and fails to launch. Each daemon process gets its
-        // own directory instead, scoped by pid + timestamp so concurrent
-        // daemons (e.g. back-to-back integration tests) never collide.
-        let user_data_dir = std::env::temp_dir().join(format!(
-            "stapler-mcp-chromium-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
+        // `SingletonLock`) and fails to launch. Absent an operator-configured
+        // persistent dir, each daemon process gets its own ephemeral
+        // directory instead, scoped by pid + timestamp so concurrent daemons
+        // (e.g. back-to-back integration tests) never collide.
+        let user_data_dir = match &persistent_profile_dir {
+            Some(dir) => dir.clone(),
+            None => std::env::temp_dir().join(format!(
+                "stapler-mcp-chromium-{}-{}",
+                std::process::id(),
+                now_millis()
+            )),
+        };
         std::fs::create_dir_all(&user_data_dir).map_err(|e| PortError::Other(e.to_string()))?;
+
+        let unsafe_profile_warning = match &persistent_profile_dir {
+            Some(_) => prepare_persistent_profile_dir(&user_data_dir)?,
+            None => None,
+        };
 
         let config = BrowserConfig::builder()
             .user_data_dir(&user_data_dir)
@@ -455,7 +571,7 @@ impl NativeBrowser {
             .map_err(|e| PortError::Other(e.to_string()))?;
         let (browser, mut handler) = Browser::launch(config)
             .await
-            .map_err(|e| PortError::Other(e.to_string()))?;
+            .map_err(|e| describe_launch_error(e, persistent_profile_dir.as_deref()))?;
 
         // Drains the CDP websocket event stream for the daemon's whole
         // lifetime; dropping this JoinHandle does not stop the task.
@@ -472,7 +588,16 @@ impl NativeBrowser {
             pending_new_sessions: Cell::new(0),
             reaper: RefCell::new(Some(reaper)),
             credential_store: RefCell::new(None),
+            unsafe_profile_warning,
         })
+    }
+
+    /// `Some` only when this browser's profile dir is persistent (opted in
+    /// via `STAPLER_MCP_BROWSER_PROFILE_DIR`) and its location looks unsafe
+    /// (inside a git repo or a cloud-synced folder) — see
+    /// `compute_unsafe_profile_warning`.
+    pub fn unsafe_profile_warning(&self) -> Option<&str> {
+        self.unsafe_profile_warning.as_deref()
     }
 
     /// Generates a session id unique within this process's lifetime:
@@ -3005,6 +3130,122 @@ mod tests {
         }
     }
 
+    // ---- browser-profile-persistence: unsafe-location / permission /
+    // error-wrapping helpers (Chrome-free, no LocalSet needed) ----
+
+    #[test]
+    fn should_return_none_for_safe_profile_path() {
+        let dir = PathBuf::from("/tmp/stapler-mcp-test-safe-profile");
+        assert_eq!(unsafe_profile_location_reason(&dir), None);
+    }
+
+    #[test]
+    fn should_detect_git_repo_ancestor() {
+        let dir = std::env::temp_dir().join(format!("stapler-mcp-test-git-{}", now_millis()));
+        let child = dir.join("browser-profile");
+        std::fs::create_dir_all(dir.join(".git")).expect("create fixture .git dir");
+        std::fs::create_dir_all(&child).expect("create fixture child dir");
+
+        let reason = unsafe_profile_location_reason(&child);
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(reason, Some("appears to be inside a git repository"));
+    }
+
+    #[test]
+    fn should_detect_sync_folder_segment() {
+        let dir = PathBuf::from("/home/testuser/Dropbox/browser-profile");
+        assert_eq!(
+            unsafe_profile_location_reason(&dir),
+            Some("appears to be inside a cloud-synced folder")
+        );
+    }
+
+    #[test]
+    fn should_return_none_for_compute_unsafe_profile_warning_when_ephemeral() {
+        let dir = PathBuf::from("/home/testuser/Dropbox/browser-profile");
+        assert_eq!(compute_unsafe_profile_warning(None), None);
+        // Ephemeral mode never even looks at `dir`'s content, but confirm no
+        // panic/false-positive if a caller ever passed a `Some` matching one
+        // of the same fixtures above.
+        let _ = dir;
+    }
+
+    #[test]
+    fn should_return_formatted_warning_for_compute_unsafe_profile_warning_when_persistent_and_unsafe(
+    ) {
+        let dir = PathBuf::from("/home/testuser/Dropbox/browser-profile");
+        let warning = compute_unsafe_profile_warning(Some(&dir))
+            .expect("expected a warning for Dropbox path");
+        assert!(warning.contains(&dir.display().to_string()));
+        assert!(warning.contains("near-plaintext browser credentials"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_set_mode_0700_on_persistent_dir() {
+        let dir = std::env::temp_dir().join(format!("stapler-mcp-test-perms-{}", now_millis()));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+
+        harden_persistent_dir_permissions(&dir).expect("harden permissions");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_refuse_to_harden_a_symlinked_profile_dir() {
+        let base = std::env::temp_dir().join(format!("stapler-mcp-test-symlink-{}", now_millis()));
+        let real_target = base.join("real-target");
+        let symlink_path = base.join("profile-symlink");
+        std::fs::create_dir_all(&real_target).expect("create fixture target dir");
+        std::os::unix::fs::symlink(&real_target, &symlink_path).expect("create fixture symlink");
+
+        let result = harden_persistent_dir_permissions(&symlink_path);
+
+        let target_mode = std::fs::metadata(&real_target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        std::fs::remove_dir_all(&base).ok();
+
+        let err = result.expect_err("a symlinked profile dir should be refused, not chmod'd");
+        assert!(err.to_string().contains("symlink"));
+        assert_ne!(
+            target_mode, 0o700,
+            "the symlink target's permissions must be untouched, not silently hardened through the symlink"
+        );
+    }
+
+    #[test]
+    fn should_name_profile_dir_and_singletonlock_when_persistent_and_error_is_lock_collision() {
+        let dir = PathBuf::from("/tmp/shared-profile");
+        let err = describe_launch_error(
+            "Failed to create /tmp/shared-profile/SingletonLock: File exists (17)",
+            Some(&dir),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&dir.display().to_string()));
+        assert!(msg.contains("SingletonLock"));
+        assert!(msg.contains("in use by another stapler-mcp daemon"));
+    }
+
+    #[test]
+    fn should_pass_through_raw_error_when_ephemeral() {
+        let err = describe_launch_error("some other launch failure", None);
+        assert_eq!(err.to_string(), "some other launch failure");
+    }
+
+    #[test]
+    fn should_pass_through_raw_error_when_persistent_but_not_a_lock_collision() {
+        let dir = PathBuf::from("/tmp/shared-profile");
+        let err = describe_launch_error("Chrome binary not found", Some(&dir));
+        assert_eq!(err.to_string(), "Chrome binary not found");
+    }
+
     // ---- Story 2.1: session registry data structures ----
 
     #[tokio::test]
@@ -4083,7 +4324,7 @@ mod tests {
                     "<!doctype html><html><body><input type=\"password\" id=\"pw\"></body></html>";
                 let (site_url, _shutdown_site) = spawn_single_page_site(html).await;
 
-                let mut browser = NativeBrowser::launch()
+                let mut browser = NativeBrowser::launch(None)
                     .await
                     .expect("Chrome must be installed to run this ignored integration test");
                 browser.set_credential_store(Rc::new(FakeCredentialStore::with_response(Ok(
