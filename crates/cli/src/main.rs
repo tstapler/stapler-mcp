@@ -16,8 +16,8 @@ use stapler_mcp_core::schema::{
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
     BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
     BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
-    BrowserTypeSecretInput, BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput,
-    IndexDocsInput, ListIndexedSourcesInput, ReadSavedPageInput, ReadWebsiteInput,
+    BrowserTypeSecretInput, BrowserWaitForInput, DaemonStatusOutput, DownloadWebsiteInput,
+    FetchPageInput, IndexDocsInput, ListIndexedSourcesInput, ReadSavedPageInput, ReadWebsiteInput,
     RemoveIndexedSourceInput, SearchDocsInput,
 };
 use stapler_mcp_core::tools::{browser, credential, docs, fetch, search, webcrawl};
@@ -137,25 +137,76 @@ async fn run_status() -> i32 {
     0
 }
 
-/// Prints the `browser profile: ...` line (and, if present, a hazard warning
-/// line) sourced from `ping`'s `browserProfileMode`/`browserProfileWarning`
-/// fields (`Daemon::set_status_extra`, wired in `run_daemon`). **Must read
-/// these exact camelCase keys** — this reads the raw `serde_json::Value`
-/// `client::call` returns directly, not `DaemonStatusOutput`, so it has to
-/// match `run_daemon`'s wire format itself; a mismatch would silently print
-/// "ephemeral" for every daemon via the `unwrap_or` fallback below, not fail
-/// loudly.
-fn print_browser_profile_status(ping_result: &serde_json::Value) {
-    let mode = ping_result
-        .get("browserProfileMode")
-        .and_then(|v| v.as_str())
+/// Computes the `browser profile: ...` line (and, if present, a hazard
+/// warning line) from a `DaemonStatusOutput` — the same typed struct
+/// `stapler_daemon_status`'s `daemon_status()` deserializes from `ping`'s
+/// response (`Daemon::set_status_extra`, wired in `run_daemon`). Going
+/// through the shared type rather than raw `serde_json::Value::get(...)`
+/// calls means a wire-key mismatch is a deserialization miss on a named
+/// field, not two independently-typed string literals that could silently
+/// drift apart.
+fn browser_profile_status_lines(status: &DaemonStatusOutput) -> Vec<String> {
+    let mode = status
+        .browser_profile_mode
+        .as_deref()
         .unwrap_or("ephemeral");
-    println!("browser profile: {mode}");
-    if let Some(warning) = ping_result
-        .get("browserProfileWarning")
-        .and_then(|v| v.as_str())
-    {
-        println!("warning: {warning}");
+    let mut lines = vec![format!("browser profile: {mode}")];
+    if let Some(warning) = &status.browser_profile_warning {
+        lines.push(format!("warning: {warning}"));
+    }
+    lines
+}
+
+/// `ping_result` is `--status`'s raw `client::call` response; deserializing
+/// it into `DaemonStatusOutput` here (rather than reading `.get("...")`
+/// keys directly) fails to `None` fields, not silently wrong values, if
+/// `run_daemon`'s wire format ever drifts from this struct.
+fn print_browser_profile_status(ping_result: &serde_json::Value) {
+    let status: DaemonStatusOutput =
+        serde_json::from_value(ping_result.clone()).unwrap_or(DaemonStatusOutput {
+            pong: false,
+            browser_profile_mode: None,
+            browser_profile_warning: None,
+        });
+    for line in browser_profile_status_lines(&status) {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod browser_profile_status_tests {
+    use super::*;
+
+    #[test]
+    fn should_default_to_ephemeral_when_mode_absent() {
+        let status = DaemonStatusOutput {
+            pong: true,
+            browser_profile_mode: None,
+            browser_profile_warning: None,
+        };
+        assert_eq!(
+            browser_profile_status_lines(&status),
+            vec!["browser profile: ephemeral".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_print_persistent_mode_and_warning_when_present() {
+        let status = DaemonStatusOutput {
+            pong: true,
+            browser_profile_mode: Some(
+                "persistent at /home/alice/.stapler-mcp/browser-profile".to_string(),
+            ),
+            browser_profile_warning: Some("looks unsafe".to_string()),
+        };
+        assert_eq!(
+            browser_profile_status_lines(&status),
+            vec![
+                "browser profile: persistent at /home/alice/.stapler-mcp/browser-profile"
+                    .to_string(),
+                "warning: looks unsafe".to_string(),
+            ]
+        );
     }
 }
 

@@ -91,21 +91,26 @@ fn compute_unsafe_profile_warning(persistent_dir: Option<&Path>) -> Option<Strin
 /// aren't readable by other local users. Only ever called on the
 /// `persistent_profile_dir` branch — the pre-existing ephemeral dir's
 /// permissions (umask-derived) are unchanged, out of this item's scope.
+///
+/// Refuses a symlink rather than chmod'ing through it: `set_permissions`
+/// follows symlinks, so a misconfigured or swapped `STAPLER_MCP_BROWSER_PROFILE_DIR`
+/// pointing at (or replaced by) a symlink would otherwise silently 0700 an
+/// unrelated target directory instead of the intended profile dir.
 #[cfg(unix)]
 fn harden_persistent_dir_permissions(dir: &Path) -> Result<(), PortError> {
+    if std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(PortError::Other(format!(
+            "browser profile dir {} is a symlink — refusing to use it as a persistent profile dir",
+            dir.display()
+        )));
+    }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| PortError::Other(e.to_string()))
 }
 
-/// Wraps a `Browser::launch` failure with a friendlier message when it's
-/// almost certainly a `SingletonLock` collision (a second daemon already
-/// holding the configured persistent profile dir) — detected by checking the
-/// underlying error text for `"SingletonLock"` (the literal substring Chrome's
-/// own `ProcessSingleton` failure includes, e.g. `Failed to create
-/// <dir>/SingletonLock: File exists (17)`) rather than blindly relabeling
-/// every persistent-mode launch failure, which would misdiagnose an unrelated
-/// failure (corrupted profile, missing Chrome binary, disk full) as a lock
-/// collision.
 /// Runs once, only for a persistent profile dir: hardens its permissions and
 /// computes (printing, if present) its unsafe-location warning. One seam over
 /// `harden_persistent_dir_permissions` + `compute_unsafe_profile_warning` so
@@ -120,6 +125,15 @@ fn prepare_persistent_profile_dir(dir: &Path) -> Result<Option<String>, PortErro
     Ok(warning)
 }
 
+/// Wraps a `Browser::launch` failure with a friendlier message when it's
+/// almost certainly a `SingletonLock` collision (a second daemon already
+/// holding the configured persistent profile dir) — detected by checking the
+/// underlying error text for `"SingletonLock"` (the literal substring Chrome's
+/// own `ProcessSingleton` failure includes, e.g. `Failed to create
+/// <dir>/SingletonLock: File exists (17)`) rather than blindly relabeling
+/// every persistent-mode launch failure, which would misdiagnose an unrelated
+/// failure (corrupted profile, missing Chrome binary, disk full) as a lock
+/// collision.
 fn describe_launch_error(e: impl std::fmt::Display, persistent_dir: Option<&Path>) -> PortError {
     let msg = e.to_string();
     match persistent_dir {
@@ -3178,6 +3192,32 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_refuse_to_harden_a_symlinked_profile_dir() {
+        let base = std::env::temp_dir().join(format!("stapler-mcp-test-symlink-{}", now_millis()));
+        let real_target = base.join("real-target");
+        let symlink_path = base.join("profile-symlink");
+        std::fs::create_dir_all(&real_target).expect("create fixture target dir");
+        std::os::unix::fs::symlink(&real_target, &symlink_path).expect("create fixture symlink");
+
+        let result = harden_persistent_dir_permissions(&symlink_path);
+
+        let target_mode = std::fs::metadata(&real_target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        std::fs::remove_dir_all(&base).ok();
+
+        let err = result.expect_err("a symlinked profile dir should be refused, not chmod'd");
+        assert!(err.to_string().contains("symlink"));
+        assert_ne!(
+            target_mode, 0o700,
+            "the symlink target's permissions must be untouched, not silently hardened through the symlink"
+        );
     }
 
     #[test]
