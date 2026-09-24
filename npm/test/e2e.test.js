@@ -41,6 +41,14 @@ const FILLER =
     "ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in " +
     "voluptate velit esse cillum dolore eu fugiat nulla pariatur.";
 
+async function waitUntilRemoved(targetPath, timeoutMs) {
+    const start = Date.now();
+    while (fs.existsSync(targetPath)) {
+        if (Date.now() - start >= timeoutMs) return;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+}
+
 // Small synthetic multi-page site + robots.txt, mirroring the Rust
 // `webcrawl.rs` integration test — same routes, same assertions, proving the
 // wasm/Node adapter's crawl/robots/cache behavior matches the native one.
@@ -190,7 +198,13 @@ test("daemon architecture and real tools round trip", async () => {
         //    — that would just respawn a fresh daemon, which is the whole
         //    point of `ensure_daemon` and would make the check meaningless.
         await wasm.ensure_daemon_and_call("shutdown", "", ENTRY);
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        // Poll rather than a fixed sleep: shutdown includes closing the real
+        // Chrome session opened in step 4, whose teardown time varies with
+        // machine/CI load — a fixed sleep here was observed flaking in CI
+        // (assertion failed with the lock dir still present) while passing
+        // reliably in a fast local run.
+        await waitUntilRemoved(path.join(home, "daemon.sock"), 5000);
+        await waitUntilRemoved(path.join(home, "daemon.lock"), 5000);
     } finally {
         mock.server.close();
     }

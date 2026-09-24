@@ -16,16 +16,21 @@ ship two ways — a native CLI and a zero-native-binary `npx` package — withou
 duplicating the thin-client/daemon architecture or the tool logic twice. See
 [`NOTES.md`](./NOTES.md) for the phase-by-phase build log and what's deferred.
 
-## Architecture: thin client + shared daemon
+## Architecture: thin client + shared daemon, two transports
 
-This is the entire point of the project, not an optional nicety.
+This is the entire point of the project, not an optional nicety. The shared
+daemon is reachable two ways: the default per-session stdio thin client
+(unchanged), and an opt-in Streamable HTTP endpoint for clients that can
+speak MCP-over-HTTP directly and skip the per-session subprocess entirely.
 
 ```
 Claude Code session 1 ──▶ stapler-mcp (thin stdio MCP server) ─┐
 Claude Code session 2 ──▶ stapler-mcp (thin stdio MCP server) ─┼──▶ ~/.stapler-mcp/daemon.sock ──▶ stapler-mcp --daemon
 Claude Code subagent N ─▶ stapler-mcp (thin stdio MCP server) ─┘         (one process, one browser pool,
                                                                            one HTTP client, one cache —
-                                                                           shared machine-wide)
+Any MCP-over-HTTP client ─────────────────────────────────────────────▶ 127.0.0.1:$STAPLER_MCP_HTTP_PORT/mcp
+                                                                           shared machine-wide, same daemon,
+                                                                           bearer-token authenticated)
 ```
 
 - **thin client** (no flags) — what Claude Code actually launches per
@@ -41,12 +46,109 @@ Claude Code subagent N ─▶ stapler-mcp (thin stdio MCP server) ─┘        
   attempts an exclusive lock on `~/.stapler-mcp/daemon.lock` — only the
   winner binds the socket, the rest see "already running" and exit
   immediately (`crates/native/src/lock.rs` / `crates/wasm/src/glue/lock.js`).
+- **HTTP transport** (opt-in, via `STAPLER_MCP_HTTP_PORT`) — the same
+  `--daemon` process also binds `127.0.0.1:$STAPLER_MCP_HTTP_PORT/mcp` as a
+  Streamable HTTP MCP endpoint, protected by a bearer token the daemon
+  generates on first HTTP-enabled startup (`~/.stapler-mcp/http-token`,
+  mode `0600`). A client that speaks MCP-over-HTTP natively connects
+  straight to the daemon — no per-session thin-client subprocess at all.
+  The stdio thin client keeps working unchanged alongside it; the two
+  transports share the same daemon, browser pool, and caches. See
+  "First time enabling HTTP" below to configure a client for this.
 
 This mirrors a fix already underway in the sibling project `stapler-squad`
 (also owned by this user), where its own `--mcp` subcommand is moving from
 "duplicate the whole backend per subagent" to "thin client of the one
 already-running service" — same pattern, different transport. `stapler-mcp`
 is an independent repository and does not depend on or modify `stapler-squad`.
+
+## Running as a persistent service
+
+Running `--daemon` as a supervised, auto-restarting user service means it
+survives reboots and doesn't depend on a thin client happening to auto-spawn
+it first. Templates for both platforms live in `scripts/`.
+
+**Linux (systemd user service)** — `scripts/stapler-mcp.service.example`:
+
+```bash
+cp scripts/stapler-mcp.service.example ~/.config/systemd/user/stapler-mcp.service
+# edit STAPLER_MCP_HTTP_PORT / ExecStart path as needed, then:
+systemctl --user daemon-reload
+systemctl --user enable --now stapler-mcp
+stapler-mcp --status
+```
+
+**macOS (launchd agent)** — `scripts/com.tstapler.stapler-mcp.plist.example`:
+
+```bash
+cp scripts/com.tstapler.stapler-mcp.plist.example ~/Library/LaunchAgents/com.tstapler.stapler-mcp.plist
+# edit the ProgramArguments path (launchd does not expand ~/$HOME) and
+# STAPLER_MCP_HTTP_PORT as needed, then:
+launchctl load -w ~/Library/LaunchAgents/com.tstapler.stapler-mcp.plist
+stapler-mcp --status
+```
+
+## Troubleshooting
+
+Work through these in order:
+
+1. **Is the service unit running?**
+   `systemctl --user status stapler-mcp` (Linux) or
+   `launchctl print gui/$(id -u)/com.tstapler.stapler-mcp` (macOS).
+2. **Is the daemon itself reachable?** `stapler-mcp --status` — reports the
+   daemon's PID and, separately, whether its HTTP transport is configured
+   and listening. This never auto-spawns a daemon, so a clean "not running"
+   is a real diagnosis, not a side effect.
+3. **Start it.** `systemctl --user start stapler-mcp` if a service unit is
+   installed (step 1), otherwise `stapler-mcp --daemon` directly.
+
+**Falling back to stdio**: if the HTTP transport is misbehaving and you just
+need things working again, revert your MCP client config's stapler-mcp entry
+back to the plain stdio form — `command`/`args` pointing at the
+`stapler-mcp` binary with no `STAPLER_MCP_HTTP_PORT` involved. The stdio
+thin-client path doesn't depend on the HTTP transport at all.
+
+## First time enabling HTTP
+
+1. Start the daemon with the HTTP port set:
+   `STAPLER_MCP_HTTP_PORT=47439 stapler-mcp --daemon`
+2. On that first HTTP-enabled startup it generates a bearer token at
+   `~/.stapler-mcp/http-token` (mode `0600`) and logs that it did so.
+3. Run `stapler-mcp --print-config` to print the ready-to-use client config
+   block (see "Distributing the HTTP token" below for where it reads from
+   and why it never invents a token).
+4. Paste the result into `~/.claude.json`'s user-scoped `mcpServers` entry —
+   **after** running the verification snippet below to confirm that file
+   isn't git-tracked.
+5. Optionally install the persistent service (above) so the daemon survives
+   reboots instead of depending on a thin client auto-spawning it.
+6. Verify with `stapler-mcp --status` — expect `daemon: running (pid ...)`
+   and `http: listening on 127.0.0.1:47439`.
+
+### Distributing the HTTP token
+
+Never paste a literal bearer token into the git-tracked `mcp-servers.json`
+(or any file in this repo). Instead, run `stapler-mcp --print-config` and
+paste its output into `~/.claude.json` — Claude Code's real documented
+user-level MCP config file. That's a standalone file directly in `$HOME`,
+distinct from `~/.claude/` (which may itself be a dotfiles-managed git
+symlink on some machines) — the two are easy to confuse, so verify which one
+you're editing before pasting a secret into it:
+
+```bash
+target=$(readlink -f ~/.claude.json); repo=$(readlink -f ~/dotfiles)
+case "$target" in
+  "$repo"/*) git -C "$repo" ls-files --error-unmatch -- "${target#$repo/}" \
+             && echo "TRACKED — unsafe, gitignore it or use headersHelper instead" \
+             || echo "inside the repo dir but untracked — safe for now" ;;
+  *) echo "outside the repo dir entirely — cannot be tracked, safe" ;;
+esac
+```
+
+`${ENV_VAR}` substitution inside a `headers` field has been reported
+unreliable in Claude Code and isn't a safe substitute for this manual
+copy-paste approach — paste the real token from `--print-config`, don't try
+to reference it indirectly.
 
 ### Why a Unix domain socket
 
@@ -90,7 +192,8 @@ verbatim — never hand-authored twice.
 |---|---|
 | `fetch_page` | Headless-render a URL, return title + extracted text, optionally save rendered HTML to a local path (`savePath`). |
 | `brave_web_search` | Stateless HTTP wrapper over the Brave Search API. Reads `BRAVE_API_KEY` from the **daemon's** environment. Base URL overridable via `BRAVE_API_BASE_URL` (used by both adapters' test suites to point at a mock server). |
-| `read_website` | Fetch a URL (optionally BFS-crawling same-host links up to `maxDepth`/`maxPages`), extract main content via Readability-style extraction, return it as Markdown. Cached by URL hash on the daemon — a cache hit skips the network fetch entirely (at the cost of not expanding that page's links further). Respects `robots.txt`. |
+| `read_website` | Fetch a URL (optionally BFS-crawling same-host links up to `maxDepth`/`maxPages`), extract main content via Readability-style extraction, return it as Markdown. Cached by URL hash on the daemon — a cache hit skips the network fetch entirely (at the cost of not expanding that page's links further). Respects `robots.txt`. Once the combined Markdown across every page returned passes ~60,000 characters (tunable via `maxInlineChars`, or force it for every page with `alwaysSaveToFile`), further pages come back as a short preview plus `savedPath` instead of the full text, so a long crawl can't crowd out the rest of the caller's context. |
+| `read_saved_page` | Search (`query`, with `contextLines` of surrounding context — like `grep -n -C`) or paginate (`offset`/`limit`, line-numbered — like `Read`) a page previously saved by `read_website`'s `savedPath`. Only ever reads a path matching that mechanism's own naming scheme, never an arbitrary file. Works even when the caller isn't on the same machine as the daemon. |
 | `download_website` | Same crawl/`robots.txt` mechanics as `read_website`, saves raw HTML per page under `saveDir` instead of extracting Markdown. Merges what were two separate third-party MCP servers this user ran before. |
 | `stapler_index_docs` / `stapler_search_docs` / `stapler_list_indexed_sources` / `stapler_remove_indexed_source` | Native-only: crawl a doc site, embed it locally (`fastembed`/`all-MiniLM-L6-v2`), and semantically search it — a narrower-scope, in-process replacement for the Node `docs-mcp-server`. `stapler_`-prefixed to avoid a tool-name collision with that server's own `search_docs`. |
 | `stapler_browser_navigate` / `stapler_browser_click` / `stapler_browser_type` / `stapler_browser_snapshot` | `playwright-mcp`-style browser automation via accessibility-tree snapshots, with a `sessionId` threaded across calls and a 300s idle-timeout reaper for abandoned sessions. Snapshots include open shadow DOM content automatically, and recursively traverse same-process (same-origin) `<iframe>` content up to 5 levels deep by resolving each `Iframe` node's child frame via CDP and splicing in its AX tree; cross-origin iframes run in a separate renderer process this session can't reach, so they're left as childless `Iframe` leaves ([#20](https://github.com/tstapler/stapler-mcp/issues/20)). |
@@ -137,6 +240,10 @@ cargo build -p stapler-mcp   # produces target/debug/stapler-mcp (or --release)
 
 # Manual daemon inspection (normally auto-started, not run by hand):
 ./target/debug/stapler-mcp --daemon
+
+# Read-only diagnostics — never auto-spawn a daemon:
+./target/debug/stapler-mcp --status         # daemon/HTTP liveness
+./target/debug/stapler-mcp --print-config   # HTTP client config block, see "First time enabling HTTP"
 ```
 
 ### npm / Node (no Rust toolchain needed)
@@ -162,6 +269,13 @@ primarily for tests):
   a liveness-checked lock directory on the Node side) + PID
 - `daemon.log` — stdout/stderr of the detached daemon (it has no
   controlling terminal once spawned)
+- `http-port` — the port the HTTP transport was last started with, written
+  whenever `STAPLER_MCP_HTTP_PORT` is set and removed when it isn't. Read by
+  `--status`/`--print-config` instead of the environment variable, since
+  neither command can assume it's running in the same shell that started
+  the daemon.
+- `http-token` — the HTTP transport's bearer token (mode `0600`), generated
+  once on first HTTP-enabled startup and reused thereafter.
 
 ## Development
 
