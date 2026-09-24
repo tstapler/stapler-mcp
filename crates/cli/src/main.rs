@@ -117,17 +117,46 @@ async fn run_status() -> i32 {
     let socket = NativeSocketFactory;
     let sock_path = paths::socket_path(&env);
 
-    let ping_result =
-        stapler_mcp_core::client::ping(&socket, &sock_path, STATUS_PING_TIMEOUT).await;
-    if ping_result.is_err() {
+    let ping_result = stapler_mcp_core::client::call(
+        &socket,
+        &sock_path,
+        stapler_mcp_core::protocol::PING_TOOL,
+        None,
+        STATUS_PING_TIMEOUT,
+    )
+    .await;
+    let Ok(ping_result) = ping_result else {
         println!("daemon: not running");
         println!("try: systemctl --user start stapler-mcp   (or: stapler-mcp --daemon)");
         return 1;
-    }
+    };
 
     print_daemon_pid(&env);
+    print_browser_profile_status(&ping_result);
     print_http_status(&env).await;
     0
+}
+
+/// Prints the `browser profile: ...` line (and, if present, a hazard warning
+/// line) sourced from `ping`'s `browserProfileMode`/`browserProfileWarning`
+/// fields (`Daemon::set_status_extra`, wired in `run_daemon`). **Must read
+/// these exact camelCase keys** — this reads the raw `serde_json::Value`
+/// `client::call` returns directly, not `DaemonStatusOutput`, so it has to
+/// match `run_daemon`'s wire format itself; a mismatch would silently print
+/// "ephemeral" for every daemon via the `unwrap_or` fallback below, not fail
+/// loudly.
+fn print_browser_profile_status(ping_result: &serde_json::Value) {
+    let mode = ping_result
+        .get("browserProfileMode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ephemeral");
+    println!("browser profile: {mode}");
+    if let Some(warning) = ping_result
+        .get("browserProfileWarning")
+        .and_then(|v| v.as_str())
+    {
+        println!("warning: {warning}");
+    }
 }
 
 /// Prints the `daemon: running (pid ...)` line, reading the PID directly out
@@ -296,7 +325,25 @@ async fn run_daemon() {
 
     let http = Rc::new(NativeHttp::new());
     let fs = Rc::new(NativeFs);
-    let browser = match NativeBrowser::launch().await {
+    // Opt-in, daemon-startup-only: read once here, not per-call, since
+    // `user_data_dir` is consumed once at `Browser::launch()` — a
+    // `stapler_browser_navigate` tool parameter would silently no-op after
+    // the daemon's first `navigate`. See `paths::browser_profile_dir`.
+    let persistent_profile_dir = paths::browser_profile_dir(&env).map(std::path::PathBuf::from);
+    let browser_profile_mode = match &persistent_profile_dir {
+        Some(dir) => format!("persistent at {}", dir.display()),
+        None => "ephemeral".to_string(),
+    };
+    match &persistent_profile_dir {
+        Some(dir) => eprintln!(
+            "stapler-mcp: browser profile: persistent at {}",
+            dir.display()
+        ),
+        None => eprintln!(
+            "stapler-mcp: browser profile: ephemeral (temp dir, does not survive daemon restart)"
+        ),
+    }
+    let browser = match NativeBrowser::launch(persistent_profile_dir).await {
         Ok(b) => Rc::new(b),
         Err(e) => {
             eprintln!("stapler-mcp: failed to launch browser: {e}");
@@ -324,6 +371,14 @@ async fn run_daemon() {
     // (works fine through `Deref`), and the bridge consumer spawned after
     // registration needs its own clone of the same daemon.
     let daemon = Rc::new(Daemon::new());
+    // Echoed on every `ping` (and therefore `stapler_daemon_status` /
+    // `--status`) response so an operator/agent can positively verify
+    // `STAPLER_MCP_BROWSER_PROFILE_DIR` took effect, rather than inferring it
+    // from whether cookies survived a restart.
+    daemon.set_status_extra(serde_json::json!({
+        "browserProfileMode": browser_profile_mode,
+        "browserProfileWarning": browser.unsafe_profile_warning(),
+    }));
 
     daemon.register(
         "fetch_page",

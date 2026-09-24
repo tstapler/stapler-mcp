@@ -17,11 +17,12 @@ use stapler_mcp_core::schema::{
     BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
     BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
     BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
-    BrowserTypeInput, BrowserTypeSecretInput, BrowserWaitForInput, DownloadWebsiteInput,
-    DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput,
-    ListIndexedSourcesInput, ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput,
-    ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput,
-    SearchDocsInput, SearchDocsOutput,
+    BrowserTypeInput, BrowserTypeSecretInput, BrowserWaitForInput, DaemonStatusInput,
+    DaemonStatusOutput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
+    FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
+    ListIndexedSourcesOutput, ReadSavedPageInput, ReadSavedPageOutput, ReadWebsiteInput,
+    ReadWebsiteOutput, RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput,
+    SearchDocsOutput,
 };
 #[derive(Debug, Clone)]
 pub struct McpRouter<T: DaemonTransport = SocketTransport> {
@@ -665,6 +666,38 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
         serde_json::from_value(result)
             .map_err(|e| e.to_string())
             .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_daemon_status",
+        description = "Check whether the shared stapler-mcp daemon is reachable and report daemon-wide status that isn't tied to any one browser session — currently the active browser profile persistence mode (\"ephemeral\" or \"persistent at <path>\") and, if the configured profile directory looks unsafe (inside a git repository or a cloud-synced folder), a warning naming the hazard. Use this to confirm STAPLER_MCP_BROWSER_PROFILE_DIR actually took effect rather than inferring it from whether cookies survived a restart."
+    )]
+    async fn daemon_status(
+        &self,
+        _params: Parameters<DaemonStatusInput>,
+    ) -> Result<Json<DaemonStatusOutput>, String> {
+        let result = self
+            .transport
+            .call(stapler_mcp_core::protocol::PING_TOOL, serde_json::json!({}))
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
+    }
+}
+
+impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
+    /// Test-only accessor exercising the exact `daemon_status` tool method
+    /// (and therefore the same `DaemonStatusOutput` deserialization path a
+    /// real MCP client would go through) without a live stdio client. See
+    /// `registered_tools()`'s doc comment for why this needs the same
+    /// `#[allow(dead_code)]`.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub async fn call_daemon_status_for_test(&self) -> Result<DaemonStatusOutput, String> {
+        self.daemon_status(Parameters(DaemonStatusInput {}))
+            .await
+            .map(|Json(output)| output)
     }
 }
 

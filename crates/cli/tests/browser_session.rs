@@ -1000,7 +1000,7 @@ async fn navigate_concurrent_should_not_exceed_max_open_sessions() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut browser = NativeBrowser::launch()
+            let mut browser = NativeBrowser::launch(None)
                 .await
                 .expect("NativeBrowser::launch should succeed with a real Chrome/Chromium binary");
 

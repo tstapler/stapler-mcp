@@ -32,8 +32,8 @@ use stapler_mcp_core::schema::{
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
     BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
     BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
-    BrowserWaitForInput, IndexDocsInput, ListIndexedSourcesInput, RemoveIndexedSourceInput,
-    SearchDocsInput,
+    BrowserWaitForInput, DaemonStatusInput, IndexDocsInput, ListIndexedSourcesInput,
+    RemoveIndexedSourceInput, SearchDocsInput,
 };
 
 #[path = "../src/mcp_router.rs"]
@@ -161,6 +161,10 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
         (
             "stapler_browser_get_html",
             schema_for_input::<BrowserGetHtmlInput>().expect("BrowserGetHtmlInput schemars schema"),
+        ),
+        (
+            "stapler_daemon_status",
+            schema_for_input::<DaemonStatusInput>().expect("DaemonStatusInput schemars schema"),
         ),
     ];
 

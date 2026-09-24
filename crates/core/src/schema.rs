@@ -584,6 +584,24 @@ pub struct BrowserListSessionsOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct DaemonStatusInput {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonStatusOutput {
+    pub pong: bool,
+    /// `"ephemeral"` or `"persistent at <path>"`. `None` only if talking to a
+    /// daemon that never calls `Daemon::set_status_extra` (the wasm adapter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profile_mode: Option<String>,
+    /// Non-null when the active persistent profile dir's location looks
+    /// unsafe (inside a git repo or a cloud-synced folder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profile_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserCloseAllSessionsInput {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
