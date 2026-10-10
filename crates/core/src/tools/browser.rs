@@ -83,7 +83,7 @@ fn to_tab_info_output(tab: TabInfo) -> BrowserTabInfo {
 /// sentence with `"{verb} {id}: "`. Everything else is wrapped with the
 /// failing verb and id so it's clear what was being attempted when the
 /// driver failed.
-fn map_error(verb: &str, id: &str, err: PortError) -> String {
+pub(crate) fn map_error(verb: &str, id: &str, err: PortError) -> String {
     match err {
         PortError::NotFound(msg) | PortError::SessionCrashed(msg) => msg,
         other => format!("{verb} {id}: {other}"),
