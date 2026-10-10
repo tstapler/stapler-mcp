@@ -1556,3 +1556,52 @@ async fn daemon_should_reach_native_credential_store_when_op_service_account_tok
     .await
     .expect("shutdown call should succeed");
 }
+
+/// Live coverage for `browser_web_search`'s real Bing-scrape path (issue
+/// #46): `search.rs`'s own unit tests only ever mock `evaluate`'s return
+/// value, so `EXTRACT_BING_RESULTS_JS` itself — the base64url redirect
+/// decode, the `li.b_algo` selectors — is never actually executed by
+/// anything except this test. Needs real network access to `www.bing.com`,
+/// so it's `#[ignore]`d like every other real-dependency test in this file.
+#[tokio::test]
+#[ignore]
+async fn browser_web_search_should_return_decoded_results_from_real_bing() {
+    let (_tmp, socket, sock_path) = start_daemon(false).await;
+
+    let result = client::call(
+        &socket,
+        &sock_path,
+        "browser_web_search",
+        Some(json!({ "query": "rust programming language" })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_web_search should succeed against the real Bing");
+
+    let results = result["results"]
+        .as_array()
+        .expect("expected a results array");
+    assert!(
+        !results.is_empty(),
+        "expected at least one result, got: {result:?}"
+    );
+    assert!(
+        results.iter().all(|r| {
+            let url = r["url"].as_str().unwrap_or_default();
+            (url.starts_with("http://") || url.starts_with("https://"))
+                && !url.contains("bing.com/ck/a")
+        }),
+        "every result url should be a decoded destination, not a bing.com \
+         tracking redirect: {results:?}"
+    );
+
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
+}
