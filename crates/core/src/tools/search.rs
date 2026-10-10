@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 
-use crate::ports::HttpClient;
+use crate::ports::{BrowserDriver, HttpClient, SessionId};
 use crate::schema::{BraveSearchInput, BraveSearchOutput, BraveSearchResult};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.search.brave.com/res/v1/web/search";
@@ -76,4 +78,303 @@ fn build_search_url(base_url: &str, query: &str, count: u32) -> String {
         .append_pair("count", &count.to_string())
         .finish();
     format!("{base_url}?{qs}")
+}
+
+const BROWSER_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bing, not DuckDuckGo as issue #46 originally suggested: verified
+/// empirically (this crate's own `stapler_browser_navigate`/`evaluate` tools,
+/// plus a plain `curl`, against `html.duckduckgo.com/html/`) that DuckDuckGo's
+/// server-side bot challenge ("Unfortunately, bots use DuckDuckGo too")
+/// triggers unconditionally from this environment's egress — headless
+/// Chrome, headed Chrome, and a bare `curl` with a normal browser
+/// `User-Agent` were all challenged identically, so it isn't a headless-UA
+/// fingerprint this crate could fix. The same two checks against
+/// `www.bing.com/search` returned real, unchallenged results every time.
+const SEARCH_BASE_URL: &str = "https://www.bing.com/search";
+
+/// Runs in the search results page. Bing wraps every organic result's link
+/// in a `bing.com/ck/a` click-tracking redirect; the real target is
+/// base64url-encoded in that redirect's `u` query parameter, itself prefixed
+/// with a literal `"a1"` marker — stripped and decoded here so callers get
+/// the actual destination URL, not a tracking link that expires/redirects
+/// through Bing on every follow-up fetch.
+const EXTRACT_BING_RESULTS_JS: &str = r#"() => {
+    function decodeBingUrl(href) {
+        try {
+            const params = new URL(href).searchParams;
+            const u = params.get('u');
+            if (u && u.startsWith('a1')) {
+                let b64 = u.slice(2).replace(/-/g, '+').replace(/_/g, '/');
+                while (b64.length % 4) {
+                    b64 += '=';
+                }
+                return atob(b64);
+            }
+        } catch (e) {}
+        return href;
+    }
+    return Array.from(document.querySelectorAll('li.b_algo')).map((el) => {
+        const a = el.querySelector('h2 a');
+        const caption = el.querySelector('.b_caption, .b_snippet');
+        return {
+            title: a ? a.textContent.trim() : '',
+            url: a ? decodeBingUrl(a.href) : '',
+            description: caption ? caption.textContent.trim().replace(/\s+/g, ' ') : '',
+        };
+    }).filter((r) => r.url);
+}"#;
+
+#[derive(Deserialize)]
+struct RawBrowserResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// Keyless fallback for `brave_web_search` (issue #46): renders Bing's
+/// search results page in a fresh, throwaway browser session and scrapes the
+/// organic results, rather than calling an API. Mirrors
+/// `BraveSearchInput`/`BraveSearchOutput`'s shape exactly (reusing the same
+/// types) so a caller can route through either tool interchangeably.
+///
+/// Opens exactly one session per call and always closes it before returning
+/// — on the success path and the error path alike — so a search never
+/// leaves residue in `stapler_browser_list_sessions` (deliberately no
+/// cross-search session reuse: unrelated queries must never share state).
+pub async fn browser_web_search<B: BrowserDriver>(
+    browser: &B,
+    input: BraveSearchInput,
+) -> Result<BraveSearchOutput, String> {
+    if input.query.is_empty() {
+        return Err("query must not be empty".to_string());
+    }
+    let count = resolve_count(input.count);
+
+    // `count` is forwarded to Bing as a query param, but it's a request, not
+    // a guarantee — verified empirically it has no visible effect on how
+    // many organic `b_algo` results actually render (consistently ~10 either
+    // way), so `take(count)` below just caps whatever Bing returned rather
+    // than ever padding it out.
+    let value = run_search_session(browser, &input.query, count).await?;
+    let raw: Vec<RawBrowserResult> = serde_json::from_value(value)
+        .map_err(|e| format!("browser web search: unexpected result shape: {e}"))?;
+
+    Ok(BraveSearchOutput {
+        results: raw.into_iter().take(count).map(to_brave_result).collect(),
+    })
+}
+
+fn resolve_count(count: Option<u32>) -> usize {
+    (match count {
+        None | Some(0) => 10,
+        Some(c) if c > 20 => 20,
+        Some(c) => c,
+    }) as usize
+}
+
+fn to_brave_result(r: RawBrowserResult) -> BraveSearchResult {
+    BraveSearchResult {
+        title: r.title,
+        url: r.url,
+        description: r.description,
+    }
+}
+
+/// Navigates a fresh session to the Bing results page, extracts results, and
+/// always closes the session before returning — on the success path and the
+/// error path alike, so a search never leaves residue in
+/// `stapler_browser_list_sessions`.
+async fn run_search_session<B: BrowserDriver>(
+    browser: &B,
+    query: &str,
+    count: usize,
+) -> Result<serde_json::Value, String> {
+    let url = build_search_url(SEARCH_BASE_URL, query, count as u32);
+    let nav = browser
+        .navigate(&url, None, BROWSER_SEARCH_TIMEOUT)
+        .await
+        .map_err(|e| format!("browser web search: {e}"))?;
+
+    let eval_result = browser
+        .evaluate(
+            &nav.session_id,
+            EXTRACT_BING_RESULTS_JS,
+            None,
+            BROWSER_SEARCH_TIMEOUT,
+        )
+        .await;
+    close_search_session(browser, &nav.session_id).await;
+
+    eval_result.map_err(|e| format!("browser web search: {e}"))
+}
+
+/// Best-effort: a failure to close the per-search session is never surfaced
+/// as a tool error (the search itself may have already succeeded), but it
+/// would leave residue in `stapler_browser_list_sessions` — logged to stderr
+/// so it's at least visible to the daemon operator.
+async fn close_search_session<B: BrowserDriver>(browser: &B, session_id: &SessionId) {
+    if let Err(e) = browser.close_session(session_id).await {
+        eprintln!("stapler-mcp: browser web search: failed to close session: {e}");
+    }
+}
+
+#[cfg(test)]
+mod browser_web_search_tests {
+    use super::*;
+    use crate::ports::{NavigateResult, PortError};
+    use crate::tools::test_support::{sample_snapshot, FakeBrowserDriver};
+
+    fn input(query: &str, count: Option<u32>) -> BraveSearchInput {
+        BraveSearchInput {
+            query: query.to_string(),
+            count,
+        }
+    }
+
+    fn navigated(session_id: &str) -> Result<NavigateResult, PortError> {
+        Ok(NavigateResult {
+            session_id: SessionId(session_id.to_string()),
+            final_url: "https://www.bing.com/search?q=rust".to_string(),
+            snapshot: sample_snapshot("https://www.bing.com/search?q=rust", None),
+        })
+    }
+
+    fn results_json(n: usize) -> serde_json::Value {
+        let items: Vec<_> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "title": format!("Result {i}"),
+                    "url": format!("https://example.com/{i}"),
+                    "description": format!("Description {i}"),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(items)
+    }
+
+    #[tokio::test]
+    async fn should_return_err_when_query_is_empty() {
+        let driver = FakeBrowserDriver::new();
+
+        let err = browser_web_search(&driver, input("", None))
+            .await
+            .expect_err("empty query should be rejected");
+
+        assert_eq!(err, "query must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_return_shaped_results_when_search_succeeds() {
+        let driver = FakeBrowserDriver::new()
+            .with_navigate(navigated("sess-1"))
+            .with_evaluate(Ok(results_json(3)))
+            .with_close_session(Ok(()));
+
+        let output = browser_web_search(&driver, input("rust tokio", None))
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(output.results.len(), 3);
+        assert_eq!(output.results[0].title, "Result 0");
+        assert_eq!(output.results[0].url, "https://example.com/0");
+        assert_eq!(output.results[0].description, "Description 0");
+        assert_eq!(
+            driver.calls.borrow().as_slice(),
+            &["navigate", "evaluate", "close_session"]
+        );
+    }
+
+    #[tokio::test]
+    async fn should_clamp_count_to_20_when_input_count_exceeds_max() {
+        let driver = FakeBrowserDriver::new()
+            .with_navigate(navigated("sess-1"))
+            .with_evaluate(Ok(results_json(30)))
+            .with_close_session(Ok(()));
+
+        let output = browser_web_search(&driver, input("rust", Some(99)))
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(output.results.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn should_default_count_to_10_when_input_count_is_zero_or_omitted() {
+        let driver = FakeBrowserDriver::new()
+            .with_navigate(navigated("sess-1"))
+            .with_evaluate(Ok(results_json(30)))
+            .with_close_session(Ok(()));
+
+        let output = browser_web_search(&driver, input("rust", Some(0)))
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(output.results.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn should_propagate_navigate_error_without_calling_close_session() {
+        let driver =
+            FakeBrowserDriver::new().with_navigate(Err(PortError::Other("boom".to_string())));
+
+        let err = browser_web_search(&driver, input("rust", None))
+            .await
+            .expect_err("navigate failure should surface as an error");
+
+        assert!(err.contains("boom"), "unexpected message: {err}");
+        assert_eq!(driver.calls.borrow().as_slice(), &["navigate"]);
+    }
+
+    #[tokio::test]
+    async fn should_close_session_and_propagate_error_when_evaluate_fails() {
+        let driver = FakeBrowserDriver::new()
+            .with_navigate(navigated("sess-1"))
+            .with_evaluate(Err(PortError::Timeout))
+            .with_close_session(Ok(()));
+
+        let err = browser_web_search(&driver, input("rust", None))
+            .await
+            .expect_err("evaluate failure should surface as an error");
+
+        assert!(err.contains("timed out"), "unexpected message: {err}");
+        assert_eq!(
+            driver.calls.borrow().as_slice(),
+            &["navigate", "evaluate", "close_session"],
+            "the per-search session must still be closed even when evaluate fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_err_when_evaluate_result_has_unexpected_shape() {
+        let driver = FakeBrowserDriver::new()
+            .with_navigate(navigated("sess-1"))
+            .with_evaluate(Ok(serde_json::json!({"not": "an array"})))
+            .with_close_session(Ok(()));
+
+        let err = browser_web_search(&driver, input("rust", None))
+            .await
+            .expect_err("malformed result shape should surface as an error");
+
+        assert!(
+            err.contains("unexpected result shape"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_results_when_no_matches_found() {
+        let driver = FakeBrowserDriver::new()
+            .with_navigate(navigated("sess-1"))
+            .with_evaluate(Ok(results_json(0)))
+            .with_close_session(Ok(()));
+
+        let output = browser_web_search(&driver, input("asdkjaslkdjaslkdj", None))
+            .await
+            .expect("empty results should still be a success");
+
+        assert!(output.results.is_empty());
+    }
 }

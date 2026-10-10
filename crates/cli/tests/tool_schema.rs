@@ -27,7 +27,7 @@ use rmcp::handler::server::common::schema_for_input;
 use rmcp::model::JsonObject;
 
 use stapler_mcp_core::schema::{
-    BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
+    BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
     BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
     BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
@@ -165,6 +165,10 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
         (
             "stapler_daemon_status",
             schema_for_input::<DaemonStatusInput>().expect("DaemonStatusInput schemars schema"),
+        ),
+        (
+            "browser_web_search",
+            schema_for_input::<BraveSearchInput>().expect("BraveSearchInput schemars schema"),
         ),
     ];
 

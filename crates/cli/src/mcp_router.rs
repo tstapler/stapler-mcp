@@ -109,6 +109,26 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     }
 
     #[tool(
+        name = "browser_web_search",
+        description = "Keyless fallback for brave_web_search: renders a Bing search results page in a throwaway browser session and scrapes the organic results. Same input/output shape as brave_web_search. Opens and closes exactly one session per call."
+    )]
+    async fn browser_web_search(
+        &self,
+        params: Parameters<BraveSearchInput>,
+    ) -> Result<Json<BraveSearchOutput>, String> {
+        let result = self
+            .transport
+            .call(
+                "browser_web_search",
+                serde_json::to_value(params.0).map_err(|e| e.to_string())?,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| e.to_string())
+            .map(Json)
+    }
+
+    #[tool(
         name = "read_website",
         description = "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon. Once the combined Markdown across all pages returned passes ~60,000 characters (tunable via maxInlineChars, or force it for every page with alwaysSaveToFile), further pages come back as a short preview plus savedPath instead — use read_saved_page to search or page through the full content."
     )]

@@ -460,6 +460,17 @@ async fn run_daemon() {
         }),
     );
 
+    daemon.register(
+        "browser_web_search",
+        json_handler({
+            let browser = browser.clone();
+            move |input: BraveSearchInput| {
+                let browser = browser.clone();
+                async move { search::browser_web_search(&*browser, input).await }
+            }
+        }),
+    );
+
     let cache_dir = paths::cache_dir(&env);
     // Only ever set by this crate's own integration tests, to let the
     // crawler reach a `127.0.0.1` mock server — see `NetworkPolicy`'s doc
