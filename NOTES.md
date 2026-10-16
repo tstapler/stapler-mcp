@@ -244,6 +244,26 @@ Re-run immediately after to confirm reproducibility (different ephemeral
 port/tempdir each run, same shape): 5 processes/122368 KB before, 0
 additional processes/45480 KB after.
 
+### Release profile tuning (issue #37) — binary size
+
+`stapler-mcp` is still one binary serving both the per-session thin client
+and the shared daemon, so `[profile.release]` in the workspace `Cargo.toml`
+only picks the two tunings that help both roles with no runtime-speed
+tradeoff — `strip = true`, `lto = "fat"`, `codegen-units = 1` — and
+deliberately skips `opt-level = "z"` (also proposed in the issue), which
+would trade away the daemon's embedding/search/browser hot-path performance
+for a size win that only benefits the thin client. Splitting the thin
+client into its own crate/binary (the issue's higher-value, higher-risk
+proposal, which would also let the thin-client build opt out of
+`stapler-mcp-native`'s `chromiumoxide`/`fastembed` deps and justify
+`opt-level = "z"` for that target alone) remains open.
+
+Measured (`cargo build --release -p stapler-mcp`, this machine,
+2026-10-16): 65548304 bytes (unstripped) before, 45608776 bytes (stripped)
+after — a 30.4% reduction. Release build time rose from 2m43s to 6m27s
+(fat LTO + one codegen unit); CI is unaffected since `.github/workflows/
+ci.yml` only runs `cargo build --workspace` (debug, no `--release`).
+
 ## Deferred
 
 One item below is narrow enough that it's tracked as a GitHub issue rather

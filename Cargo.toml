@@ -6,3 +6,14 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+# `stapler-mcp` is a single binary serving both the per-session thin client
+# and the shared daemon (#38 hasn't split them), so this profile has to suit
+# both roles — no `opt-level = "z"`, which would trade away the daemon's
+# embedding/search/browser hot-path performance for a size win that only
+# benefits the thin client. `strip` + `lto` + one codegen unit shrink the
+# binary without that tradeoff. See issue #37.
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
