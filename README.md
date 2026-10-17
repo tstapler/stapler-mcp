@@ -249,6 +249,34 @@ Verify whether persistence is actually active — without reading
 stapler-mcp --status
 ```
 
+### Selectable tool profiles
+
+By default every tool above is registered on every connection — a session
+that only ever calls `read_website` still pays the `tools/list`
+context cost of the full browser-automation and docs-index surface. Set
+`STAPLER_MCP_TOOL_PROFILE` to a comma-separated list of categories, in the
+**client's** environment (it's read by the thin stdio/HTTP client, not the
+daemon), to narrow what that session sees and can call:
+
+```bash
+STAPLER_MCP_TOOL_PROFILE=web,docs stapler-mcp
+```
+
+| Category | Tools |
+|---|---|
+| `web` | `fetch_page`, `brave_web_search`, `browser_web_search`, `read_website`, `read_saved_page`, `download_website` |
+| `browser-core` | `stapler_browser_navigate`, `click`, `type`, `snapshot`, `close_session`, `close_all_sessions`, `list_sessions`, `tabs` |
+| `browser-advanced` | `stapler_browser_type_secret`, `hover`, `select_option`, `press_key`, `wait_for`, `screenshot`, `pdf`, `evaluate`, `get_html`, `fill_form`, `set_checked`, `history`, `resize`, `find` |
+| `docs` | `stapler_index_docs`, `search_docs`, `list_indexed_sources`, `remove_indexed_source` |
+| `daemon` | `stapler_daemon_status` |
+
+Leaving the variable unset, empty, or set to `all` keeps today's behavior
+(every tool registered). An unknown category token is logged and ignored; if
+every token in a non-empty value is unknown, the whole thing falls back to
+`all` rather than silently disabling every tool. A disabled tool is hidden
+from `tools/list` and rejected by `tools/call` with the standard "tool not
+found" error, not merely undocumented.
+
 ## Deferred
 
 See [`NOTES.md`](./NOTES.md) for the full log. Wiring wasm/npm packaging
