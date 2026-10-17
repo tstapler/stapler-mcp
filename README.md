@@ -254,20 +254,29 @@ stapler-mcp --status
 By default every tool above is registered on every connection — a session
 that only ever calls `read_website` still pays the `tools/list`
 context cost of the full browser-automation and docs-index surface. Set
-`STAPLER_MCP_TOOL_PROFILE` to a comma-separated list of categories, in the
-**client's** environment (it's read by the thin stdio/HTTP client, not the
-daemon), to narrow what that session sees and can call:
+`STAPLER_MCP_TOOL_PROFILE` to a comma-separated list of categories to narrow
+what a session sees and can call:
 
 ```bash
 STAPLER_MCP_TOOL_PROFILE=web,docs stapler-mcp
 ```
 
+Where to set it depends on the transport. For **stdio**, the profile is
+per-session: each thin-client process reads its own environment, so
+different Claude Code sessions can run different profiles. For **HTTP**,
+`McpRouter::with_transport` builds a fresh router per HTTP session, but it
+reads the env var from the long-lived `--daemon` process's own environment —
+fixed once at daemon startup and identical for every HTTP session and bearer
+token holder. Set it in the **daemon's** launch environment for HTTP, not an
+individual HTTP client's; there's no way to give two HTTP callers of the
+same daemon different profiles.
+
 | Category | Tools |
 |---|---|
 | `web` | `fetch_page`, `brave_web_search`, `browser_web_search`, `read_website`, `read_saved_page`, `download_website` |
-| `browser-core` | `stapler_browser_navigate`, `click`, `type`, `snapshot`, `close_session`, `close_all_sessions`, `list_sessions`, `tabs` |
-| `browser-advanced` | `stapler_browser_type_secret`, `hover`, `select_option`, `press_key`, `wait_for`, `screenshot`, `pdf`, `evaluate`, `get_html`, `fill_form`, `set_checked`, `history`, `resize`, `find` |
-| `docs` | `stapler_index_docs`, `search_docs`, `list_indexed_sources`, `remove_indexed_source` |
+| `browser-core` | `stapler_browser_navigate`, `stapler_browser_click`, `stapler_browser_type`, `stapler_browser_snapshot`, `stapler_browser_close_session`, `stapler_browser_close_all_sessions`, `stapler_browser_list_sessions`, `stapler_browser_tabs` |
+| `browser-advanced` | `stapler_browser_type_secret`, `stapler_browser_hover`, `stapler_browser_select_option`, `stapler_browser_press_key`, `stapler_browser_wait_for`, `stapler_browser_screenshot`, `stapler_browser_pdf`, `stapler_browser_evaluate`, `stapler_browser_get_html`, `stapler_browser_fill_form`, `stapler_browser_set_checked`, `stapler_browser_history`, `stapler_browser_resize`, `stapler_browser_find` |
+| `docs` | `stapler_index_docs`, `stapler_search_docs`, `stapler_list_indexed_sources`, `stapler_remove_indexed_source` |
 | `daemon` | `stapler_daemon_status` |
 
 Leaving the variable unset, empty, or set to `all` keeps today's behavior
@@ -276,6 +285,13 @@ every token in a non-empty value is unknown, the whole thing falls back to
 `all` rather than silently disabling every tool. A disabled tool is hidden
 from `tools/list` and rejected by `tools/call` with the standard "tool not
 found" error, not merely undocumented.
+
+This is a context-size optimization, not a security control. It only
+changes which tools this one router instance exposes — it does nothing to
+stop another process, session, or (on HTTP) another holder of the same
+bearer token from invoking the full tool set against the same shared
+daemon, which has no per-caller authorization model. Don't rely on a
+profile to contain an untrusted or compromised caller.
 
 ## Deferred
 

@@ -29,8 +29,9 @@ use stapler_mcp_core::schema::{
 /// `STAPLER_MCP_TOOL_PROFILE` (issue #18): a comma-separated list of
 /// categories below, narrowing which tools a session's `tools/list` and
 /// `tools/call` expose — unset, empty, or `all` keeps today's behavior
-/// (every tool registered), matching this repo's existing opt-in-env-var
-/// convention (`STAPLER_MCP_BROWSER_PROFILE_DIR`, `STAPLER_MCP_HTTP_PORT`).
+/// (every tool registered). Read via raw `std::env::var`, following
+/// `STAPLER_MCP_HTTP_PORT`'s precedent (`main.rs`'s `run_daemon()`) rather
+/// than the `EnvPort`-trait convention `STAPLER_MCP_BROWSER_PROFILE_DIR` uses.
 const ENV_TOOL_PROFILE: &str = "STAPLER_MCP_TOOL_PROFILE";
 
 /// Every registered tool name, grouped by category. A tool must appear in
@@ -92,13 +93,10 @@ const TOOL_CATEGORIES: &[(&str, &[&str])] = &[
     ("daemon", &["stapler_daemon_status"]),
 ];
 
-/// Resolves `STAPLER_MCP_TOOL_PROFILE`'s raw value into the tool names to
-/// hide: `None`/empty/`all` (case-insensitive) disables nothing. An unknown
-/// category token is warned about and skipped rather than rejected outright
-/// — matching `paths::browser_profile_dir`'s fail-soft posture. If every
-/// token in a non-empty spec turns out unknown, that's indistinguishable
-/// from a typo'd env var locking a session out of every tool, so this falls
-/// back to "all" (no filtering) rather than disabling everything.
+/// Resolves `STAPLER_MCP_TOOL_PROFILE` into tool names to hide. `None`,
+/// empty, or `all` (case-insensitive) disables nothing. An unknown token is
+/// warned and skipped; if every token is unknown, falls back to "all" rather
+/// than disabling everything (a typo'd env var shouldn't lock out every tool).
 fn tools_outside_profile(spec: Option<&str>) -> Vec<&'static str> {
     let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return Vec::new();
@@ -135,14 +133,16 @@ fn tools_outside_profile(spec: Option<&str>) -> Vec<&'static str> {
         .collect()
 }
 
-/// Disables every tool `STAPLER_MCP_TOOL_PROFILE` excludes on `router` —
-/// shared by `McpRouter::new()` and `::with_transport()` so both the stdio
-/// and per-HTTP-session construction paths respect the same env var.
+/// Disables every tool `spec` excludes (see `tools_outside_profile`) on
+/// `router` — shared by `McpRouter::new()` and `::with_transport()` so both
+/// the stdio and per-HTTP-session construction paths respect the same
+/// profile. Takes the resolved spec rather than reading the env var itself,
+/// so tests can inject a value without mutating process-global state.
 fn apply_tool_profile<S: Send + Sync + 'static>(
     router: &mut rmcp::handler::server::router::tool::ToolRouter<S>,
+    spec: Option<&str>,
 ) {
-    let profile = std::env::var(ENV_TOOL_PROFILE).ok();
-    for name in tools_outside_profile(profile.as_deref()) {
+    for name in tools_outside_profile(spec) {
         router.disable_route(name);
     }
 }
@@ -161,7 +161,10 @@ pub struct McpRouter<T: DaemonTransport = SocketTransport> {
 impl McpRouter<SocketTransport> {
     pub fn new() -> Self {
         let mut tool_router = Self::tool_router();
-        apply_tool_profile(&mut tool_router);
+        apply_tool_profile(
+            &mut tool_router,
+            std::env::var(ENV_TOOL_PROFILE).ok().as_deref(),
+        );
         Self {
             transport: SocketTransport,
             tool_router,
@@ -185,7 +188,10 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     #[allow(dead_code)]
     pub fn with_transport(transport: T) -> Self {
         let mut tool_router = Self::tool_router();
-        apply_tool_profile(&mut tool_router);
+        apply_tool_profile(
+            &mut tool_router,
+            std::env::var(ENV_TOOL_PROFILE).ok().as_deref(),
+        );
         Self {
             transport,
             tool_router,
@@ -903,12 +909,10 @@ impl<T: DaemonTransport + Send + Sync + 'static> ServerHandler for McpRouter<T> 
 mod tool_profile_tests {
     use super::*;
 
-    /// Every real `#[tool(name = "...")]` above must appear in exactly one
-    /// `TOOL_CATEGORIES` group — a name missing here would silently never be
-    /// disabled by any profile, and a duplicate would mean two categories
-    /// fight over the same tool. `registered_tools()` is the full, real
-    /// catalog, so diffing against it (rather than hand-maintaining a second
-    /// expected list) catches drift the moment a tool is added or renamed.
+    /// Every `#[tool]` name above must appear in exactly one `TOOL_CATEGORIES`
+    /// group, diffed against the real `registered_tools()` catalog so a
+    /// missing or duplicated entry is caught the moment a tool is added or
+    /// renamed.
     #[test]
     fn tool_categories_should_cover_every_registered_tool_exactly_once() {
         let tools = McpRouter::<SocketTransport>::registered_tools();
@@ -950,21 +954,30 @@ mod tool_profile_tests {
 
     #[test]
     fn tools_outside_profile_should_keep_only_requested_categories_when_web_given() {
-        let disabled = tools_outside_profile(Some("web"));
+        let expected: HashSet<&str> = TOOL_CATEGORIES
+            .iter()
+            .filter(|(category, _)| *category != "web")
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
 
-        assert!(!disabled.contains(&"fetch_page"));
-        assert!(disabled.contains(&"stapler_browser_navigate"));
-        assert!(disabled.contains(&"stapler_index_docs"));
-        assert!(disabled.contains(&"stapler_daemon_status"));
+        let disabled: HashSet<&str> = tools_outside_profile(Some("web")).into_iter().collect();
+
+        assert_eq!(disabled, expected);
     }
 
     #[test]
     fn tools_outside_profile_should_union_multiple_categories_when_comma_separated() {
-        let disabled = tools_outside_profile(Some("web, docs"));
+        let expected: HashSet<&str> = TOOL_CATEGORIES
+            .iter()
+            .filter(|(category, _)| *category != "web" && *category != "docs")
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
 
-        assert!(!disabled.contains(&"fetch_page"));
-        assert!(!disabled.contains(&"stapler_index_docs"));
-        assert!(disabled.contains(&"stapler_browser_navigate"));
+        let disabled: HashSet<&str> = tools_outside_profile(Some("web, docs"))
+            .into_iter()
+            .collect();
+
+        assert_eq!(disabled, expected);
     }
 
     #[test]
@@ -978,5 +991,24 @@ mod tool_profile_tests {
     #[test]
     fn tools_outside_profile_should_fall_back_to_all_when_every_token_is_unknown() {
         assert!(tools_outside_profile(Some("not-a-real-category")).is_empty());
+    }
+
+    #[test]
+    fn apply_tool_profile_should_hide_profiled_out_tools_from_list_all_when_profile_given() {
+        let mut router = McpRouter::<SocketTransport>::tool_router();
+        apply_tool_profile(&mut router, Some("web"));
+
+        let tools = router.list_all();
+        let names: HashSet<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(names.contains("fetch_page"));
+        assert!(!names.contains("stapler_browser_navigate"));
+    }
+
+    #[test]
+    fn apply_tool_profile_should_keep_every_tool_when_spec_is_none() {
+        let mut router = McpRouter::<SocketTransport>::tool_router();
+        let before = router.list_all().len();
+        apply_tool_profile(&mut router, None);
+        assert_eq!(router.list_all().len(), before);
     }
 }
