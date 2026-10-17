@@ -33,6 +33,7 @@ pub(crate) struct FakeBrowserDriver {
     press_key_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
     wait_for_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
     screenshot_result: RefCell<Option<Result<Vec<u8>, PortError>>>,
+    pdf_result: RefCell<Option<Result<Vec<u8>, PortError>>>,
     evaluate_result: RefCell<Option<Result<serde_json::Value, PortError>>>,
     /// Records the `(function, locator)` args each `evaluate()` call
     /// actually received, so tests can verify which branch a caller (e.g.
@@ -70,6 +71,7 @@ impl FakeBrowserDriver {
             press_key_result: RefCell::new(None),
             wait_for_result: RefCell::new(None),
             screenshot_result: RefCell::new(None),
+            pdf_result: RefCell::new(None),
             evaluate_result: RefCell::new(None),
             evaluate_calls: RefCell::new(Vec::new()),
             history_result: RefCell::new(None),
@@ -148,6 +150,11 @@ impl FakeBrowserDriver {
 
     pub(crate) fn with_screenshot(self, result: Result<Vec<u8>, PortError>) -> Self {
         *self.screenshot_result.borrow_mut() = Some(result);
+        self
+    }
+
+    pub(crate) fn with_pdf(self, result: Result<Vec<u8>, PortError>) -> Self {
+        *self.pdf_result.borrow_mut() = Some(result);
         self
     }
 
@@ -415,6 +422,14 @@ impl BrowserDriver for FakeBrowserDriver {
             .borrow_mut()
             .take()
             .expect("screenshot result not configured")
+    }
+
+    async fn pdf(&self, _session_id: &SessionId, _timeout: Duration) -> Result<Vec<u8>, PortError> {
+        self.calls.borrow_mut().push("pdf");
+        self.pdf_result
+            .borrow_mut()
+            .take()
+            .expect("pdf result not configured")
     }
 
     async fn evaluate(
