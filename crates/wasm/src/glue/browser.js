@@ -385,6 +385,16 @@ function refLocator(page, refId) {
 }
 module.exports.refLocator = refLocator;
 
+// Shared by every ref-dispatched action that can itself cause navigation
+// (click/type/type_secret): records the pre-dispatch URL on the snapshot
+// only when this specific call's dispatch actually changed it — never
+// conflated with the unrelated SSRF-`blocked` signal.
+function applyNavigatedFrom(snapshot, urlBefore, urlAfter) {
+    if (urlAfter !== urlBefore) {
+        snapshot.navigatedFrom = urlBefore;
+    }
+}
+
 function requireLiveSession(sessionId) {
     const session = requireSession(sessionId);
     evictIfCrashed(session, sessionId);
@@ -466,9 +476,104 @@ function capSnapshotNodes(root, maxNodes) {
 }
 module.exports.capSnapshotNodes = capSnapshotNodes;
 
+// ---------------------------------------------------------------------------
+// Structural snapshot redaction (Epic 2.3): Playwright's `ariaSnapshot()`
+// text carries no `type`/`autocomplete` attribute at all, so redaction
+// parity with native (`crates/core/src/ports.rs`'s `AxNode.value` doc
+// comment states the shared key) requires a second, per-ref probe of the
+// live DOM, merged into the tree `parseAriaSnapshot` already built.
+
+// Same fixed, non-length-preserving sentinel as native's
+// `REDACTED_PLACEHOLDER` (`crates/core/src/ports.rs`) — duplicated here
+// because JS glue can't import a Rust const, the same reason `isBlockedHost`
+// above duplicates `webcrawl.rs`'s SSRF logic instead of calling into it.
+const REDACTED_PLACEHOLDER = "[REDACTED]";
+module.exports.REDACTED_PLACEHOLDER = REDACTED_PLACEHOLDER;
+
+// Role(s) `ariaSnapshot()` emits for a bare `<input>`/`<textarea>` — the
+// fail-safe half of the redaction rule below only applies to nodes that look
+// like a form control in the first place; a button or generic container with
+// no live-DOM entry is not a secret-shaped node and must not be redacted.
+// Must stay in lockstep with native's `is_form_control_role`
+// (`crates/native/src/ax.rs`) — a password/OTP field Chromium assigns
+// `searchbox`/`combobox` (rather than `textbox`) needs the same redaction
+// coverage on both adapters (A2 code review fix).
+const FORM_CONTROL_ROLES = new Set(["textbox", "searchbox", "combobox"]);
+
+// Live-DOM collection pass (Task 2.3.1a/2.3.2a): resolves each form-control
+// node already present in the parsed snapshot tree back to its live element
+// via `refLocator` — the same `aria-ref=` locator every other ref-targeted
+// action (click/type/type_secret) already uses — rather than a raw
+// `el.getAttribute("aria-ref")` DOM read. That attribute read was the actual
+// bug: Playwright's `aria-ref=` engine resolves purely through an internal
+// per-page snapshot map (`_createAriaRefEngine`) and never writes `aria-ref`
+// as a real DOM attribute, so `getAttribute` always returned `null` against
+// a real browser — every textbox fell into the fail-safe and got redacted
+// unconditionally. An open shadow root's contents resolve correctly here for
+// free, because `ariaSnapshot()`/`aria-ref=` already cross open shadow
+// boundaries when building the ref-annotated tree; a closed shadow root's
+// contents never appear as nodes in `root` at all, so there is nothing here
+// to collect a ref for.
+function collectRedactionInfo(page, root) {
+    const refs = [];
+    (function walk(node) {
+        if (FORM_CONTROL_ROLES.has(node.role) && node.ref) {
+            refs.push(node.ref);
+        }
+        for (const child of node.children) {
+            walk(child);
+        }
+    })(root);
+
+    return Promise.all(
+        refs.map((ref) =>
+            refLocator(page, ref)
+                .evaluate((el) => ({ type: el.type || "", autocomplete: el.autocomplete || "" }))
+                .then((shape) => ({ ref, redact: isSecretShapedField(shape.type, shape.autocomplete) }))
+                // Fail-safe: a ref that can't be resolved (element removed
+                // between snapshot and probe, or a closed shadow root hid
+                // it) must redact, never silently drop — same "can't confirm
+                // it's safe" rule `mergeRedactionInfo` applies below, and
+                // .catch() here keeps one failing lookup from rejecting the
+                // whole Promise.all.
+                .catch(() => ({ ref, redact: true })),
+        ),
+    );
+}
+module.exports.collectRedactionInfo = collectRedactionInfo;
+
+// Merges `collectRedactionInfo`'s live-DOM pass into the tree
+// `parseAriaSnapshot` already built (Task 2.3.1b): substitutes
+// `REDACTED_PLACEHOLDER` for any node whose `ref` matches a `redact: true`
+// entry, and — the fail-safe half of the same rule, matching native's
+// `AxNode.value` doc comment — for any form-control-looking node with no
+// matching entry at all (removed between the two passes, or hidden behind a
+// closed shadow root the live-DOM pass couldn't see into: "can't confirm
+// it's safe" redacts rather than leaking).
+function mergeRedactionInfo(root, redactionInfo) {
+    const byRef = new Map();
+    for (const info of redactionInfo) {
+        if (info.ref) {
+            byRef.set(info.ref, info.redact);
+        }
+    }
+    function visit(node) {
+        if (FORM_CONTROL_ROLES.has(node.role) && byRef.get(node.ref) !== false) {
+            node.value = REDACTED_PLACEHOLDER;
+        }
+        for (const child of node.children) {
+            visit(child);
+        }
+    }
+    visit(root);
+}
+module.exports.mergeRedactionInfo = mergeRedactionInfo;
+
 async function captureSnapshot(page) {
     const text = await page.ariaSnapshot();
     const root = parseAriaSnapshot(text);
+    const redactionInfo = await collectRedactionInfo(page, root);
+    mergeRedactionInfo(root, redactionInfo);
     const truncated = capSnapshotNodes(root, MAX_SNAPSHOT_NODES);
     return { root, url: page.url(), truncated };
 }
@@ -566,10 +671,7 @@ module.exports.jsBrowserClick = async function (sessionId, refId, timeoutMs) {
         await waitForBlockedGracePeriod(session);
         checkBlocked(session);
         const snapshot = await captureSnapshot(session.page);
-        const urlAfter = session.page.url();
-        if (urlAfter !== urlBefore) {
-            snapshot.navigatedFrom = urlBefore;
-        }
+        applyNavigatedFrom(snapshot, urlBefore, session.page.url());
         return snapshot;
     });
 };
@@ -588,10 +690,114 @@ module.exports.jsBrowserType = async function (sessionId, refId, text, timeoutMs
         await waitForBlockedGracePeriod(session);
         checkBlocked(session);
         const snapshot = await captureSnapshot(session.page);
-        const urlAfter = session.page.url();
-        if (urlAfter !== urlBefore) {
-            snapshot.navigatedFrom = urlBefore;
+        applyNavigatedFrom(snapshot, urlBefore, session.page.url());
+        return snapshot;
+    });
+};
+
+// ---------------------------------------------------------------------------
+// Epic 4.3: `type_secret` dispatch support. `jsBrowserCurrentUrl` (Task
+// 4.3.3a) is called by `WasmBrowser::type_secret`
+// (`crates/wasm/src/browser.rs`) *before* it ever resolves a credential, so
+// the domain check runs against a freshly-queried URL rather than a stale
+// one — closing the same same-call-redirect staleness class `6b6b56a`
+// already fixed for the SSRF guard. `jsBrowserTypeSecret` (Task 4.3.2a)
+// performs the actual DOM write once the caller has already resolved and
+// domain-checked the secret; it does no domain checking of its own.
+
+// No `runSerialized` here, unlike every mutating export below: reading
+// `page.url()` is a synchronous property access on Playwright's `Page`
+// object (no CDP round trip), and queueing it behind other in-flight calls
+// on this session would defeat the whole point of querying it *fresh* right
+// before the domain check — a queued read could return a page state older
+// than the moment `WasmBrowser::type_secret` actually asked for it.
+module.exports.jsBrowserCurrentUrl = async function (sessionId) {
+    const session = requireLiveSession(sessionId);
+    return session.page.url();
+};
+
+// The shared password/TOTP predicate: `type === "password"` or
+// `autocomplete` one of the TOTP/password values. `collectRedactionInfo`'s
+// structural redaction pass and this dispatch-time re-check both call it
+// directly on plain `{type, autocomplete}` values already extracted from a
+// live DOM node, not the node itself.
+function isSecretShapedField(nodeType, autocomplete) {
+    return (
+        nodeType === "password" ||
+        ["one-time-code", "current-password", "new-password"].includes(autocomplete)
+    );
+}
+module.exports.isSecretShapedField = isSecretShapedField;
+
+// `ux.md` §4 example-5's verbatim refusal template, mirroring native's
+// `secret_field_shape_refusal` (`crates/native/src/browser.rs`). `role` is
+// hardcoded to `"textbox"` rather than looked up from a fresh AX snapshot:
+// every node `FORM_CONTROL_ROLES`/structural redaction ever considers
+// secret-shaped is an `<input>`/`<textarea>`, which `parseAriaSnapshot`
+// always assigns the `textbox` role.
+function secretFieldShapeRefusal(refId) {
+    return `type_secret refused: ref "${refId}" resolves to a plain text field (role=textbox, no protected/password state), not a password or TOTP input — use stapler_browser_type for non-secret fields, or re-snapshot if this field should be a password field.`;
+}
+module.exports.secretFieldShapeRefusal = secretFieldShapeRefusal;
+
+// Task 4.3.2c: unconditionally redacts `type_secret`'s own acted-on node in
+// its returned snapshot, independent of whatever `mergeRedactionInfo`
+// already decided for it — belt-and-suspenders for a field shape the
+// structural pass doesn't happen to catch (`architecture.md` §6), mirroring
+// native's `redact_node_by_ref`. `ref` strings are unique within one
+// snapshot, so this stops at the first match.
+function forceRedactByRef(node, refId) {
+    if (node.ref === refId) {
+        node.value = REDACTED_PLACEHOLDER;
+        return true;
+    }
+    return node.children.some((child) => forceRedactByRef(child, refId));
+}
+module.exports.forceRedactByRef = forceRedactByRef;
+
+// Task 4.3.2a/4.3.2b: reuses `refLocator`/`locator.fill()`'s atomic write
+// exactly like `jsBrowserType`, with two additions: a dispatch-time re-check
+// of the resolved node's live `type`/`autocomplete` immediately before the
+// fill (Task 4.3.2b — as close to the write as possible, mirroring native's
+// ordering rationale), and unconditional own-node redaction after (Task
+// 4.3.2c). `secretValue` crosses the wasm boundary as a plain JS string
+// immediately before this call and is never stored on `session` or logged —
+// `WasmBrowser::type_secret` (`crates/wasm/src/browser.rs`) is responsible
+// for resolving it (and checking the domain, Task 4.3.3a) before ever
+// calling this function; this function itself does no domain checking.
+module.exports.jsBrowserTypeSecret = async function (sessionId, refId, secretValue, timeoutMs) {
+    const session = requireLiveSession(sessionId);
+    return runSerialized(session, async () => {
+        const urlBefore = session.page.url();
+        const locator = refLocator(session.page, refId);
+
+        let shape;
+        try {
+            shape = await locator.evaluate(
+                (el) => ({
+                    type: el.type || "",
+                    autocomplete: el.autocomplete || "",
+                }),
+                { timeout: timeoutMs },
+            );
+        } catch (e) {
+            throw describeActionError(refId, e);
         }
+        if (!isSecretShapedField(shape.type, shape.autocomplete)) {
+            throw new Error(secretFieldShapeRefusal(refId));
+        }
+
+        try {
+            await locator.fill(secretValue, { timeout: timeoutMs });
+        } catch (e) {
+            throw describeActionError(refId, e);
+        }
+        // Same SSRF-race fix as `jsBrowserType`/`jsBrowserClick`.
+        await waitForBlockedGracePeriod(session);
+        checkBlocked(session);
+        const snapshot = await captureSnapshot(session.page);
+        forceRedactByRef(snapshot.root, refId);
+        applyNavigatedFrom(snapshot, urlBefore, session.page.url());
         return snapshot;
     });
 };

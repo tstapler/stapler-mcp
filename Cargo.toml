@@ -6,3 +6,11 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+# No `opt-level = "z"`: `stapler-mcp` still shares one binary between the
+# daemon and the thin client, and that would cost the daemon's hot paths.
+# See issue #37 / NOTES.md.
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,27 @@
+# Template for ~/.config/systemd/user/stapler-mcp.service — runs the
+# stapler-mcp daemon as a persistent, auto-restarting user service (Unix
+# socket + optional Streamable HTTP transport on STAPLER_MCP_HTTP_PORT).
+#
+# Setup:
+#   1. cargo install --path crates/cli  # or: cargo install stapler-mcp, once published
+#   2. Copy this file to ~/.config/systemd/user/stapler-mcp.service
+#   3. systemctl --user daemon-reload && systemctl --user enable --now stapler-mcp
+#   4. stapler-mcp --status
+#      daemon: running (pid ...)
+#      http: listening on 127.0.0.1:47439
+
+[Unit]
+Description=stapler-mcp daemon (shared MCP backend, HTTP + Unix socket)
+After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+Environment=STAPLER_MCP_HTTP_PORT=47439
+ExecStart=%h/.cargo/bin/stapler-mcp --daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

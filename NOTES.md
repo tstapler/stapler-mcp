@@ -208,6 +208,62 @@ than failing the whole capture. Verified against real Chrome in
 `crates/cli/tests/browser_session.rs`'s
 `snapshot_should_include_iframe_content_when_same_origin_iframe_present`.
 
+### MCP Streamable HTTP transport on the daemon (issue #38) — process-count/RSS confirmation
+
+Added a Streamable HTTP transport (`crates/cli/src/http_server.rs` +
+`transport.rs`, bearer-token auth) so the daemon can serve tool calls
+directly over `http://127.0.0.1:<port>/mcp`, alongside the existing
+Unix-socket/stdio thin-client path — see
+`project_plans/mcp-streamable-http/` for the full requirements/plan.
+`plan.md` Story 9.1.2 calls for confirming the actual outcome metric (issue
+#37: process count, not per-process size) with a `pstree`/`ps` before/after
+capture. Real Claude Code sessions weren't available inside this sandbox, so
+`scripts/measure-process-count.sh` reproduces the same underlying mechanism
+instead — N `stapler-mcp` stdio thin-client processes (the literal binary
+Claude Code spawns per session, each with stdin held open on a FIFO like a
+real session) vs. N concurrent callers over the HTTP transport against the
+same daemon, in a fully isolated `STAPLER_MCP_HOME`. It exits non-zero
+instead of printing anything if it can't actually measure (daemon didn't
+start, a thin-client process didn't show up, an HTTP call failed).
+
+Run 2026-09-15 (`./scripts/measure-process-count.sh 5`), verbatim output:
+
+```
+=== starting daemon (HTTP on 127.0.0.1:51697, STAPLER_MCP_HOME=/tmp/tmp.tX9eretG98/home) ===
+=== BEFORE: spawning 5 stdio thin-client sessions (stdin held open) ===
+BEFORE: 5 stdio thin-client process(es), combined RSS 123148 KB
+=== AFTER: 5 concurrent HTTP tools/list calls against the same daemon ===
+AFTER: 5/5 HTTP tools/list calls succeeded; 0 additional stapler-mcp process(es); daemon RSS 44876 KB
+
+=== summary ===
+before (stdio, 5 sessions): 5 process(es), 123148 KB combined
+after  (HTTP,  5 sessions): 0 additional process(es), 44876 KB (daemon only, serving all 5)
+```
+
+Re-run immediately after to confirm reproducibility (different ephemeral
+port/tempdir each run, same shape): 5 processes/122368 KB before, 0
+additional processes/45480 KB after.
+
+### Release profile tuning (issue #37) — binary size
+
+`stapler-mcp` is still one binary serving both the per-session thin client
+and the shared daemon, so `[profile.release]` in the workspace `Cargo.toml`
+only picks the two tunings that help both roles with no runtime-speed
+tradeoff — `strip = true`, `lto = "fat"`, `codegen-units = 1` — and
+deliberately skips `opt-level = "z"` (also proposed in the issue), which
+would trade away the daemon's embedding/search/browser hot-path performance
+for a size win that only benefits the thin client. Splitting the thin
+client into its own crate/binary (the issue's higher-value, higher-risk
+proposal, which would also let the thin-client build opt out of
+`stapler-mcp-native`'s `chromiumoxide`/`fastembed` deps and justify
+`opt-level = "z"` for that target alone) remains open.
+
+Measured (`cargo build --release -p stapler-mcp`, this machine,
+2026-10-16): 65548304 bytes (unstripped) before, 45608776 bytes (stripped)
+after — a 30.4% reduction. Release build time rose from 2m43s to 6m27s
+(fat LTO + one codegen unit); CI is unaffected since `.github/workflows/
+ci.yml` only runs `cargo build --workspace` (debug, no `--release`).
+
 ## Deferred
 
 One item below is narrow enough that it's tracked as a GitHub issue rather
