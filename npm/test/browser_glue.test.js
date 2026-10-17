@@ -1154,3 +1154,155 @@ test("jsBrowserResize_should_set_viewport_size_and_return_snapshot", async () =>
 
     browserGlue.sessions.delete(id);
 });
+
+// ---------------------------------------------------------------------------
+// Network capture (`jsBrowserNetworkRequests`): mirrors the native
+// `NetworkLog` rules — cap, binary skip, filter, atomic clear, blocked guard.
+
+function mockNetworkPage() {
+    const handlers = {};
+    return {
+        on: (event, fn) => { handlers[event] = fn; },
+        emit: (event, arg) => handlers[event](arg),
+    };
+}
+
+function mockExchange(url, { status = 200, contentType = "application/json", body = "{}" } = {}) {
+    const request = { url: () => url, method: () => "GET" };
+    const response = {
+        request: () => request,
+        url: () => url,
+        status: () => status,
+        headers: () => ({ "content-type": contentType }),
+        text: async () => body,
+    };
+    return { request, response };
+}
+
+test("wireNetworkCapture_should_record_status_content_type_and_body_when_response_arrives", async () => {
+    const session = {};
+    const page = mockNetworkPage();
+    browserGlue.wireNetworkCapture(session, page);
+    const { request, response } = mockExchange("https://x.test/api/data", { body: '{"ok":true}' });
+
+    page.emit("request", request);
+    await page.emit("response", response);
+
+    assert.strictEqual(session.networkEntries.length, 1);
+    const e = session.networkEntries[0];
+    assert.strictEqual(e.status, 200);
+    assert.strictEqual(e.contentType, "application/json");
+    assert.strictEqual(e.body, '{"ok":true}');
+    assert.strictEqual(e.bodyTruncated, false);
+});
+
+test("wireNetworkCapture_should_store_null_body_and_not_read_it_when_content_type_is_binary", async () => {
+    const session = {};
+    const page = mockNetworkPage();
+    browserGlue.wireNetworkCapture(session, page);
+    const { request, response } = mockExchange("https://x.test/a.png", { contentType: "image/png" });
+    let read = false;
+    response.text = async () => { read = true; return "PNG"; };
+
+    page.emit("request", request);
+    await page.emit("response", response);
+
+    assert.strictEqual(session.networkEntries[0].body, null);
+    assert.strictEqual(read, false);
+});
+
+test("wireNetworkCapture_should_truncate_body_at_cap_on_utf8_boundary", async () => {
+    const session = {};
+    const page = mockNetworkPage();
+    browserGlue.wireNetworkCapture(session, page);
+    const { request, response } = mockExchange("https://x.test/big", {
+        contentType: "text/plain",
+        body: "€".repeat(16384),
+    });
+
+    page.emit("request", request);
+    await page.emit("response", response);
+
+    const e = session.networkEntries[0];
+    assert.ok(Buffer.byteLength(e.body) <= 16384);
+    assert.strictEqual(Buffer.byteLength(e.body) % 3, 0);
+    assert.strictEqual(e.bodyTruncated, true);
+});
+
+test("wireNetworkCapture_should_stop_at_cap_and_set_truncated", async () => {
+    const session = {};
+    const page = mockNetworkPage();
+    browserGlue.wireNetworkCapture(session, page);
+
+    for (let i = 0; i < browserGlue.MAX_NETWORK_ENTRIES + 3; i++) {
+        const { request, response } = mockExchange(`https://x.test/${i}`);
+        page.emit("request", request);
+        await page.emit("response", response);
+    }
+
+    assert.strictEqual(session.networkEntries.length, browserGlue.MAX_NETWORK_ENTRIES);
+    assert.strictEqual(session.networkTruncated, true);
+});
+
+test("resetNetwork_should_empty_entries_and_drop_in_flight_responses_from_previous_page", async () => {
+    const session = {};
+    const page = mockNetworkPage();
+    browserGlue.wireNetworkCapture(session, page);
+    const old = mockExchange("https://x.test/old");
+    page.emit("request", old.request);
+
+    browserGlue.resetNetwork(session);
+    await page.emit("response", old.response);
+
+    assert.strictEqual(session.networkEntries.length, 0);
+    assert.strictEqual(session.networkTruncated, false);
+});
+
+test("jsBrowserNetworkRequests_should_filter_by_url_substring", async () => {
+    const id = "sess-net-filter";
+    const session = { page: {}, lastUsed: Date.now(), blocked: undefined };
+    const page = mockNetworkPage();
+    browserGlue.wireNetworkCapture(session, page);
+    browserGlue.sessions.set(id, session);
+    for (const url of ["https://x.test/api/data", "https://x.test/index.html"]) {
+        const { request, response } = mockExchange(url);
+        page.emit("request", request);
+        await page.emit("response", response);
+    }
+
+    const result = await browserGlue.jsBrowserNetworkRequests(id, "/api/", null, false);
+
+    assert.deepStrictEqual(result.entries.map((e) => e.url), ["https://x.test/api/data"]);
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserNetworkRequests_should_return_entries_then_empty_list_when_clear_requested", async () => {
+    const id = "sess-net-clear";
+    const session = { page: {}, lastUsed: Date.now(), blocked: undefined };
+    const page = mockNetworkPage();
+    browserGlue.wireNetworkCapture(session, page);
+    browserGlue.sessions.set(id, session);
+    const { request, response } = mockExchange("https://x.test/a");
+    page.emit("request", request);
+    await page.emit("response", response);
+
+    const first = await browserGlue.jsBrowserNetworkRequests(id, null, null, true);
+    const second = await browserGlue.jsBrowserNetworkRequests(id, null, null, false);
+
+    assert.strictEqual(first.entries.length, 1);
+    assert.strictEqual(second.entries.length, 0);
+    browserGlue.sessions.delete(id);
+});
+
+test("jsBrowserNetworkRequests_should_reject_with_blocked_message_when_session_blocked", async () => {
+    const id = "sess-net-blocked";
+    const session = { page: {}, lastUsed: Date.now(), blocked: browserGlue.blockedHostMessage(id, "169.254.169.254") };
+    browserGlue.wireNetworkCapture(session, mockNetworkPage());
+    browserGlue.sessions.set(id, session);
+
+    await assert.rejects(
+        () => browserGlue.jsBrowserNetworkRequests(id, null, null, false),
+        /blocked host/,
+    );
+    browserGlue.sessions.delete(id);
+});

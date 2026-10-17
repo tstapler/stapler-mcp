@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use stapler_mcp_core::ports::{
-    AxNode, AxSnapshot, BrowserDriver, HistoryAction, Locator, NavigateResult, PageExtract,
-    PortError, SessionId, SessionSummary, TabAction, TabInfo, TabsResult, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, HistoryAction, Locator, NavigateResult, NetworkEntry,
+    NetworkRequestsResult, PageExtract, PortError, SessionId, SessionSummary, TabAction, TabInfo,
+    TabsResult, WaitCondition,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -75,6 +76,13 @@ extern "C" {
     ) -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsBrowserHistory)]
     fn js_browser_history(session_id: &str, action: &str, timeout_ms: f64) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = jsBrowserNetworkRequests)]
+    fn js_browser_network_requests(
+        session_id: &str,
+        filter_url: Option<String>,
+        max_body_bytes: Option<u32>,
+        clear: bool,
+    ) -> js_sys::Promise;
     #[wasm_bindgen(js_name = jsBrowserResize)]
     fn js_browser_resize(
         session_id: &str,
@@ -124,6 +132,27 @@ impl From<JsAxNode> for AxNode {
             children: n.children.into_iter().map(AxNode::from).collect(),
         }
     }
+}
+
+/// Mirrors the entry shape `browser.js`'s `wireNetworkCapture` produces.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsNetworkEntry {
+    url: String,
+    method: String,
+    status: Option<u16>,
+    content_type: Option<String>,
+    body: Option<String>,
+    body_truncated: bool,
+    timing_ms: Option<u64>,
+    started_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsNetworkRequests {
+    entries: Vec<JsNetworkEntry>,
+    truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -586,6 +615,43 @@ impl BrowserDriver for WasmBrowser {
         let parsed: JsAxSnapshot =
             serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))?;
         Ok(parsed.into())
+    }
+
+    async fn network_requests(
+        &self,
+        session_id: &SessionId,
+        filter_url: Option<&str>,
+        max_body_bytes: Option<usize>,
+        clear: bool,
+    ) -> Result<NetworkRequestsResult, PortError> {
+        let result = JsFuture::from(js_browser_network_requests(
+            &session_id.0,
+            filter_url.map(String::from),
+            max_body_bytes.map(|n| n.min(u32::MAX as usize) as u32),
+            clear,
+        ))
+        .await
+        .map_err(js_reject_to_port_error)?;
+
+        let parsed: JsNetworkRequests =
+            serde_wasm_bindgen::from_value(result).map_err(|e| PortError::Other(e.to_string()))?;
+        Ok(NetworkRequestsResult {
+            entries: parsed
+                .entries
+                .into_iter()
+                .map(|e| NetworkEntry {
+                    url: e.url,
+                    method: e.method,
+                    status: e.status,
+                    content_type: e.content_type,
+                    body: e.body,
+                    body_truncated: e.body_truncated,
+                    timing_ms: e.timing_ms,
+                    started_at_ms: e.started_at_ms,
+                })
+                .collect(),
+            truncated: parsed.truncated,
+        })
     }
 
     async fn resize(

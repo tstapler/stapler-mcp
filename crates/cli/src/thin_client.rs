@@ -18,13 +18,13 @@ use stapler_mcp_core::schema::{
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
     BrowserFindInput, BrowserFindOutput, BrowserHistoryInput, BrowserHoverInput,
     BrowserListSessionsInput, BrowserListSessionsOutput, BrowserNavigateInput,
-    BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
-    BrowserScreenshotOutput, BrowserSelectOptionInput, BrowserSetCheckedInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput,
-    BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput, FetchPageInput,
-    FetchPageOutput, IndexDocsInput, IndexDocsOutput, ListIndexedSourcesInput,
-    ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput, RemoveIndexedSourceInput,
-    RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
+    BrowserNavigateOutput, BrowserNetworkRequestsInput, BrowserNetworkRequestsOutput,
+    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserScreenshotOutput,
+    BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput,
+    BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput,
+    DownloadWebsiteOutput, FetchPageInput, FetchPageOutput, IndexDocsInput, IndexDocsOutput,
+    ListIndexedSourcesInput, ListIndexedSourcesOutput, ReadWebsiteInput, ReadWebsiteOutput,
+    RemoveIndexedSourceInput, RemoveIndexedSourceOutput, SearchDocsInput, SearchDocsOutput,
 };
 use stapler_mcp_native::{
     NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
@@ -364,6 +364,19 @@ impl ThinClient {
         params: Parameters<BrowserResizeInput>,
     ) -> Result<Json<BrowserActionOutput>, String> {
         call_daemon("stapler_browser_resize", params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "stapler_browser_network_requests",
+        description = "List the network requests (url, method, status, contentType, text body, timingMs) an existing browser session made since its last navigation — useful for debugging a page that didn't load expected content, or reading data that only appears in an XHR/fetch response. Optional filterUrl keeps only URLs containing that substring; clear: true returns the entries and then empties the list; savePath also writes a HAR 1.2 file (no header data). Bodies are text only (binary types are null) and capped at maxBodyBytes (default and max 16384). At most 1000 entries per navigation."
+    )]
+    async fn browser_network_requests(
+        &self,
+        params: Parameters<BrowserNetworkRequestsInput>,
+    ) -> Result<Json<BrowserNetworkRequestsOutput>, String> {
+        call_daemon("stapler_browser_network_requests", params.0)
             .await
             .map(Json)
     }

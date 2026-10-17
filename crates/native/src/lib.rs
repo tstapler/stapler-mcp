@@ -8,6 +8,7 @@ mod env;
 mod fs;
 mod http;
 mod lock;
+mod network;
 mod sleep;
 mod socket;
 mod spawn;

@@ -21,7 +21,8 @@ use stapler_mcp_core::schema::{
     BraveSearchInput, BraveSearchOutput, BrowserActionOutput, BrowserClickInput,
     BrowserCloseAllSessionsInput, BrowserCloseAllSessionsOutput, BrowserCloseSessionInput,
     BrowserCloseSessionOutput, BrowserHoverInput, BrowserListSessionsInput,
-    BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput,
+    BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput,
+    BrowserNetworkRequestsInput, BrowserNetworkRequestsOutput, BrowserPressKeyInput,
     BrowserSelectOptionInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTabsOutput,
     BrowserTypeInput, BrowserWaitForInput, DownloadWebsiteInput, DownloadWebsiteOutput,
     FetchPageInput, FetchPageOutput, ReadWebsiteInput, ReadWebsiteOutput,
@@ -253,6 +254,21 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         }),
     );
 
+    daemon.register(
+        "stapler_browser_network_requests",
+        json_handler({
+            let browser = browser.clone();
+            let fsstore = fsstore.clone();
+            move |input: BrowserNetworkRequestsInput| {
+                let browser = browser.clone();
+                let fsstore = fsstore.clone();
+                async move {
+                    browser_tools::browser_network_requests(&*browser, &*fsstore, input).await
+                }
+            }
+        }),
+    );
+
     let socket = socket::WasmSocketFactory;
     let run_result = daemon.run(&socket, &sock_path).await;
     // Always close the browser on the way out, even on error — otherwise the
@@ -450,6 +466,14 @@ pub fn list_tools_json() -> Result<String, JsValue> {
             output_schema: serde_json::to_value(schemars::schema_for!(BrowserActionOutput))
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
         },
+        ToolDescriptor {
+            name: "stapler_browser_network_requests",
+            description: "List the network requests (url, method, status, contentType, text body, timingMs) an existing browser session made since its last navigation. Optional filterUrl keeps only URLs containing that substring; clear: true returns the entries and then empties the list; savePath also writes a HAR 1.2 file. Bodies are text only (binary types are null), capped at maxBodyBytes (default and max 16384); at most 1000 entries per navigation.",
+            input_schema: serde_json::to_value(schemars::schema_for!(BrowserNetworkRequestsInput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            output_schema: serde_json::to_value(schemars::schema_for!(BrowserNetworkRequestsOutput))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        },
     ];
     serde_json::to_string(&tools).map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -459,7 +483,7 @@ mod list_tools_tests {
     use super::list_tools_json;
 
     #[test]
-    fn list_tools_json_should_contain_twelve_browser_tool_descriptors_when_called() {
+    fn list_tools_json_should_contain_thirteen_browser_tool_descriptors_when_called() {
         let json = list_tools_json().expect("list_tools_json should succeed");
         let tools: serde_json::Value =
             serde_json::from_str(&json).expect("list_tools_json output should be valid JSON");
@@ -483,6 +507,7 @@ mod list_tools_tests {
             "stapler_browser_select_option",
             "stapler_browser_press_key",
             "stapler_browser_wait_for",
+            "stapler_browser_network_requests",
         ];
         let matched: Vec<&&str> = browser_tool_names
             .iter()
@@ -491,8 +516,8 @@ mod list_tools_tests {
 
         assert_eq!(
             matched.len(),
-            12,
-            "expected exactly 12 browser tool descriptors, found {matched:?} in {names:?}"
+            13,
+            "expected exactly 13 browser tool descriptors, found {matched:?} in {names:?}"
         );
     }
 }

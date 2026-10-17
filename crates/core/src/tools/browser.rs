@@ -22,8 +22,8 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::ports::{
-    AxNode, AxSnapshot, BrowserDriver, FileStore, HistoryAction, Locator, PortError, SessionId,
-    TabAction, TabInfo, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, FileStore, HistoryAction, Locator, NetworkEntry, PortError,
+    SessionId, TabAction, TabInfo, WaitCondition,
 };
 use crate::schema::{
     AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput,
@@ -31,10 +31,11 @@ use crate::schema::{
     BrowserCloseSessionOutput, BrowserEvaluateInput, BrowserEvaluateOutput, BrowserFillFormInput,
     BrowserFindInput, BrowserFindMatch, BrowserFindOutput, BrowserFormFieldType,
     BrowserHistoryAction, BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsOutput,
-    BrowserNavigateInput, BrowserNavigateOutput, BrowserPressKeyInput, BrowserResizeInput,
-    BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
-    BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabInfo,
-    BrowserTabsAction, BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
+    BrowserNavigateInput, BrowserNavigateOutput, BrowserNetworkEntry, BrowserNetworkRequestsInput,
+    BrowserNetworkRequestsOutput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
+    BrowserScreenshotOutput, BrowserSelectOptionInput, BrowserSessionSummary,
+    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabInfo, BrowserTabsAction,
+    BrowserTabsInput, BrowserTabsOutput, BrowserTypeInput, BrowserWaitForInput,
 };
 use crate::tools::webcrawl::{blocked_host_reason, NetworkPolicy};
 
@@ -737,6 +738,143 @@ pub async fn browser_resize<B: BrowserDriver>(
     })
 }
 
+/// Largest `maxBodyBytes` the adapters honour; mirrors the native adapter's
+/// per-body capture cap.
+const MAX_NETWORK_BODY_BYTES: usize = 16_384;
+
+pub async fn browser_network_requests<B: BrowserDriver, F: FileStore>(
+    browser: &B,
+    fs: &F,
+    input: BrowserNetworkRequestsInput,
+) -> Result<BrowserNetworkRequestsOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let session_id = SessionId(input.session_id.clone());
+    let max_body_bytes = input
+        .max_body_bytes
+        .map(|n| (n as usize).min(MAX_NETWORK_BODY_BYTES));
+
+    let result = browser
+        .network_requests(
+            &session_id,
+            input.filter_url.as_deref().filter(|f| !f.is_empty()),
+            max_body_bytes,
+            input.clear.unwrap_or(false),
+        )
+        .await
+        .map_err(|e| map_error("network requests for", &input.session_id, e))?;
+
+    let mut saved_to = None;
+    if let Some(save_path) = input.save_path {
+        let har = serde_json::to_vec_pretty(&to_har(&result.entries))
+            .map_err(|e| format!("serializing HAR: {e}"))?;
+        fs.write_file(&save_path, &har)
+            .await
+            .map_err(|e| e.to_string())?;
+        saved_to = Some(save_path);
+    }
+
+    Ok(BrowserNetworkRequestsOutput {
+        entries: result
+            .entries
+            .into_iter()
+            .map(|e| BrowserNetworkEntry {
+                url: e.url,
+                method: e.method,
+                status: e.status,
+                content_type: e.content_type,
+                body: e.body,
+                body_truncated: e.body_truncated,
+                timing_ms: e.timing_ms,
+            })
+            .collect(),
+        truncated: result.truncated,
+        saved_to,
+    })
+}
+
+/// HAR 1.2 document for `entries`. Header and size data isn't captured, so
+/// the required `headers`/`cookies` arrays are empty and the size fields use
+/// the spec's `-1` ("unknown").
+fn to_har(entries: &[NetworkEntry]) -> serde_json::Value {
+    use serde_json::json;
+
+    let har_entries: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            let time = e.timing_ms.map_or(-1, |t| t as i64);
+            let query_string: Vec<_> = url::Url::parse(&e.url)
+                .map(|u| {
+                    u.query_pairs()
+                        .map(|(k, v)| json!({ "name": k, "value": v }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut content = json!({
+                "size": e.body.as_ref().map_or(-1, |b| b.len() as i64),
+                "mimeType": e.content_type.clone().unwrap_or_default(),
+            });
+            if let Some(body) = &e.body {
+                content["text"] = json!(body);
+            }
+            json!({
+                "startedDateTime": iso8601_utc(e.started_at_ms),
+                "time": time,
+                "request": {
+                    "method": e.method,
+                    "url": e.url,
+                    "httpVersion": "HTTP/1.1",
+                    "cookies": [],
+                    "headers": [],
+                    "queryString": query_string,
+                    "headersSize": -1,
+                    "bodySize": -1,
+                },
+                "response": {
+                    "status": e.status.unwrap_or(0),
+                    "statusText": "",
+                    "httpVersion": "HTTP/1.1",
+                    "cookies": [],
+                    "headers": [],
+                    "content": content,
+                    "redirectURL": "",
+                    "headersSize": -1,
+                    "bodySize": -1,
+                },
+                "cache": {},
+                "timings": { "send": -1, "wait": time, "receive": -1 },
+            })
+        })
+        .collect();
+
+    json!({
+        "log": {
+            "version": "1.2",
+            "creator": { "name": "stapler-mcp", "version": env!("CARGO_PKG_VERSION") },
+            "entries": har_entries,
+        }
+    })
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` for a Unix-epoch millisecond timestamp
+/// (Howard Hinnant's civil-from-days algorithm; avoids a date-time dep).
+fn iso8601_utc(epoch_ms: u64) -> String {
+    let ms = epoch_ms % 1000;
+    let secs = epoch_ms / 1000;
+    let (h, mi, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
+}
+
 /// Caps how many matches are returned in one call — a broad query against a
 /// large page shouldn't dump most of the tree back, defeating the point of
 /// `find` being cheaper than a full `snapshot`.
@@ -817,6 +955,9 @@ mod tests {
     use crate::ports::PageExtract;
     use crate::schema::BrowserFormField;
 
+    /// `(filter_url, max_body_bytes, clear)` as received by `network_requests`.
+    type NetworkArgs = (Option<String>, Option<usize>, bool);
+
     struct FakeBrowserDriver {
         navigate_result: RefCell<Option<Result<crate::ports::NavigateResult, PortError>>>,
         click_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
@@ -836,6 +977,8 @@ mod tests {
         evaluate_result: RefCell<Option<Result<serde_json::Value, PortError>>>,
         history_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         resize_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+        network_result: RefCell<Option<Result<crate::ports::NetworkRequestsResult, PortError>>>,
+        network_args: RefCell<Option<NetworkArgs>>,
         /// Overrides whatever `tabs()` would otherwise compute from
         /// `tabs_state` — used to simulate driver-level failures (e.g. an
         /// unknown session) without disturbing the in-memory tab list.
@@ -864,6 +1007,8 @@ mod tests {
                 evaluate_result: RefCell::new(None),
                 history_result: RefCell::new(None),
                 resize_result: RefCell::new(None),
+                network_result: RefCell::new(None),
+                network_args: RefCell::new(None),
                 tabs_error: RefCell::new(None),
                 tabs_state: RefCell::new(vec![TabInfo {
                     index: 0,
@@ -940,6 +1085,14 @@ mod tests {
 
         fn with_history(self, result: Result<AxSnapshot, PortError>) -> Self {
             *self.history_result.borrow_mut() = Some(result);
+            self
+        }
+
+        fn with_network(
+            self,
+            result: Result<crate::ports::NetworkRequestsResult, PortError>,
+        ) -> Self {
+            *self.network_result.borrow_mut() = Some(result);
             self
         }
 
@@ -1224,6 +1377,22 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .expect("resize result not configured")
+        }
+
+        async fn network_requests(
+            &self,
+            _session_id: &SessionId,
+            filter_url: Option<&str>,
+            max_body_bytes: Option<usize>,
+            clear: bool,
+        ) -> Result<crate::ports::NetworkRequestsResult, PortError> {
+            self.calls.borrow_mut().push("network_requests");
+            *self.network_args.borrow_mut() =
+                Some((filter_url.map(String::from), max_body_bytes, clear));
+            self.network_result
+                .borrow_mut()
+                .take()
+                .expect("network result not configured")
         }
     }
 
@@ -3319,5 +3488,136 @@ mod tests {
             err,
             "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
         );
+    }
+
+    fn sample_entry(url: &str) -> NetworkEntry {
+        NetworkEntry {
+            url: url.to_string(),
+            method: "GET".to_string(),
+            status: Some(200),
+            content_type: Some("application/json".to_string()),
+            body: Some("{\"ok\":true}".to_string()),
+            body_truncated: false,
+            timing_ms: Some(42),
+            started_at_ms: 1_700_000_000_123,
+        }
+    }
+
+    fn network_input(session_id: &str) -> BrowserNetworkRequestsInput {
+        BrowserNetworkRequestsInput {
+            session_id: session_id.to_string(),
+            filter_url: None,
+            max_body_bytes: None,
+            clear: None,
+            save_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+        let fs = FakeFileStore::new();
+
+        let err = browser_network_requests(&driver, &fs, network_input(""))
+            .await
+            .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_forward_filter_clamped_cap_and_clear_to_driver() {
+        let driver =
+            FakeBrowserDriver::new().with_network(Ok(crate::ports::NetworkRequestsResult {
+                entries: vec![sample_entry("https://x.test/api/data")],
+                truncated: true,
+            }));
+        let fs = FakeFileStore::new();
+
+        let out = browser_network_requests(
+            &driver,
+            &fs,
+            BrowserNetworkRequestsInput {
+                filter_url: Some("/api/".to_string()),
+                max_body_bytes: Some(1_000_000),
+                clear: Some(true),
+                ..network_input("sess-1")
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(
+            *driver.network_args.borrow(),
+            Some((
+                Some("/api/".to_string()),
+                Some(MAX_NETWORK_BODY_BYTES),
+                true
+            ))
+        );
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].status, Some(200));
+        assert_eq!(out.entries[0].body.as_deref(), Some("{\"ok\":true}"));
+        assert!(out.truncated);
+        assert_eq!(out.saved_to, None);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_write_har_1_2_when_save_path_given() {
+        let driver =
+            FakeBrowserDriver::new().with_network(Ok(crate::ports::NetworkRequestsResult {
+                entries: vec![sample_entry("https://x.test/api?q=1")],
+                truncated: false,
+            }));
+        let fs = FakeFileStore::new();
+
+        let out = browser_network_requests(
+            &driver,
+            &fs,
+            BrowserNetworkRequestsInput {
+                save_path: Some("/tmp/out.har".to_string()),
+                ..network_input("sess-1")
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(out.saved_to.as_deref(), Some("/tmp/out.har"));
+        let (path, bytes) = fs.last_write.borrow().clone().expect("HAR written");
+        assert_eq!(path, "/tmp/out.har");
+        let har: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(har["log"]["version"], "1.2");
+        assert_eq!(har["log"]["creator"]["name"], "stapler-mcp");
+        let entry = &har["log"]["entries"][0];
+        assert_eq!(entry["startedDateTime"], "2023-11-14T22:13:20.123Z");
+        assert_eq!(entry["request"]["method"], "GET");
+        assert_eq!(entry["request"]["queryString"][0]["name"], "q");
+        assert_eq!(entry["request"]["headersSize"], -1);
+        assert_eq!(entry["response"]["status"], 200);
+        assert_eq!(entry["response"]["content"]["text"], "{\"ok\":true}");
+        assert_eq!(entry["response"]["content"]["mimeType"], "application/json");
+        assert_eq!(entry["time"], 42);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_pass_blocked_session_not_found_through_unchanged() {
+        let driver = FakeBrowserDriver::new()
+            .with_network(Err(PortError::NotFound("session blocked".to_string())));
+        let fs = FakeFileStore::new();
+
+        let err = browser_network_requests(&driver, &fs, network_input("sess-1"))
+            .await
+            .expect_err("not-found should surface as an error");
+
+        assert_eq!(err, "session blocked");
+        assert!(fs.last_write.borrow().is_none());
+    }
+
+    #[test]
+    fn iso8601_utc_should_format_epoch_and_leap_day() {
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00.000Z");
+        // 2024-02-29T12:34:56.789Z
+        assert_eq!(iso8601_utc(1_709_210_096_789), "2024-02-29T12:34:56.789Z");
     }
 }

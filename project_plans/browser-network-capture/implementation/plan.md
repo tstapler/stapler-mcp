@@ -211,6 +211,22 @@ function called from Rust wasm glue.
 - Calls `stapler_browser_network_requests` with `filter_url = "/api/data"`
 - Asserts: entry with status 200 and JSON body containing expected content is present
 
+## As built (deltas from the plan above)
+
+- Native state lives in `crates/native/src/network.rs` (`NetworkLog`): in-flight requests are
+  correlated by `request_id` in a private `partial` map, separate from completed `entries`;
+  `BrowserSession.network` is an `Rc<RefCell<NetworkLog>>` shared with four listener tasks
+  (`requestWillBeSent`, `responseReceived`, `loadingFinished`, `loadingFailed`), each borrowing
+  only synchronously. Resolves adversarial challenge 1.
+- `clear: true` is copy-then-clear inside one `NetworkLog::query` call (no `.await`). Challenge 5.
+- HAR export uses `-1` for `headersSize`/`bodySize`; headers/cookies arrays are empty. Challenge 3.
+- Registered unconditionally in both daemons; candidate for a future `network` tool profile.
+  Challenge 4.
+- Redirect hops (repeated `request_id`) become separate entries; `max_body_bytes` is clamped to
+  the 16 384-byte capture cap.
+- Open question 1 (single vs. multiple event tasks): `page.event_listener` returns one stream
+  per event type, so four tasks are used.
+
 ## Ordering / Dependencies
 
 ```

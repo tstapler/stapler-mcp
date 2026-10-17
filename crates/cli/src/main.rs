@@ -10,11 +10,11 @@ use stapler_mcp_core::ports::{LockError, LockGuard, ProcessLock};
 use stapler_mcp_core::schema::{
     BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
     BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserHistoryInput,
-    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserPressKeyInput,
-    BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput,
-    BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput,
-    DownloadWebsiteInput, FetchPageInput, IndexDocsInput, ListIndexedSourcesInput,
-    ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
+    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserNetworkRequestsInput,
+    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
+    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
+    BrowserWaitForInput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
+    ListIndexedSourcesInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 use stapler_mcp_core::tools::{browser, docs, fetch, search, webcrawl};
 use stapler_mcp_native::{
@@ -363,6 +363,19 @@ async fn run_daemon() {
             move |input: BrowserResizeInput| {
                 let browser = browser.clone();
                 async move { browser::browser_resize(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_network_requests",
+        json_handler({
+            let browser = browser.clone();
+            let fs = fs.clone();
+            move |input: BrowserNetworkRequestsInput| {
+                let browser = browser.clone();
+                let fs = fs.clone();
+                async move { browser::browser_network_requests(&*browser, &*fs, input).await }
             }
         }),
     );

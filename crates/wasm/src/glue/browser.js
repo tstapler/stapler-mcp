@@ -344,6 +344,118 @@ function wireCrashListener(sessionId, session, page) {
 }
 module.exports.wireCrashListener = wireCrashListener;
 
+// Network capture (mirrors native's `NetworkLog` in
+// `crates/native/src/network.rs`): entries accumulate per session, are reset
+// on every navigate, and stop at MAX_NETWORK_ENTRIES.
+const MAX_NETWORK_ENTRIES = 1000;
+const MAX_NETWORK_BODY_BYTES = 16384;
+module.exports.MAX_NETWORK_ENTRIES = MAX_NETWORK_ENTRIES;
+
+function isBinaryContentType(contentType) {
+    const ct = (contentType || "").trim().toLowerCase();
+    return (
+        ct.startsWith("image/") ||
+        ct.startsWith("font/") ||
+        ct.startsWith("audio/") ||
+        ct.startsWith("video/") ||
+        ct.startsWith("application/octet-stream")
+    );
+}
+module.exports.isBinaryContentType = isBinaryContentType;
+
+// Cuts `text` to at most `max` UTF-8 bytes without splitting a character.
+function truncateUtf8(text, max) {
+    const buf = Buffer.from(text, "utf8");
+    if (buf.length <= max) {
+        return { text, truncated: false };
+    }
+    let end = max;
+    while (end > 0 && (buf[end] & 0xc0) === 0x80) {
+        end--;
+    }
+    return { text: buf.subarray(0, end).toString("utf8"), truncated: true };
+}
+module.exports.truncateUtf8 = truncateUtf8;
+
+function resetNetwork(session) {
+    session.networkEntries = [];
+    session.networkTruncated = false;
+    session.networkGeneration = (session.networkGeneration || 0) + 1;
+}
+module.exports.resetNetwork = resetNetwork;
+
+function pushNetworkEntry(session, entry) {
+    if (session.networkEntries.length >= MAX_NETWORK_ENTRIES) {
+        session.networkTruncated = true;
+        return;
+    }
+    session.networkEntries.push(entry);
+}
+module.exports.pushNetworkEntry = pushNetworkEntry;
+
+// Subscribes to `page`'s request lifecycle events. Called once, at session
+// creation, before the first `goto`, so the initial load is captured. Only
+// the session's first tab is observed.
+function wireNetworkCapture(session, page) {
+    resetNetwork(session);
+    const starts = new WeakMap();
+    page.on("request", (request) => {
+        starts.set(request, { at: Date.now(), generation: session.networkGeneration });
+    });
+    page.on("requestfailed", (request) => {
+        const start = starts.get(request);
+        if (!start || start.generation !== session.networkGeneration) {
+            return;
+        }
+        pushNetworkEntry(session, {
+            url: request.url(),
+            method: request.method(),
+            status: null,
+            contentType: null,
+            body: null,
+            bodyTruncated: false,
+            timingMs: Date.now() - start.at,
+            startedAtMs: start.at,
+        });
+    });
+    page.on("response", async (response) => {
+        const request = response.request();
+        const start = starts.get(request);
+        if (!start || start.generation !== session.networkGeneration) {
+            return;
+        }
+        const contentType = (response.headers()["content-type"] || "").split(";")[0].trim() || null;
+        let body = null;
+        let bodyTruncated = false;
+        const wantsBody =
+            session.networkEntries.length < MAX_NETWORK_ENTRIES &&
+            !(contentType && isBinaryContentType(contentType));
+        if (wantsBody) {
+            try {
+                const cut = truncateUtf8(await response.text(), MAX_NETWORK_BODY_BYTES);
+                body = cut.text;
+                bodyTruncated = cut.truncated;
+            } catch {
+                // Body unavailable (redirect, evicted, navigated away).
+            }
+        }
+        if (start.generation !== session.networkGeneration) {
+            return;
+        }
+        pushNetworkEntry(session, {
+            url: response.url(),
+            method: request.method(),
+            status: response.status(),
+            contentType,
+            body,
+            bodyTruncated,
+            timingMs: Date.now() - start.at,
+            startedAtMs: start.at,
+        });
+    });
+}
+module.exports.wireNetworkCapture = wireNetworkCapture;
+
 function requireSession(sessionId) {
     const session = sessions.get(sessionId);
     if (!session) {
@@ -531,10 +643,14 @@ module.exports.jsBrowserNavigate = async function (url, sessionId, timeoutMs) {
         sessions.set(id, session);
         wireFrameNavigatedGuard(id, session);
         wireCrashListener(id, session);
+        wireNetworkCapture(session, page);
         ensureReaper();
     }
     session.lastUsed = Date.now();
     return runSerialized(session, async () => {
+        // A new navigation starts with an empty network log; the session's
+        // first `goto` is also covered, since wiring (above) already emptied it.
+        resetNetwork(session);
         await session.page.goto(url, { timeout: timeoutMs, waitUntil: "load" });
         // BLOCKER fix: navigate() itself must not skip the same SSRF check
         // click/type/snapshot already perform — a redirect (server- or
@@ -893,6 +1009,30 @@ module.exports.jsBrowserResize = async function (sessionId, width, height, timeo
         await session.page.setViewportSize({ width, height });
         return captureSnapshot(session.page);
     });
+};
+
+module.exports.jsBrowserNetworkRequests = async function (sessionId, filterUrl, maxBodyBytes, clear) {
+    // `requireLiveSession` throws for a blocked session, which
+    // `map_js_error` maps to `PortError::NotFound`.
+    const session = requireLiveSession(sessionId);
+    const cap = Math.min(maxBodyBytes == null ? MAX_NETWORK_BODY_BYTES : maxBodyBytes, MAX_NETWORK_BODY_BYTES);
+    // Copy and clear with no `await` in between, so no capture event can
+    // land between the two.
+    const entries = session.networkEntries
+        .filter((e) => !filterUrl || e.url.includes(filterUrl))
+        .map((e) => {
+            if (e.body == null) {
+                return { ...e };
+            }
+            const cut = truncateUtf8(e.body, cap);
+            return { ...e, body: cut.text, bodyTruncated: e.bodyTruncated || cut.truncated };
+        });
+    const truncated = session.networkTruncated;
+    if (clear) {
+        session.networkEntries = [];
+        session.networkTruncated = false;
+    }
+    return { entries, truncated };
 };
 
 module.exports.jsBrowserWaitFor = async function (sessionId, conditionJson, timeoutMs) {
