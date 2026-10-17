@@ -121,6 +121,16 @@ async fn daemon_architecture_and_tools_round_trip() {
         .await
         .expect("ping should succeed against running daemon");
 
+    // 3.5. `ping`'s response carries the real daemon's browser-profile status
+    //      (STAPLER_MCP_BROWSER_PROFILE_DIR unset here, so ephemeral mode and
+    //      no unsafe-location warning) — the same payload `stapler_daemon_status`
+    //      and `stapler-mcp --status` read.
+    let ping_result = client::call(&socket, &sock_path, "ping", None, Duration::from_secs(2))
+        .await
+        .expect("ping call should succeed against running daemon");
+    assert_eq!(ping_result["browserProfileMode"], "ephemeral");
+    assert!(ping_result["browserProfileWarning"].is_null());
+
     // 4. A second ensure_daemon call reuses the already-running daemon rather
     //    than spawning a redundant one — checked via the PID recorded in the
     //    lockfile staying unchanged.

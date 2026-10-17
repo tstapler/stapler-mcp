@@ -1,7 +1,7 @@
 //! Verifies Story 5.2.1's `tools/list` acceptance criterion (plan.md Epic
 //! 5.2, tracked as REQ-15 in validation.md's "Gap" row): the four docs-index
 //! tools (`index_docs`, `search_docs`, `list_indexed_sources`,
-//! `remove_indexed_source`) must be registered on `ThinClient`'s `rmcp`
+//! `remove_indexed_source`) must be registered on `McpRouter`'s `rmcp`
 //! `ToolRouter` with a non-empty `description` and an `inputSchema` that
 //! matches their respective `*Input` struct's `schemars`-derived JSON
 //! Schema.
@@ -9,16 +9,16 @@
 //! Deliberately does NOT go through a live stdio MCP client or the daemon
 //! socket (that's `docs_index_round_trip`'s job, and it's `#[ignore]`d
 //! because it needs the real embedding model). Instead this inspects
-//! `ThinClient`'s tool router directly via `rmcp::ToolRouter::list_all()` —
+//! `McpRouter`'s tool router directly via `rmcp::ToolRouter::list_all()` —
 //! the same in-process metadata the `tools/list` MCP method serves — so it's
 //! fast, hermetic, and safe to run on every `cargo test`.
 //!
-//! `crates/cli` is a bin-only crate (no `[lib]` target), so `thin_client.rs`
-//! isn't reachable from `tests/` via a normal `use`. `#[path]` pulls the
-//! module in directly; `ThinClient::registered_tools()` (a small
-//! `#[cfg(test)]`-gated accessor added alongside `ThinClient` itself) then
-//! exposes the macro-generated tool router's metadata without a live stdio
-//! MCP client.
+//! `crates/cli` is a bin-only crate (no `[lib]` target), so `mcp_router.rs`
+//! isn't reachable from `tests/` via a normal `use`. `#[path]` pulls it (and
+//! `transport.rs`, which it depends on) in directly;
+//! `McpRouter::registered_tools()` (a small `#[cfg(test)]`-gated accessor
+//! added alongside `McpRouter` itself) then exposes the macro-generated tool
+//! router's metadata without a live stdio MCP client.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -27,22 +27,24 @@ use rmcp::handler::server::common::schema_for_input;
 use rmcp::model::JsonObject;
 
 use stapler_mcp_core::schema::{
-    BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
-    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserHistoryInput,
-    BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput, BrowserNetworkRequestsInput,
-    BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput, BrowserSelectOptionInput,
-    BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput, BrowserTypeInput,
-    BrowserWaitForInput, IndexDocsInput, ListIndexedSourcesInput, RemoveIndexedSourceInput,
-    SearchDocsInput,
+    BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
+    BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
+    BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
+    BrowserNetworkRequestsInput, BrowserPdfInput, BrowserPressKeyInput, BrowserResizeInput,
+    BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput,
+    BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput, DaemonStatusInput, IndexDocsInput,
+    ListIndexedSourcesInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 
-#[path = "../src/thin_client.rs"]
-mod thin_client;
+#[path = "../src/mcp_router.rs"]
+mod mcp_router;
+#[path = "../src/transport.rs"]
+mod transport;
 
 #[tokio::test]
 async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_input_schema_when_tools_list_called(
 ) {
-    let tools = thin_client::ThinClient::registered_tools();
+    let tools = mcp_router::McpRouter::<transport::SocketTransport>::registered_tools();
     let tool_names: HashSet<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert_eq!(
         tool_names.len(),
@@ -130,6 +132,10 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
                 .expect("BrowserScreenshotInput schemars schema"),
         ),
         (
+            "stapler_browser_pdf",
+            schema_for_input::<BrowserPdfInput>().expect("BrowserPdfInput schemars schema"),
+        ),
+        (
             "stapler_browser_evaluate",
             schema_for_input::<BrowserEvaluateInput>()
                 .expect("BrowserEvaluateInput schemars schema"),
@@ -157,6 +163,18 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
             schema_for_input::<BrowserFindInput>().expect("BrowserFindInput schemars schema"),
         ),
         (
+            "stapler_browser_get_html",
+            schema_for_input::<BrowserGetHtmlInput>().expect("BrowserGetHtmlInput schemars schema"),
+        ),
+        (
+            "stapler_daemon_status",
+            schema_for_input::<DaemonStatusInput>().expect("DaemonStatusInput schemars schema"),
+        ),
+        (
+            "browser_web_search",
+            schema_for_input::<BraveSearchInput>().expect("BraveSearchInput schemars schema"),
+        ),
+        (
             "stapler_browser_network_requests",
             schema_for_input::<BrowserNetworkRequestsInput>()
                 .expect("BrowserNetworkRequestsInput schemars schema"),
@@ -182,4 +200,54 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
             "tool `{name}`'s inputSchema does not match `{name}`'s Input struct's schemars-derived JSON Schema"
         );
     }
+}
+
+/// Fakes the daemon's `ping` response so `stapler_daemon_status`'s
+/// deserialization path can be exercised without a live socket.
+struct FakePingTransport {
+    response: serde_json::Value,
+}
+
+impl transport::DaemonTransport for FakePingTransport {
+    async fn call(
+        &self,
+        _tool: &'static str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Ok(self.response.clone())
+    }
+}
+
+/// Exercises `McpRouter::call_daemon_status_for_test()` — and therefore the
+/// exact `daemon_status()` tool method a real MCP client calls — against a
+/// faked `ping` response carrying `run_daemon`'s actual camelCase wire keys
+/// (`browserProfileMode`/`browserProfileWarning`), so a drift between
+/// `run_daemon`'s `set_status_extra` JSON and `DaemonStatusOutput`'s
+/// `#[serde(rename_all = "camelCase")]` fields fails this test rather than
+/// silently deserializing to `None` (previously exercised nowhere: this
+/// accessor existed but had no caller).
+#[tokio::test]
+async fn daemon_status_should_deserialize_run_daemons_camelcase_wire_keys() {
+    let router = mcp_router::McpRouter::with_transport(FakePingTransport {
+        response: serde_json::json!({
+            "pong": true,
+            "browserProfileMode": "persistent at /home/alice/.stapler-mcp/browser-profile",
+            "browserProfileWarning": "looks unsafe",
+        }),
+    });
+
+    let status = router
+        .call_daemon_status_for_test()
+        .await
+        .expect("daemon_status should succeed against a well-formed ping response");
+
+    assert!(status.pong);
+    assert_eq!(
+        status.browser_profile_mode.as_deref(),
+        Some("persistent at /home/alice/.stapler-mcp/browser-profile")
+    );
+    assert_eq!(
+        status.browser_profile_warning.as_deref(),
+        Some("looks unsafe")
+    );
 }
