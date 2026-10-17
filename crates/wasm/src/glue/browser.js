@@ -349,6 +349,7 @@ module.exports.wireCrashListener = wireCrashListener;
 // on every navigate, and stop at MAX_NETWORK_ENTRIES.
 const MAX_NETWORK_ENTRIES = 1000;
 const MAX_NETWORK_BODY_BYTES = 16384;
+const NETWORK_BODY_TIMEOUT_MS = 3000;
 module.exports.MAX_NETWORK_ENTRIES = MAX_NETWORK_ENTRIES;
 
 function isBinaryContentType(contentType) {
@@ -427,12 +428,23 @@ function wireNetworkCapture(session, page) {
         const contentType = (response.headers()["content-type"] || "").split(";")[0].trim() || null;
         let body = null;
         let bodyTruncated = false;
+        // Same rule as native's `NetworkLog::wants_body`: the type must be
+        // known and non-binary, and the cap must have room.
         const wantsBody =
             session.networkEntries.length < MAX_NETWORK_ENTRIES &&
-            !(contentType && isBinaryContentType(contentType));
+            contentType !== null &&
+            !isBinaryContentType(contentType);
         if (wantsBody) {
             try {
-                const cut = truncateUtf8(await response.text(), MAX_NETWORK_BODY_BYTES);
+                // Streaming/SSE bodies may never finish; don't let one
+                // pin the entry.
+                const text = await Promise.race([
+                    response.text(),
+                    new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error("body timeout")), NETWORK_BODY_TIMEOUT_MS).unref?.(),
+                    ),
+                ]);
+                const cut = truncateUtf8(text, MAX_NETWORK_BODY_BYTES);
                 body = cut.text;
                 bodyTruncated = cut.truncated;
             } catch {
@@ -1015,7 +1027,7 @@ module.exports.jsBrowserNetworkRequests = async function (sessionId, filterUrl, 
     // `requireLiveSession` throws for a blocked session, which
     // `map_js_error` maps to `PortError::NotFound`.
     const session = requireLiveSession(sessionId);
-    const cap = Math.min(maxBodyBytes == null ? MAX_NETWORK_BODY_BYTES : maxBodyBytes, MAX_NETWORK_BODY_BYTES);
+    const cap = Math.max(0, Math.min(maxBodyBytes == null ? MAX_NETWORK_BODY_BYTES : maxBodyBytes, MAX_NETWORK_BODY_BYTES));
     // Copy and clear with no `await` in between, so no capture event can
     // land between the two.
     const entries = session.networkEntries

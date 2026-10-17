@@ -41,6 +41,7 @@ struct Partial {
     started_monotonic_s: f64,
     status: Option<u16>,
     content_type: Option<String>,
+    response_seen: bool,
 }
 
 #[derive(Default)]
@@ -75,17 +76,28 @@ impl NetworkLog {
                 started_monotonic_s: monotonic_s,
                 status: None,
                 content_type: None,
+                response_seen: false,
             },
         );
     }
 
-    pub fn on_response(&mut self, request_id: &str, status: u16, content_type: &str) {
+    pub fn on_response(&mut self, request_id: &str, status: Option<u16>, content_type: &str) {
         if let Some(p) = self.partial.get_mut(request_id) {
-            p.status = Some(status);
+            p.status = status;
+            p.response_seen = true;
             if !content_type.is_empty() {
                 p.content_type = Some(content_type.to_string());
             }
         }
+    }
+
+    /// Whether `responseReceived` has been recorded for `request_id`. The
+    /// `Network.*` events arrive on separate streams, so a `loadingFinished`
+    /// handler uses this to wait for its response to land first.
+    pub fn has_response(&self, request_id: &str) -> bool {
+        self.partial
+            .get(request_id)
+            .is_some_and(|p| p.response_seen)
     }
 
     /// Whether `Network.getResponseBody` is worth calling for `request_id`:
@@ -204,7 +216,7 @@ mod tests {
 
     fn done(log: &mut NetworkLog, id: &str, url: &str, ct: &str, body: Option<&str>) {
         log.on_request(id, url, "GET", 1_000, 1.0, None);
-        log.on_response(id, 200, ct);
+        log.on_response(id, Some(200), ct);
         log.complete(id, 1.25, body.map(String::from));
     }
 
@@ -250,9 +262,9 @@ mod tests {
     fn wants_body_should_be_false_for_binary_types_and_true_for_json() {
         let mut log = NetworkLog::default();
         log.on_request("1", "http://x/a.png", "GET", 0, 0.0, None);
-        log.on_response("1", 200, "image/png");
+        log.on_response("1", Some(200), "image/png");
         log.on_request("2", "http://x/api", "GET", 0, 0.0, None);
-        log.on_response("2", 200, "application/json");
+        log.on_response("2", Some(200), "application/json");
         assert!(!log.wants_body("1"));
         assert!(log.wants_body("2"));
         assert!(!log.wants_body("unknown"));
@@ -369,7 +381,7 @@ mod tests {
             done(&mut log, &i.to_string(), "http://x/a", "text/plain", None);
         }
         log.on_request("late", "http://x/late", "GET", 0, 0.0, None);
-        log.on_response("late", 200, "application/json");
+        log.on_response("late", Some(200), "application/json");
         assert!(!log.wants_body("late"));
     }
 
@@ -378,13 +390,22 @@ mod tests {
         let mut log = NetworkLog::default();
         log.on_request("1", "http://x/old", "GET", 0, 1.0, None);
         log.on_request("1", "http://x/new", "GET", 0, 1.1, Some(302));
-        log.on_response("1", 200, "text/html");
+        log.on_response("1", Some(200), "text/html");
         log.complete("1", 1.2, None);
         let r = log.query(None, None, false);
         assert_eq!(r.entries.len(), 2);
         assert_eq!(r.entries[0].url, "http://x/old");
         assert_eq!(r.entries[0].status, Some(302));
         assert_eq!(r.entries[1].status, Some(200));
+    }
+
+    #[test]
+    fn has_response_should_be_true_only_after_on_response() {
+        let mut log = NetworkLog::default();
+        log.on_request("1", "http://x/a", "GET", 0, 0.0, None);
+        assert!(!log.has_response("1"));
+        log.on_response("1", None, "text/plain");
+        assert!(log.has_response("1"));
     }
 
     #[test]

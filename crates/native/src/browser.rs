@@ -1033,6 +1033,12 @@ async fn spawn_session_listeners(
     }
 }
 
+/// Upper bound on scheduler yields a `loadingFinished` handler spends waiting
+/// for its `responseReceived` event to be recorded.
+const NETWORK_RESPONSE_WAIT_YIELDS: usize = 16;
+/// Bounds `Network.getResponseBody` so a stalled call can't pin a task.
+const NETWORK_BODY_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Enables the CDP `Network` domain and feeds `log` from its request /
 /// response / finished / failed events. Like `spawn_session_listeners`, called
 /// once at session creation, before the first `goto`, so the initial page
@@ -1042,72 +1048,99 @@ async fn spawn_network_listeners(
     page: &Page,
     log: Rc<RefCell<NetworkLog>>,
 ) -> Result<(), PortError> {
+    let subscribe_err = |e: chromiumoxide::error::CdpError| {
+        PortError::Other(format!("subscribing to network events: {e}"))
+    };
     page.execute(NetworkEnableParams::default())
         .await
         .map_err(|e| PortError::Other(format!("enabling network capture: {e}")))?;
 
-    if let Ok(mut events) = page.event_listener::<EventRequestWillBeSent>().await {
-        let log = log.clone();
-        tokio::task::spawn_local(async move {
-            while let Some(ev) = events.next().await {
-                let redirect_status = ev.redirect_response.as_ref().map(|r| r.status as u16);
-                log.borrow_mut().on_request(
-                    ev.request_id.inner(),
-                    &ev.request.url,
-                    &ev.request.method,
-                    (*ev.wall_time.inner() * 1000.0) as u64,
-                    *ev.timestamp.inner(),
-                    redirect_status,
-                );
-            }
-        });
-    }
+    let mut requests = page
+        .event_listener::<EventRequestWillBeSent>()
+        .await
+        .map_err(subscribe_err)?;
+    let mut responses = page
+        .event_listener::<EventResponseReceived>()
+        .await
+        .map_err(subscribe_err)?;
+    let mut finished = page
+        .event_listener::<EventLoadingFinished>()
+        .await
+        .map_err(subscribe_err)?;
+    let mut failed = page
+        .event_listener::<EventLoadingFailed>()
+        .await
+        .map_err(subscribe_err)?;
 
-    if let Ok(mut events) = page.event_listener::<EventResponseReceived>().await {
-        let log = log.clone();
-        tokio::task::spawn_local(async move {
-            while let Some(ev) = events.next().await {
-                log.borrow_mut().on_response(
-                    ev.request_id.inner(),
-                    ev.response.status as u16,
-                    &ev.response.mime_type,
-                );
-            }
-        });
-    }
+    let request_log = log.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(ev) = requests.next().await {
+            let redirect_status = ev
+                .redirect_response
+                .as_ref()
+                .and_then(|r| u16::try_from(r.status).ok());
+            request_log.borrow_mut().on_request(
+                ev.request_id.inner(),
+                &ev.request.url,
+                &ev.request.method,
+                (*ev.wall_time.inner() * 1000.0) as u64,
+                *ev.timestamp.inner(),
+                redirect_status,
+            );
+        }
+    });
 
-    if let Ok(mut events) = page.event_listener::<EventLoadingFinished>().await {
-        let log = log.clone();
-        let page = page.clone();
-        tokio::task::spawn_local(async move {
-            while let Some(ev) = events.next().await {
+    let response_log = log.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(ev) = responses.next().await {
+            response_log.borrow_mut().on_response(
+                ev.request_id.inner(),
+                u16::try_from(ev.response.status).ok(),
+                &ev.response.mime_type,
+            );
+        }
+    });
+
+    let finished_log = log.clone();
+    let finished_page = page.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(ev) = finished.next().await {
+            // One task per event so a stalled body fetch can't delay the
+            // completion of later requests.
+            let log = finished_log.clone();
+            let page = finished_page.clone();
+            tokio::task::spawn_local(async move {
                 let id = ev.request_id.inner().clone();
+                // `responseReceived` is drained by its own task; yield so it
+                // runs before this handler decides whether to fetch a body.
+                for _ in 0..NETWORK_RESPONSE_WAIT_YIELDS {
+                    if log.borrow().has_response(&id) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
                 let wants_body = log.borrow().wants_body(&id);
                 let body = if wants_body {
                     // Best effort: Chrome may already have evicted the body.
-                    match page
-                        .execute(GetResponseBodyParams::new(ev.request_id.clone()))
-                        .await
-                    {
-                        Ok(r) if !r.result.base64_encoded => Some(r.result.body.clone()),
+                    let fetch = page.execute(GetResponseBodyParams::new(ev.request_id.clone()));
+                    match tokio::time::timeout(NETWORK_BODY_FETCH_TIMEOUT, fetch).await {
+                        Ok(Ok(r)) if !r.result.base64_encoded => Some(r.result.body.clone()),
                         _ => None,
                     }
                 } else {
                     None
                 };
                 log.borrow_mut().complete(&id, *ev.timestamp.inner(), body);
-            }
-        });
-    }
+            });
+        }
+    });
 
-    if let Ok(mut events) = page.event_listener::<EventLoadingFailed>().await {
-        tokio::task::spawn_local(async move {
-            while let Some(ev) = events.next().await {
-                log.borrow_mut()
-                    .on_failed(ev.request_id.inner(), *ev.timestamp.inner());
-            }
-        });
-    }
+    tokio::task::spawn_local(async move {
+        while let Some(ev) = failed.next().await {
+            log.borrow_mut()
+                .on_failed(ev.request_id.inner(), *ev.timestamp.inner());
+        }
+    });
 
     Ok(())
 }
@@ -1252,7 +1285,10 @@ impl BrowserDriver for NativeBrowser {
                     spawn_session_listeners(&page, id.clone(), blocked.clone(), crashed.clone())
                         .await;
                     let network = Rc::new(RefCell::new(NetworkLog::default()));
-                    spawn_network_listeners(&page, network.clone()).await?;
+                    if let Err(e) = spawn_network_listeners(&page, network.clone()).await {
+                        let _ = page.close().await;
+                        return Err(e);
+                    }
 
                     // Now safe to actually request the caller's URL: the
                     // listeners are attached, so any redirect chained onto

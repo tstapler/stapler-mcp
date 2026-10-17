@@ -755,13 +755,14 @@ pub async fn browser_network_requests<B: BrowserDriver, F: FileStore>(
         .max_body_bytes
         .map(|n| (n as usize).min(MAX_NETWORK_BODY_BYTES));
 
+    let clear = input.clear.unwrap_or(false);
+    let filter_url = input.filter_url.as_deref().filter(|f| !f.is_empty());
+    // With a HAR to write, defer the clear until the write succeeded so a
+    // failed write doesn't lose the captured entries.
+    let clear_now = clear && input.save_path.is_none();
+
     let result = browser
-        .network_requests(
-            &session_id,
-            input.filter_url.as_deref().filter(|f| !f.is_empty()),
-            max_body_bytes,
-            input.clear.unwrap_or(false),
-        )
+        .network_requests(&session_id, filter_url, max_body_bytes, clear_now)
         .await
         .map_err(|e| map_error("network requests for", &input.session_id, e))?;
 
@@ -773,6 +774,14 @@ pub async fn browser_network_requests<B: BrowserDriver, F: FileStore>(
             .await
             .map_err(|e| e.to_string())?;
         saved_to = Some(save_path);
+        if clear {
+            // Entries that arrived since the read above are dropped
+            // unreturned; acceptable for a debugging aid.
+            browser
+                .network_requests(&session_id, filter_url, max_body_bytes, true)
+                .await
+                .map_err(|e| map_error("network requests for", &input.session_id, e))?;
+        }
     }
 
     Ok(BrowserNetworkRequestsOutput {
@@ -843,7 +852,7 @@ fn to_har(entries: &[NetworkEntry]) -> serde_json::Value {
                     "bodySize": -1,
                 },
                 "cache": {},
-                "timings": { "send": -1, "wait": time, "receive": -1 },
+                "timings": { "send": 0, "wait": time.max(0), "receive": 0 },
             })
         })
         .collect();
@@ -977,7 +986,7 @@ mod tests {
         evaluate_result: RefCell<Option<Result<serde_json::Value, PortError>>>,
         history_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
         resize_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
-        network_result: RefCell<Option<Result<crate::ports::NetworkRequestsResult, PortError>>>,
+        network_results: RefCell<VecDeque<Result<crate::ports::NetworkRequestsResult, PortError>>>,
         network_args: RefCell<Option<NetworkArgs>>,
         /// Overrides whatever `tabs()` would otherwise compute from
         /// `tabs_state` — used to simulate driver-level failures (e.g. an
@@ -1007,7 +1016,7 @@ mod tests {
                 evaluate_result: RefCell::new(None),
                 history_result: RefCell::new(None),
                 resize_result: RefCell::new(None),
-                network_result: RefCell::new(None),
+                network_results: RefCell::new(VecDeque::new()),
                 network_args: RefCell::new(None),
                 tabs_error: RefCell::new(None),
                 tabs_state: RefCell::new(vec![TabInfo {
@@ -1092,7 +1101,7 @@ mod tests {
             self,
             result: Result<crate::ports::NetworkRequestsResult, PortError>,
         ) -> Self {
-            *self.network_result.borrow_mut() = Some(result);
+            self.network_results.borrow_mut().push_back(result);
             self
         }
 
@@ -1389,9 +1398,9 @@ mod tests {
             self.calls.borrow_mut().push("network_requests");
             *self.network_args.borrow_mut() =
                 Some((filter_url.map(String::from), max_body_bytes, clear));
-            self.network_result
+            self.network_results
                 .borrow_mut()
-                .take()
+                .pop_front()
                 .expect("network result not configured")
         }
     }
@@ -2717,18 +2726,30 @@ mod tests {
     /// that's all this needs (unlike `docs.rs`'s fuller `InMemoryFileStore`).
     struct FakeFileStore {
         last_write: RefCell<Option<(String, Vec<u8>)>>,
+        fail_writes: bool,
     }
 
     impl FakeFileStore {
         fn new() -> Self {
             FakeFileStore {
                 last_write: RefCell::new(None),
+                fail_writes: false,
+            }
+        }
+
+        fn failing() -> Self {
+            FakeFileStore {
+                fail_writes: true,
+                ..Self::new()
             }
         }
     }
 
     impl crate::ports::FileStore for FakeFileStore {
         async fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), PortError> {
+            if self.fail_writes {
+                return Err(PortError::Other("disk full".to_string()));
+            }
             *self.last_write.borrow_mut() = Some((path.to_string(), bytes.to_vec()));
             Ok(())
         }
@@ -3612,6 +3633,61 @@ mod tests {
 
         assert_eq!(err, "session blocked");
         assert!(fs.last_write.borrow().is_none());
+    }
+
+    fn one_entry_result() -> crate::ports::NetworkRequestsResult {
+        crate::ports::NetworkRequestsResult {
+            entries: vec![sample_entry("https://x.test/api")],
+            truncated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_not_clear_when_har_write_fails() {
+        let driver = FakeBrowserDriver::new().with_network(Ok(one_entry_result()));
+        let fs = FakeFileStore::failing();
+
+        let err = browser_network_requests(
+            &driver,
+            &fs,
+            BrowserNetworkRequestsInput {
+                clear: Some(true),
+                save_path: Some("/tmp/out.har".to_string()),
+                ..network_input("sess-1")
+            },
+        )
+        .await
+        .expect_err("write failure should surface");
+
+        assert!(err.contains("disk full"), "{err}");
+        let (_, _, clear) = driver.network_args.borrow().clone().unwrap();
+        assert!(!clear, "entries must survive a failed HAR write");
+        assert_eq!(driver.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_clear_after_har_written_when_clear_requested() {
+        let driver = FakeBrowserDriver::new()
+            .with_network(Ok(one_entry_result()))
+            .with_network(Ok(one_entry_result()));
+        let fs = FakeFileStore::new();
+
+        let out = browser_network_requests(
+            &driver,
+            &fs,
+            BrowserNetworkRequestsInput {
+                clear: Some(true),
+                save_path: Some("/tmp/out.har".to_string()),
+                ..network_input("sess-1")
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(out.entries.len(), 1);
+        assert!(fs.last_write.borrow().is_some());
+        let (_, _, clear) = driver.network_args.borrow().clone().unwrap();
+        assert!(clear, "second call performs the clear");
     }
 
     #[test]

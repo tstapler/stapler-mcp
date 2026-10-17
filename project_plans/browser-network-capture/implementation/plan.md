@@ -227,6 +227,18 @@ function called from Rust wasm glue.
 - Open question 1 (single vs. multiple event tasks): `page.event_listener` returns one stream
   per event type, so four tasks are used.
 
+- `filter_url`, the body cap and the clear run inside each adapter (not the tool layer), so
+  `clear` stays atomic with the copy. At the 1000-entry cap further entries are dropped (matches
+  requirement 8), not recorded body-less as AC 2.3.4 said.
+- Only the session's first tab is observed (native and wasm).
+- With `savePath` + `clear`, the tool reads without clearing, writes the HAR, then clears, so a
+  failed write loses nothing.
+- A body is fetched only when the content type is known and non-binary (same rule in both
+  adapters); native bodies are fetched per `loadingFinished` event with a 3 s timeout, wasm with
+  a 3 s race.
+- `loadingFinished` yields (bounded) until its `responseReceived` is recorded, because the
+  `Network.*` streams are drained by separate tasks.
+
 ## Ordering / Dependencies
 
 ```
