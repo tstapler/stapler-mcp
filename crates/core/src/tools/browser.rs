@@ -22,8 +22,8 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::ports::{
-    AxNode, AxSnapshot, BrowserDriver, FileStore, HistoryAction, Locator, PortError, SessionId,
-    TabAction, TabInfo, WaitCondition,
+    AxNode, AxSnapshot, BrowserDriver, FileStore, HistoryAction, Locator, NetworkEntry, PortError,
+    SessionId, TabAction, TabInfo, WaitCondition,
 };
 use crate::schema::{
     AxNodeOutput, AxSnapshotOutput, BrowserActionOutput, BrowserClickInput,
@@ -32,6 +32,7 @@ use crate::schema::{
     BrowserFindInput, BrowserFindMatch, BrowserFindOutput, BrowserFormFieldType,
     BrowserGetHtmlInput, BrowserGetHtmlOutput, BrowserHistoryAction, BrowserHistoryInput,
     BrowserHoverInput, BrowserListSessionsOutput, BrowserNavigateInput, BrowserNavigateOutput,
+    BrowserNetworkEntry, BrowserNetworkRequestsInput, BrowserNetworkRequestsOutput,
     BrowserPdfInput, BrowserPdfOutput, BrowserPressKeyInput, BrowserResizeInput,
     BrowserScreenshotInput, BrowserScreenshotOutput, BrowserSelectOptionInput,
     BrowserSessionSummary, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabInfo,
@@ -806,6 +807,167 @@ pub async fn browser_resize<B: BrowserDriver>(
         snapshot: to_snapshot_output(snapshot),
         note: None,
     })
+}
+
+/// Largest `maxBodyBytes` the adapters honour; mirrors the native adapter's
+/// per-body capture cap.
+const MAX_NETWORK_BODY_BYTES: usize = 16_384;
+
+/// Total body bytes returned inline per call, so a default call over 1000
+/// entries can't flood the model's context. The saved HAR keeps full bodies.
+const MAX_NETWORK_RESPONSE_BODY_BYTES: usize = 262_144;
+
+pub async fn browser_network_requests<B: BrowserDriver, F: FileStore>(
+    browser: &B,
+    fs: &F,
+    input: BrowserNetworkRequestsInput,
+) -> Result<BrowserNetworkRequestsOutput, String> {
+    if input.session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let session_id = SessionId(input.session_id.clone());
+    let max_body_bytes = input
+        .max_body_bytes
+        .map(|n| (n as usize).min(MAX_NETWORK_BODY_BYTES));
+
+    let clear = input.clear.unwrap_or(false);
+    let filter_url = input.filter_url.as_deref().filter(|f| !f.is_empty());
+    // With a HAR to write, defer the clear until the write succeeded so a
+    // failed write doesn't lose the captured entries.
+    let clear_now = clear && input.save_path.is_none();
+
+    let result = browser
+        .network_requests(&session_id, filter_url, max_body_bytes, clear_now)
+        .await
+        .map_err(|e| map_error("network requests for", &input.session_id, e))?;
+
+    let mut saved_to = None;
+    if let Some(save_path) = input.save_path {
+        let har = serde_json::to_vec_pretty(&to_har(&result.entries))
+            .map_err(|e| format!("serializing HAR: {e}"))?;
+        fs.write_file(&save_path, &har)
+            .await
+            .map_err(|e| e.to_string())?;
+        saved_to = Some(save_path);
+        if clear {
+            // Entries that arrived since the read above are dropped
+            // unreturned; acceptable for a debugging aid.
+            browser
+                .network_requests(&session_id, filter_url, max_body_bytes, true)
+                .await
+                .map_err(|e| map_error("network requests for", &input.session_id, e))?;
+        }
+    }
+
+    let mut body_budget = MAX_NETWORK_RESPONSE_BODY_BYTES;
+    Ok(BrowserNetworkRequestsOutput {
+        entries: result
+            .entries
+            .into_iter()
+            .map(|e| {
+                let (body, body_truncated) = match e.body {
+                    Some(b) if b.len() <= body_budget => {
+                        body_budget -= b.len();
+                        (Some(b), e.body_truncated)
+                    }
+                    Some(_) => (None, true),
+                    None => (None, e.body_truncated),
+                };
+                BrowserNetworkEntry {
+                    url: e.url,
+                    method: e.method,
+                    status: e.status,
+                    content_type: e.content_type,
+                    body,
+                    body_truncated,
+                    timing_ms: e.timing_ms,
+                }
+            })
+            .collect(),
+        truncated: result.truncated,
+        saved_to,
+    })
+}
+
+/// HAR 1.2 document for `entries`. Header and size data isn't captured, so
+/// the required `headers`/`cookies` arrays are empty and the size fields use
+/// the spec's `-1` ("unknown").
+fn to_har(entries: &[NetworkEntry]) -> serde_json::Value {
+    use serde_json::json;
+
+    let har_entries: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            let time = e.timing_ms.map_or(-1, |t| t as i64);
+            let query_string: Vec<_> = url::Url::parse(&e.url)
+                .map(|u| {
+                    u.query_pairs()
+                        .map(|(k, v)| json!({ "name": k, "value": v }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut content = json!({
+                "size": e.body.as_ref().map_or(-1, |b| b.len() as i64),
+                "mimeType": e.content_type.clone().unwrap_or_default(),
+            });
+            if let Some(body) = &e.body {
+                content["text"] = json!(body);
+            }
+            json!({
+                "startedDateTime": iso8601_utc(e.started_at_ms),
+                "time": time,
+                "request": {
+                    "method": e.method,
+                    "url": e.url,
+                    "httpVersion": "HTTP/1.1",
+                    "cookies": [],
+                    "headers": [],
+                    "queryString": query_string,
+                    "headersSize": -1,
+                    "bodySize": -1,
+                },
+                "response": {
+                    "status": e.status.unwrap_or(0),
+                    "statusText": "",
+                    "httpVersion": "HTTP/1.1",
+                    "cookies": [],
+                    "headers": [],
+                    "content": content,
+                    "redirectURL": "",
+                    "headersSize": -1,
+                    "bodySize": -1,
+                },
+                "cache": {},
+                "timings": { "send": 0, "wait": time.max(0), "receive": 0 },
+            })
+        })
+        .collect();
+
+    json!({
+        "log": {
+            "version": "1.2",
+            "creator": { "name": "stapler-mcp", "version": env!("CARGO_PKG_VERSION") },
+            "entries": har_entries,
+        }
+    })
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` for a Unix-epoch millisecond timestamp
+/// (Howard Hinnant's civil-from-days algorithm; avoids a date-time dep).
+fn iso8601_utc(epoch_ms: u64) -> String {
+    let ms = epoch_ms % 1000;
+    let secs = epoch_ms / 1000;
+    let (h, mi, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
 }
 
 /// Caps how many matches are returned in one call — a broad query against a
@@ -2216,18 +2378,30 @@ mod tests {
     /// that's all this needs (unlike `docs.rs`'s fuller `InMemoryFileStore`).
     struct FakeFileStore {
         last_write: RefCell<Option<(String, Vec<u8>)>>,
+        fail_writes: bool,
     }
 
     impl FakeFileStore {
         fn new() -> Self {
             FakeFileStore {
                 last_write: RefCell::new(None),
+                fail_writes: false,
+            }
+        }
+
+        fn failing() -> Self {
+            FakeFileStore {
+                fail_writes: true,
+                ..Self::new()
             }
         }
     }
 
     impl crate::ports::FileStore for FakeFileStore {
         async fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), PortError> {
+            if self.fail_writes {
+                return Err(PortError::Other("disk full".to_string()));
+            }
             *self.last_write.borrow_mut() = Some((path.to_string(), bytes.to_vec()));
             Ok(())
         }
@@ -3216,5 +3390,218 @@ mod tests {
             err,
             "no active browser session named 'sess-9'; call stapler_browser_navigate to start a new session"
         );
+    }
+
+    fn sample_entry(url: &str) -> NetworkEntry {
+        NetworkEntry {
+            url: url.to_string(),
+            method: "GET".to_string(),
+            status: Some(200),
+            content_type: Some("application/json".to_string()),
+            body: Some("{\"ok\":true}".to_string()),
+            body_truncated: false,
+            timing_ms: Some(42),
+            started_at_ms: 1_700_000_000_123,
+        }
+    }
+
+    fn network_input(session_id: &str) -> BrowserNetworkRequestsInput {
+        BrowserNetworkRequestsInput {
+            session_id: session_id.to_string(),
+            filter_url: None,
+            max_body_bytes: None,
+            clear: None,
+            save_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_return_err_when_session_id_is_empty() {
+        let driver = FakeBrowserDriver::new();
+        let fs = FakeFileStore::new();
+
+        let err = browser_network_requests(&driver, &fs, network_input(""))
+            .await
+            .expect_err("empty sessionId should be rejected");
+
+        assert_eq!(err, "sessionId must not be empty");
+        assert_eq!(driver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_forward_filter_clamped_cap_and_clear_to_driver() {
+        let driver =
+            FakeBrowserDriver::new().with_network(Ok(crate::ports::NetworkRequestsResult {
+                entries: vec![sample_entry("https://x.test/api/data")],
+                truncated: true,
+            }));
+        let fs = FakeFileStore::new();
+
+        let out = browser_network_requests(
+            &driver,
+            &fs,
+            BrowserNetworkRequestsInput {
+                filter_url: Some("/api/".to_string()),
+                max_body_bytes: Some(1_000_000),
+                clear: Some(true),
+                ..network_input("sess-1")
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(
+            *driver.network_args.borrow(),
+            Some((
+                Some("/api/".to_string()),
+                Some(MAX_NETWORK_BODY_BYTES),
+                true
+            ))
+        );
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].status, Some(200));
+        assert_eq!(out.entries[0].body.as_deref(), Some("{\"ok\":true}"));
+        assert!(out.truncated);
+        assert_eq!(out.saved_to, None);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_drop_bodies_past_total_budget_and_flag_truncated() {
+        let big = |url: &str| NetworkEntry {
+            body: Some("x".repeat(MAX_NETWORK_BODY_BYTES)),
+            ..sample_entry(url)
+        };
+        let n = MAX_NETWORK_RESPONSE_BODY_BYTES / MAX_NETWORK_BODY_BYTES + 1;
+        let entries = (0..n)
+            .map(|i| big(&format!("https://x.test/{i}")))
+            .collect();
+        let driver =
+            FakeBrowserDriver::new().with_network(Ok(crate::ports::NetworkRequestsResult {
+                entries,
+                truncated: false,
+            }));
+        let fs = FakeFileStore::new();
+
+        let out = browser_network_requests(&driver, &fs, network_input("sess-1"))
+            .await
+            .expect("should succeed");
+
+        let last = out.entries.last().expect("entries");
+        assert_eq!(out.entries.len(), n);
+        assert!(out.entries[0].body.is_some());
+        assert!(last.body.is_none() && last.body_truncated);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_write_har_1_2_when_save_path_given() {
+        let driver =
+            FakeBrowserDriver::new().with_network(Ok(crate::ports::NetworkRequestsResult {
+                entries: vec![sample_entry("https://x.test/api?q=1")],
+                truncated: false,
+            }));
+        let fs = FakeFileStore::new();
+
+        let out = browser_network_requests(
+            &driver,
+            &fs,
+            BrowserNetworkRequestsInput {
+                save_path: Some("/tmp/out.har".to_string()),
+                ..network_input("sess-1")
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(out.saved_to.as_deref(), Some("/tmp/out.har"));
+        let (path, bytes) = fs.last_write.borrow().clone().expect("HAR written");
+        assert_eq!(path, "/tmp/out.har");
+        let har: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(har["log"]["version"], "1.2");
+        assert_eq!(har["log"]["creator"]["name"], "stapler-mcp");
+        let entry = &har["log"]["entries"][0];
+        assert_eq!(entry["startedDateTime"], "2023-11-14T22:13:20.123Z");
+        assert_eq!(entry["request"]["method"], "GET");
+        assert_eq!(entry["request"]["queryString"][0]["name"], "q");
+        assert_eq!(entry["request"]["headersSize"], -1);
+        assert_eq!(entry["response"]["status"], 200);
+        assert_eq!(entry["response"]["content"]["text"], "{\"ok\":true}");
+        assert_eq!(entry["response"]["content"]["mimeType"], "application/json");
+        assert_eq!(entry["time"], 42);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_pass_blocked_session_not_found_through_unchanged() {
+        let driver = FakeBrowserDriver::new()
+            .with_network(Err(PortError::NotFound("session blocked".to_string())));
+        let fs = FakeFileStore::new();
+
+        let err = browser_network_requests(&driver, &fs, network_input("sess-1"))
+            .await
+            .expect_err("not-found should surface as an error");
+
+        assert_eq!(err, "session blocked");
+        assert!(fs.last_write.borrow().is_none());
+    }
+
+    fn one_entry_result() -> crate::ports::NetworkRequestsResult {
+        crate::ports::NetworkRequestsResult {
+            entries: vec![sample_entry("https://x.test/api")],
+            truncated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_not_clear_when_har_write_fails() {
+        let driver = FakeBrowserDriver::new().with_network(Ok(one_entry_result()));
+        let fs = FakeFileStore::failing();
+
+        let err = browser_network_requests(
+            &driver,
+            &fs,
+            BrowserNetworkRequestsInput {
+                clear: Some(true),
+                save_path: Some("/tmp/out.har".to_string()),
+                ..network_input("sess-1")
+            },
+        )
+        .await
+        .expect_err("write failure should surface");
+
+        assert!(err.contains("disk full"), "{err}");
+        let (_, _, clear) = driver.network_args.borrow().clone().unwrap();
+        assert!(!clear, "entries must survive a failed HAR write");
+        assert_eq!(driver.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn browser_network_requests_should_clear_after_har_written_when_clear_requested() {
+        let driver = FakeBrowserDriver::new()
+            .with_network(Ok(one_entry_result()))
+            .with_network(Ok(one_entry_result()));
+        let fs = FakeFileStore::new();
+
+        let out = browser_network_requests(
+            &driver,
+            &fs,
+            BrowserNetworkRequestsInput {
+                clear: Some(true),
+                save_path: Some("/tmp/out.har".to_string()),
+                ..network_input("sess-1")
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(out.entries.len(), 1);
+        assert!(fs.last_write.borrow().is_some());
+        let (_, _, clear) = driver.network_args.borrow().clone().unwrap();
+        assert!(clear, "second call performs the clear");
+    }
+
+    #[test]
+    fn iso8601_utc_should_format_epoch_and_leap_day() {
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00.000Z");
+        // 2024-02-29T12:34:56.789Z
+        assert_eq!(iso8601_utc(1_709_210_096_789), "2024-02-29T12:34:56.789Z");
     }
 }

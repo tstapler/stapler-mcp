@@ -16,6 +16,9 @@ use crate::ports::{
     TabAction, TabInfo,
 };
 
+/// `(filter_url, max_body_bytes, clear)` as received by `network_requests`.
+pub(crate) type NetworkArgs = (Option<String>, Option<usize>, bool);
+
 pub(crate) struct FakeBrowserDriver {
     navigate_result: RefCell<Option<Result<crate::ports::NavigateResult, PortError>>>,
     click_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
@@ -43,6 +46,8 @@ pub(crate) struct FakeBrowserDriver {
     pub(crate) evaluate_calls: RefCell<Vec<(String, Option<Locator>)>>,
     history_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
     resize_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
+    network_results: RefCell<VecDeque<Result<crate::ports::NetworkRequestsResult, PortError>>>,
+    pub(crate) network_args: RefCell<Option<NetworkArgs>>,
     /// Overrides whatever `tabs()` would otherwise compute from
     /// `tabs_state` — used to simulate driver-level failures (e.g. an
     /// unknown session) without disturbing the in-memory tab list.
@@ -76,6 +81,8 @@ impl FakeBrowserDriver {
             evaluate_calls: RefCell::new(Vec::new()),
             history_result: RefCell::new(None),
             resize_result: RefCell::new(None),
+            network_results: RefCell::new(VecDeque::new()),
+            network_args: RefCell::new(None),
             tabs_error: RefCell::new(None),
             tabs_state: RefCell::new(vec![TabInfo {
                 index: 0,
@@ -150,6 +157,14 @@ impl FakeBrowserDriver {
 
     pub(crate) fn with_screenshot(self, result: Result<Vec<u8>, PortError>) -> Self {
         *self.screenshot_result.borrow_mut() = Some(result);
+        self
+    }
+
+    pub(crate) fn with_network(
+        self,
+        result: Result<crate::ports::NetworkRequestsResult, PortError>,
+    ) -> Self {
+        self.network_results.borrow_mut().push_back(result);
         self
     }
 
@@ -422,6 +437,22 @@ impl BrowserDriver for FakeBrowserDriver {
             .borrow_mut()
             .take()
             .expect("screenshot result not configured")
+    }
+
+    async fn network_requests(
+        &self,
+        _session_id: &SessionId,
+        filter_url: Option<&str>,
+        max_body_bytes: Option<usize>,
+        clear: bool,
+    ) -> Result<crate::ports::NetworkRequestsResult, PortError> {
+        self.calls.borrow_mut().push("network_requests");
+        *self.network_args.borrow_mut() =
+            Some((filter_url.map(String::from), max_body_bytes, clear));
+        self.network_results
+            .borrow_mut()
+            .pop_front()
+            .expect("network result not configured")
     }
 
     async fn pdf(&self, _session_id: &SessionId, _timeout: Duration) -> Result<Vec<u8>, PortError> {

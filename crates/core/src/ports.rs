@@ -366,6 +366,28 @@ pub struct SessionSummary {
     pub crashed: bool,
 }
 
+/// One captured network transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetworkEntry {
+    pub url: String,
+    pub method: String,
+    pub status: Option<u16>,
+    pub content_type: Option<String>,
+    /// `None` for binary content types and for bodies that were unavailable.
+    pub body: Option<String>,
+    pub body_truncated: bool,
+    pub timing_ms: Option<u64>,
+    /// Milliseconds since the Unix epoch; feeds HAR `startedDateTime`.
+    pub started_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetworkRequestsResult {
+    pub entries: Vec<NetworkEntry>,
+    /// `true` if the session hit its entry cap and dropped later entries.
+    pub truncated: bool,
+}
+
 /// What `BrowserDriver::wait_for` polls for before returning.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WaitCondition {
@@ -564,6 +586,19 @@ pub trait BrowserDriver {
         height: u32,
         timeout: Duration,
     ) -> Result<AxSnapshot, PortError>;
+
+    /// Returns the network entries captured since `session_id`'s last
+    /// navigation, optionally narrowed to URLs containing `filter_url` and
+    /// with bodies cut to `max_body_bytes`. `clear: true` copies the entries
+    /// out and empties the session's list in the same step. In-memory read:
+    /// no timeout. `PortError::NotFound` for an unknown or blocked session.
+    async fn network_requests(
+        &self,
+        session_id: &SessionId,
+        filter_url: Option<&str>,
+        max_body_bytes: Option<usize>,
+        clear: bool,
+    ) -> Result<NetworkRequestsResult, PortError>;
 }
 
 pub trait FileStore {
@@ -798,6 +833,16 @@ mod tests {
             _height: u32,
             _timeout: Duration,
         ) -> Result<AxSnapshot, PortError> {
+            todo!()
+        }
+
+        async fn network_requests(
+            &self,
+            _session_id: &SessionId,
+            _filter_url: Option<&str>,
+            _max_body_bytes: Option<usize>,
+            _clear: bool,
+        ) -> Result<NetworkRequestsResult, PortError> {
             todo!()
         }
     }

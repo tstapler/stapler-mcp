@@ -12,6 +12,10 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 };
 use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+use chromiumoxide::cdp::browser_protocol::network::{
+    EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
+    EventRequestWillBeSent, EventResponseReceived, GetResponseBodyParams,
+};
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, EventFrameNavigated, EventFrameRequestedNavigation,
     GetNavigationHistoryParams, NavigateToHistoryEntryParams, PrintToPdfParams,
@@ -25,13 +29,15 @@ use futures::StreamExt;
 
 use stapler_mcp_core::ports::{
     AxNode, AxSnapshot, BrowserDriver, ClockPort, CredentialField, CredentialRef, CredentialStore,
-    HistoryAction, Locator, NavigateResult, PageExtract, PortError, SecretValue, SessionId,
-    SessionSummary, SleepPort, TabAction, TabInfo, TabsResult, WaitCondition, REDACTED_PLACEHOLDER,
+    HistoryAction, Locator, NavigateResult, NetworkRequestsResult, PageExtract, PortError,
+    SecretValue, SessionId, SessionSummary, SleepPort, TabAction, TabInfo, TabsResult,
+    WaitCondition, REDACTED_PLACEHOLDER,
 };
 use stapler_mcp_core::tools::webcrawl::{blocked_host_reason, same_host, NetworkPolicy};
 use url::Url;
 
 use crate::ax;
+use crate::network::NetworkLog;
 
 /// How long a session may sit idle (no `navigate`/`click`/`type_text`/`snapshot`
 /// call bumping its `last_used`) before `SessionIdleReaper` closes its tab and
@@ -288,6 +294,11 @@ struct BrowserSession {
     /// session's page is created (Epic 3, Story 3.2); checked by every
     /// `BrowserDriver` method before use (Story 2.5).
     crashed: Rc<Cell<bool>>,
+    /// Requests captured by the `Network.*` listeners (see
+    /// `spawn_network_listeners`); reset on every `navigate`. Only the
+    /// session's first tab is observed — listeners attach once, to the page
+    /// created at session start.
+    network: Rc<RefCell<NetworkLog>>,
     /// Serializes every session-mutating `BrowserDriver` call
     /// (`navigate`/`click`/`type_text`/`snapshot`) against this session's
     /// `Page`. Held for the full duration of the call (across all its
@@ -1441,6 +1452,118 @@ async fn spawn_session_listeners(
     }
 }
 
+/// Upper bound on scheduler yields a `loadingFinished` handler spends waiting
+/// for its `responseReceived` event to be recorded.
+const NETWORK_RESPONSE_WAIT_YIELDS: usize = 16;
+/// Bounds `Network.getResponseBody` so a stalled call can't pin a task.
+const NETWORK_BODY_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Enables the CDP `Network` domain and feeds `log` from its request /
+/// response / finished / failed events. Like `spawn_session_listeners`, called
+/// once at session creation, before the first `goto`, so the initial page
+/// load is captured. Each handler borrows `log` only synchronously; the body
+/// fetch's `.await` happens with no borrow held.
+async fn spawn_network_listeners(
+    page: &Page,
+    log: Rc<RefCell<NetworkLog>>,
+) -> Result<(), PortError> {
+    let subscribe_err = |e: chromiumoxide::error::CdpError| {
+        PortError::Other(format!("subscribing to network events: {e}"))
+    };
+    page.execute(NetworkEnableParams::default())
+        .await
+        .map_err(|e| PortError::Other(format!("enabling network capture: {e}")))?;
+
+    let mut requests = page
+        .event_listener::<EventRequestWillBeSent>()
+        .await
+        .map_err(subscribe_err)?;
+    let mut responses = page
+        .event_listener::<EventResponseReceived>()
+        .await
+        .map_err(subscribe_err)?;
+    let mut finished = page
+        .event_listener::<EventLoadingFinished>()
+        .await
+        .map_err(subscribe_err)?;
+    let mut failed = page
+        .event_listener::<EventLoadingFailed>()
+        .await
+        .map_err(subscribe_err)?;
+
+    let request_log = log.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(ev) = requests.next().await {
+            let redirect_status = ev
+                .redirect_response
+                .as_ref()
+                .and_then(|r| u16::try_from(r.status).ok());
+            request_log.borrow_mut().on_request(
+                ev.request_id.inner(),
+                &ev.request.url,
+                &ev.request.method,
+                (*ev.wall_time.inner() * 1000.0) as u64,
+                *ev.timestamp.inner(),
+                redirect_status,
+            );
+        }
+    });
+
+    let response_log = log.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(ev) = responses.next().await {
+            response_log.borrow_mut().on_response(
+                ev.request_id.inner(),
+                u16::try_from(ev.response.status).ok(),
+                &ev.response.mime_type,
+            );
+        }
+    });
+
+    let finished_log = log.clone();
+    let finished_page = page.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(ev) = finished.next().await {
+            // One task per event so a stalled body fetch can't delay the
+            // completion of later requests.
+            let log = finished_log.clone();
+            let page = finished_page.clone();
+            tokio::task::spawn_local(async move {
+                let id = ev.request_id.inner().clone();
+                // `responseReceived` is drained by its own task; yield so it
+                // runs before this handler decides whether to fetch a body.
+                for _ in 0..NETWORK_RESPONSE_WAIT_YIELDS {
+                    if log.borrow().has_response(&id) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let wants_body = log.borrow().wants_body(&id);
+                let body = if wants_body {
+                    // Best effort: Chrome may already have evicted the body.
+                    let fetch = page.execute(GetResponseBodyParams::new(ev.request_id.clone()));
+                    match tokio::time::timeout(NETWORK_BODY_FETCH_TIMEOUT, fetch).await {
+                        Ok(Ok(r)) if !r.result.base64_encoded => Some(r.result.body.clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                log.borrow_mut().complete(&id, *ev.timestamp.inner(), body);
+            });
+        }
+    });
+
+    tokio::task::spawn_local(async move {
+        while let Some(ev) = failed.next().await {
+            log.borrow_mut()
+                .on_failed(ev.request_id.inner(), *ev.timestamp.inner());
+        }
+    });
+
+    Ok(())
+}
+
 impl BrowserDriver for NativeBrowser {
     async fn navigate_and_extract(
         &self,
@@ -1577,6 +1700,11 @@ impl BrowserDriver for NativeBrowser {
                     // surfaced.
                     spawn_session_listeners(&page, id.clone(), blocked.clone(), crashed.clone())
                         .await;
+                    let network = Rc::new(RefCell::new(NetworkLog::default()));
+                    if let Err(e) = spawn_network_listeners(&page, network.clone()).await {
+                        let _ = page.close().await;
+                        return Err(e);
+                    }
 
                     // Now safe to actually request the caller's URL: the
                     // listeners are attached, so any redirect chained onto
@@ -1614,6 +1742,7 @@ impl BrowserDriver for NativeBrowser {
                             next_ref_id,
                             blocked,
                             crashed,
+                            network,
                             lock: Rc::new(tokio::sync::Mutex::new(())),
                         };
                         self.sessions.borrow_mut().insert(id, session);
@@ -1643,6 +1772,7 @@ impl BrowserDriver for NativeBrowser {
                         next_ref_id,
                         blocked,
                         crashed,
+                        network,
                         lock: Rc::new(tokio::sync::Mutex::new(())),
                     };
                     self.sessions.borrow_mut().insert(id.clone(), session);
@@ -1656,7 +1786,7 @@ impl BrowserDriver for NativeBrowser {
                 Some(id) => {
                     touch_or_evict(&self.sessions, &id.0, now_millis())?;
 
-                    let (next_ref_id, blocked, lock) = {
+                    let (next_ref_id, blocked, network, lock) = {
                         let map = self.sessions.borrow();
                         let session = map
                             .get(&id.0)
@@ -1664,6 +1794,7 @@ impl BrowserDriver for NativeBrowser {
                         (
                             session.next_ref_id.clone(),
                             session.blocked.clone(),
+                            session.network.clone(),
                             session.lock.clone(),
                         )
                     };
@@ -1712,6 +1843,7 @@ impl BrowserDriver for NativeBrowser {
                     // in-page navigation — this is the caller's documented
                     // recovery path (Task 3.4.2).
                     *blocked.borrow_mut() = None;
+                    network.borrow_mut().reset();
 
                     // `goto_or_blocked` races the whole navigation against
                     // `blocked` so a same-call redirect to an unreachable
@@ -2904,6 +3036,44 @@ impl BrowserDriver for NativeBrowser {
             .await
             .map_err(|_| PortError::Timeout)?
     }
+
+    /// In-memory read: no session lock and no `.await` after the lookup, so
+    /// the blocked check and the copy-then-clear share one uninterrupted
+    /// `borrow_mut` scope on the single-threaded runtime.
+    async fn network_requests(
+        &self,
+        session_id: &SessionId,
+        filter_url: Option<&str>,
+        max_body_bytes: Option<usize>,
+        clear: bool,
+    ) -> Result<NetworkRequestsResult, PortError> {
+        touch_or_evict(&self.sessions, &session_id.0, now_millis())?;
+        let (blocked, network) = {
+            let map = self.sessions.borrow();
+            let session = map
+                .get(&session_id.0)
+                .expect("touch_or_evict just confirmed presence");
+            (session.blocked.clone(), session.network.clone())
+        };
+        read_network(&blocked, &network, filter_url, max_body_bytes, clear)
+    }
+}
+
+/// A session flagged `blocked` (SSRF) must not leak what its captured
+/// requests saw, so it answers `NotFound` like every other operation.
+fn read_network(
+    blocked: &RefCell<Option<String>>,
+    network: &RefCell<NetworkLog>,
+    filter_url: Option<&str>,
+    max_body_bytes: Option<usize>,
+    clear: bool,
+) -> Result<NetworkRequestsResult, PortError> {
+    if let Some(reason) = blocked.borrow().clone() {
+        return Err(PortError::NotFound(reason));
+    }
+    Ok(network
+        .borrow_mut()
+        .query(filter_url, max_body_bytes, clear))
 }
 
 /// Builds one `TabInfo` per page in `tabs`, in order — used by every
@@ -4645,6 +4815,46 @@ mod tests {
         ) -> Result<AxSnapshot, PortError> {
             panic!("not exercised by this test");
         }
+
+        async fn network_requests(
+            &self,
+            _session_id: &SessionId,
+            _filter_url: Option<&str>,
+            _max_body_bytes: Option<usize>,
+            _clear: bool,
+        ) -> Result<NetworkRequestsResult, PortError> {
+            panic!("not exercised by this test");
+        }
+    }
+
+    #[test]
+    fn read_network_should_return_not_found_when_session_blocked() {
+        let blocked = RefCell::new(Some("blocked host".to_string()));
+        let network = RefCell::new(NetworkLog::default());
+        network
+            .borrow_mut()
+            .on_request("1", "http://169.254.169.254/", "GET", 0, 0.0, None);
+        network.borrow_mut().on_failed("1", 0.1);
+
+        match read_network(&blocked, &network, None, None, false) {
+            Err(PortError::NotFound(msg)) => assert_eq!(msg, "blocked host"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_network_should_return_entries_then_empty_when_clear_requested() {
+        let blocked = RefCell::new(None);
+        let network = RefCell::new(NetworkLog::default());
+        network
+            .borrow_mut()
+            .on_request("1", "http://x/a", "GET", 0, 0.0, None);
+        network.borrow_mut().on_failed("1", 0.1);
+
+        let first = read_network(&blocked, &network, None, None, true).unwrap();
+        assert_eq!(first.entries.len(), 1);
+        let second = read_network(&blocked, &network, None, None, false).unwrap();
+        assert!(second.entries.is_empty());
     }
 
     #[tokio::test]

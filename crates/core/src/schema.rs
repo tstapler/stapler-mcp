@@ -651,6 +651,45 @@ pub struct BrowserScreenshotOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct BrowserNetworkRequestsInput {
+    pub session_id: String,
+    /// Only return entries whose URL contains this substring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_url: Option<String>,
+    /// Cap each returned body at this many bytes. Defaults to, and cannot
+    /// exceed, 16384.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<u32>,
+    /// Return the current entries, then empty the session's list. Defaults to
+    /// `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear: Option<bool>,
+    /// Optional local file path to write the (filtered) entries to as a HAR
+    /// 1.2 document. The HAR carries no header data (`headersSize` and
+    /// `bodySize` are `-1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_path: Option<String>,
+}
+
+/// One request/response captured since the session's last navigation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserNetworkEntry {
+    pub url: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// UTF-8 text; `null` for binary content types and unavailable bodies.
+    pub body: Option<String>,
+    pub body_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserPdfInput {
     pub session_id: String,
     /// Optional local file path to save the PDF to. When set, `dataBase64`
@@ -660,6 +699,18 @@ pub struct BrowserPdfInput {
     pub save_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserNetworkRequestsOutput {
+    pub entries: Vec<BrowserNetworkEntry>,
+    /// `true` if the session hit its 1000-entry cap and later requests were
+    /// not recorded.
+    pub truncated: bool,
+    /// Local path the HAR was written to, if `savePath` was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

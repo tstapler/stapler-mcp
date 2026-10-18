@@ -14,11 +14,12 @@ use stapler_mcp_core::schema::{
     BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
     BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
-    BrowserPdfInput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
-    BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput,
-    BrowserTypeInput, BrowserTypeSecretInput, BrowserWaitForInput, DaemonStatusOutput,
-    DownloadWebsiteInput, FetchPageInput, IndexDocsInput, ListIndexedSourcesInput,
-    ReadSavedPageInput, ReadWebsiteInput, RemoveIndexedSourceInput, SearchDocsInput,
+    BrowserNetworkRequestsInput, BrowserPdfInput, BrowserPressKeyInput, BrowserResizeInput,
+    BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput,
+    BrowserTabsInput, BrowserTypeInput, BrowserTypeSecretInput, BrowserWaitForInput,
+    DaemonStatusOutput, DownloadWebsiteInput, FetchPageInput, IndexDocsInput,
+    ListIndexedSourcesInput, ReadSavedPageInput, ReadWebsiteInput, RemoveIndexedSourceInput,
+    SearchDocsInput,
 };
 use stapler_mcp_core::tools::{browser, credential, docs, fetch, search, webcrawl};
 use stapler_mcp_native::{
@@ -752,6 +753,19 @@ async fn run_daemon() {
             move |input: BrowserResizeInput| {
                 let browser = browser.clone();
                 async move { browser::browser_resize(&*browser, input).await }
+            }
+        }),
+    );
+
+    daemon.register(
+        "stapler_browser_network_requests",
+        json_handler({
+            let browser = browser.clone();
+            let fs = fs.clone();
+            move |input: BrowserNetworkRequestsInput| {
+                let browser = browser.clone();
+                let fs = fs.clone();
+                async move { browser::browser_network_requests(&*browser, &*fs, input).await }
             }
         }),
     );

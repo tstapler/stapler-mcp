@@ -85,8 +85,14 @@ async fn spawn_mock_site() -> (String, tokio::sync::oneshot::Sender<()>) {
                 });\
                 </script>\
                 </body></html>";
-    let routes: HashMap<&str, String> = HashMap::from([("/", page.to_string())]);
+    serve_routes(HashMap::from([("/", ("text/html", page.to_string()))])).await
+}
 
+/// Serves each `path -> (content type, body)` route over plain HTTP on an
+/// ephemeral `127.0.0.1` port; any other path is a 404.
+async fn serve_routes(
+    routes: HashMap<&'static str, (&'static str, String)>,
+) -> (String, tokio::sync::oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock site");
@@ -110,10 +116,10 @@ async fn spawn_mock_site() -> (String, tokio::sync::oneshot::Sender<()>) {
                             .and_then(|line| line.split_whitespace().nth(1))
                             .unwrap_or("/")
                             .to_string();
-                        let body = routes.get(path.as_str()).cloned();
-                        let resp = match body {
-                            Some(b) => format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        let route = routes.get(path.as_str()).cloned();
+                        let resp = match route {
+                            Some((content_type, b)) => format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 b.len(),
                                 b
                             ),
@@ -1595,6 +1601,88 @@ async fn browser_web_search_should_return_decoded_results_from_real_bing() {
          tracking redirect: {results:?}"
     );
 
+    client::call(
+        &socket,
+        &sock_path,
+        "shutdown",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("shutdown call should succeed");
+}
+
+/// Criterion 10: a page whose script `fetch`es `/api/data` on load must show
+/// that XHR in `stapler_browser_network_requests`, with status 200 and the
+/// JSON body, once narrowed by `filterUrl`.
+#[tokio::test]
+#[ignore]
+async fn network_requests_should_capture_xhr_status_and_json_body_when_page_fetches_api() {
+    let (_tmp, socket, sock_path) = start_daemon(true).await;
+    let page = "<html><head><title>XHR Fixture</title></head><body><p>hi</p>\
+                <script>fetch('/api/data').then(function (r) { return r.text(); });</script>\
+                </body></html>";
+    let (site_url, shutdown_site) = serve_routes(HashMap::from([
+        ("/", ("text/html", page.to_string())),
+        (
+            "/api/data",
+            (
+                "application/json",
+                r#"{"greeting":"hello-from-xhr"}"#.to_string(),
+            ),
+        ),
+    ]))
+    .await;
+
+    let navigate_result = client::call(
+        &socket,
+        &sock_path,
+        "stapler_browser_navigate",
+        Some(json!({ "url": site_url })),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("browser_navigate should succeed");
+    let session_id = navigate_result["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    // The fetch races the navigation's load event; poll briefly for it.
+    let mut matching = Vec::new();
+    for _ in 0..20 {
+        let result = client::call(
+            &socket,
+            &sock_path,
+            "stapler_browser_network_requests",
+            Some(json!({ "sessionId": session_id, "filterUrl": "/api/data" })),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("network_requests should succeed");
+        matching = result["entries"].as_array().cloned().unwrap_or_default();
+        if !matching.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly the XHR entry: {matching:?}"
+    );
+    assert_eq!(matching[0]["status"], 200);
+    assert_eq!(matching[0]["method"], "GET");
+    assert!(
+        matching[0]["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("hello-from-xhr")),
+        "expected JSON body fragment, got: {:?}",
+        matching[0]
+    );
+
+    let _ = shutdown_site.send(());
     client::call(
         &socket,
         &sock_path,

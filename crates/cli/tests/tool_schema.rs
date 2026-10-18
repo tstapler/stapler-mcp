@@ -30,9 +30,9 @@ use stapler_mcp_core::schema::{
     BraveSearchInput, BrowserClickInput, BrowserCloseAllSessionsInput, BrowserCloseSessionInput,
     BrowserEvaluateInput, BrowserFillFormInput, BrowserFindInput, BrowserGetHtmlInput,
     BrowserHistoryInput, BrowserHoverInput, BrowserListSessionsInput, BrowserNavigateInput,
-    BrowserPdfInput, BrowserPressKeyInput, BrowserResizeInput, BrowserScreenshotInput,
-    BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput, BrowserTabsInput,
-    BrowserTypeInput, BrowserWaitForInput, DaemonStatusInput, IndexDocsInput,
+    BrowserNetworkRequestsInput, BrowserPdfInput, BrowserPressKeyInput, BrowserResizeInput,
+    BrowserScreenshotInput, BrowserSelectOptionInput, BrowserSetCheckedInput, BrowserSnapshotInput,
+    BrowserTabsInput, BrowserTypeInput, BrowserWaitForInput, DaemonStatusInput, IndexDocsInput,
     ListIndexedSourcesInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 
@@ -173,6 +173,11 @@ async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_inpu
         (
             "browser_web_search",
             schema_for_input::<BraveSearchInput>().expect("BraveSearchInput schemars schema"),
+        ),
+        (
+            "stapler_browser_network_requests",
+            schema_for_input::<BrowserNetworkRequestsInput>()
+                .expect("BrowserNetworkRequestsInput schemars schema"),
         ),
     ];
 

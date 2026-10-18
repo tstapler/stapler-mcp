@@ -210,8 +210,8 @@ fn socket_and_channel_transport_should_register_identical_tool_schemas() {
     );
     assert_eq!(
         socket_tools.len(),
-        33,
-        "expected all 33 tools (27 ThinClient-era + read_saved_page, \
+        34,
+        "expected all 34 tools (28 ThinClient-era + read_saved_page, \
          stapler_browser_type_secret, stapler_browser_get_html merged from main, \
          stapler_daemon_status, browser_web_search, stapler_browser_pdf) to be registered"
     );

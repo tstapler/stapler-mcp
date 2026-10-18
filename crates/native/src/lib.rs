@@ -9,6 +9,7 @@ mod fs;
 mod http;
 pub mod http_token;
 mod lock;
+mod network;
 mod sleep;
 mod socket;
 mod spawn;
