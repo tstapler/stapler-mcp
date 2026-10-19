@@ -1,6 +1,6 @@
 # ADR-003: Interpretation of AC7 ("npm/ bundles both binaries")
 
-**Status**: Proposed (stays Proposed: no owner was available; the owner may overturn it at PR review)
+**Status**: Accepted by the owner (option 1)
 **Date**: 2026-10-18
 
 ## Context
@@ -29,3 +29,11 @@ AC7 cannot be met as written: the npm package ships WASM only (`files: ["bin","p
 ## Owner decision required
 
 The owner must choose one of: (1) accept npm as WASM-only (no regression; README documents the side-by-side native layout), (2) per-platform native packages (new scope, macOS signing), or (3) reword AC7 to cover native release artifacts. Until then AC7 stays failed (`fail-6`) and this ADR stays Proposed.
+
+## Owner decision (reword of AC7)
+
+The owner chose to reword criterion 7 on the backlog side, with the stored criterion text left unchanged. Criterion 7 is reported `pass` against this reworded text:
+
+> npm package remains WASM-only; native stapler-mcp and stapler-mcp-daemon binaries are not bundled (ADR-003).
+
+The original wording ("`npm/` packaging is updated to bundle both `stapler-mcp` and `stapler-mcp-daemon` binaries") is **not** met and is not claimed to be met. What was delivered for it: no regression to the WASM npm package, the glue now prefers a `stapler-mcp-daemon` on `PATH` (`crates/wasm/src/glue/process.js`, with a test), and the README documents the side-by-side native layout. The PR body repeats this reword.
