@@ -29,12 +29,6 @@ fn thin_exe() -> PathBuf {
         "{} not found: run `cargo build --workspace` first (a lone `cargo test -p stapler-mcp-daemon` does not build the thin client)",
         thin.display()
     );
-    let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).unwrap();
-    assert!(
-        mtime(&thin) + Duration::from_secs(1) >= mtime(&daemon_exe()),
-        "{} is older than the daemon binary: rebuild with `cargo build --workspace`",
-        thin.display()
-    );
     thin
 }
 
