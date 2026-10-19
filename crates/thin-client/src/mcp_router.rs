@@ -75,6 +75,7 @@ const TOOL_CATEGORIES: &[(&str, &[&str])] = &[
             "stapler_browser_pdf",
             "stapler_browser_evaluate",
             "stapler_browser_get_html",
+            "stapler_browser_network_requests",
             "stapler_browser_fill_form",
             "stapler_browser_set_checked",
             "stapler_browser_history",
@@ -183,10 +184,6 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     /// Constructs a router over a non-default transport — used by
     /// `http_server::build_mcp_service` to build a fresh
     /// `McpRouter<ChannelTransport>` per HTTP session.
-    // `tests/tool_schema.rs` pulls this file in via `#[path]` into a
-    // separate compilation unit that only calls `registered_tools()`, where
-    // dead-code analysis can't see `http_server.rs`'s real call site.
-    #[allow(dead_code)]
     pub fn with_transport(transport: T) -> Self {
         let mut tool_router = Self::tool_router();
         apply_tool_profile(
@@ -883,11 +880,8 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
 impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     /// Test-only accessor exercising the exact `daemon_status` tool method
     /// (and therefore the same `DaemonStatusOutput` deserialization path a
-    /// real MCP client would go through) without a live stdio client. See
-    /// `registered_tools()`'s doc comment for why this needs the same
-    /// `#[allow(dead_code)]`.
-    #[cfg(test)]
-    #[allow(dead_code)]
+    /// real MCP client would go through) without a live stdio client. `pub`
+    /// (not `cfg(test)`) so `tests/tool_schema.rs`, a separate crate, can call it.
     pub async fn call_daemon_status_for_test(&self) -> Result<DaemonStatusOutput, String> {
         self.daemon_status(Parameters(DaemonStatusInput {}))
             .await
@@ -902,13 +896,6 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     /// `tests/tool_schema.rs` to verify Story 5.2.1's `tools/list`
     /// acceptance criterion (all docs-index tools present with non-empty
     /// descriptions and schemas matching their `*Input` structs).
-    ///
-    /// Only called from that separate integration-test binary (which pulls
-    /// this file in via `#[path]`, since `crates/cli` has no `[lib]`
-    /// target) — invisible to dead-code analysis of *this* compilation
-    /// unit, hence the explicit allow.
-    #[cfg(test)]
-    #[allow(dead_code)]
     pub fn registered_tools() -> Vec<rmcp::model::Tool> {
         Self::tool_router().list_all()
     }

@@ -3,15 +3,20 @@ name = "stapler-mcp-native"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["heavy"]
+# Browser/embedder/HTTP adapters and their transitive deps; the per-session thin client opts out.
+heavy = ["dep:chromiumoxide", "dep:fastembed", "dep:reqwest", "dep:url"]
+
 [dependencies]
 stapler-mcp-core = { path = "../core" }
 tokio = { version = "1", features = ["rt", "net", "time", "process", "io-util", "fs", "macros", "sync"] }
 libc = "0.2"
 futures = "0.3"
-reqwest = { version = "0.13", features = ["rustls"], default-features = false }
-chromiumoxide = "0.9"
-fastembed = "=5.17.2"
-url = "2"
+reqwest = { version = "0.13", features = ["rustls"], default-features = false, optional = true }
+chromiumoxide = { version = "0.9", optional = true }
+fastembed = { version = "=5.17.2", optional = true }
+url = { version = "2", optional = true }
 serde_json = "1"
 rand = "0.9"
 

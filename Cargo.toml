@@ -1,16 +1,33 @@
 [workspace]
-members = ["crates/core", "crates/native", "crates/cli", "crates/wasm"]
-default-members = ["crates/core", "crates/native", "crates/cli"]
+members = ["crates/core", "crates/native", "crates/cli", "crates/thin-client", "crates/wasm"]
+# Thin client only (native has default-on `heavy`, so it must not be a default member): a bare `cargo build` must not unify the daemon's `heavy` feature into it.
+# Build the daemon with `-p stapler-mcp-daemon` or `--workspace`.
+default-members = ["crates/core", "crates/thin-client"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
-# No `opt-level = "z"`: `stapler-mcp` still shares one binary between the
-# daemon and the thin client, and that would cost the daemon's hot paths.
-# See issue #37 / NOTES.md.
+# Daemon (`stapler-mcp-daemon`) and the thin client share this profile: strip/LTO/codegen-units=1
+# (#37, NOTES.md). The daemon keeps default opt-level; only the thin client opts into size.
 [profile.release]
 strip = true
 lto = "fat"
 codegen-units = 1
+
+# Cargo only accepts opt-level/codegen-units/strip in a per-package override; `lto` is
+# profile-wide, so the thin client's full recipe lives in a named profile
+# (`cargo build --profile release-thin -p stapler-mcp`) that daemon builds never use.
+# `strip` is repeated in the override: a package override resets it to `debuginfo`, leaving the binary unstripped.
+[profile.release.package."stapler-mcp"]
+opt-level = "z"
+codegen-units = 1
+strip = "symbols"
+
+[profile.release-thin]
+inherits = "release"
+lto = "fat"
+opt-level = "z"
+codegen-units = 1
+strip = true

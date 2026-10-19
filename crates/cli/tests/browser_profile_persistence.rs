@@ -131,7 +131,7 @@ async fn cookie_set_before_restart_survives_daemon_restart_with_persistent_profi
     let spawner = NativeSpawner;
     let sleeper = NativeSleeper;
     let clock = NativeClock;
-    let exe = env!("CARGO_BIN_EXE_stapler-mcp").to_string();
+    let exe = env!("CARGO_BIN_EXE_stapler-mcp-daemon").to_string();
     let ensure_options = || EnsureOptions {
         startup_timeout: Some(Duration::from_secs(60)),
         exe_hint: Some(exe.clone()),

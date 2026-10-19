@@ -13,9 +13,8 @@
 //!   tests) — used wherever the test needs a handler the real binary's fixed
 //!   tool set can't provide (a handler that hangs or panics on demand).
 //!
-//! `crates/cli` is a bin-only crate, so `mcp_router.rs`/`transport.rs`/
-//! `http_server.rs` are pulled in via `#[path]`, exactly as
-//! `tests/tool_schema.rs` already does.
+//! `crates/cli` is a bin-only crate, so `transport.rs`/`http_server.rs` are
+//! pulled in via `#[path]`; `McpRouter` comes from the `stapler-mcp` lib.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -30,8 +29,6 @@ use stapler_mcp_native::{NativeClock, NativeSleeper, NativeSocketFactory, Native
 
 #[path = "../src/http_server.rs"]
 mod http_server;
-#[path = "../src/mcp_router.rs"]
-mod mcp_router;
 #[path = "../src/transport.rs"]
 mod transport;
 
@@ -89,7 +86,7 @@ async fn spawn_http_daemon() -> (tempfile::TempDir, TestEnv, u16, String) {
     let spawner = NativeSpawner;
     let sleeper = NativeSleeper;
     let clock = NativeClock;
-    let exe = env!("CARGO_BIN_EXE_stapler-mcp").to_string();
+    let exe = env!("CARGO_BIN_EXE_stapler-mcp-daemon").to_string();
 
     client::ensure_daemon(
         &socket,
@@ -200,8 +197,9 @@ fn is_tool_error(body: &Value) -> bool {
 
 #[test]
 fn socket_and_channel_transport_should_register_identical_tool_schemas() {
-    let socket_tools = mcp_router::McpRouter::<transport::SocketTransport>::registered_tools();
-    let channel_tools = mcp_router::McpRouter::<transport::ChannelTransport>::registered_tools();
+    let socket_tools = stapler_mcp::mcp_router::McpRouter::<stapler_mcp::transport::SocketTransport>::registered_tools();
+    let channel_tools =
+        stapler_mcp::mcp_router::McpRouter::<transport::ChannelTransport>::registered_tools();
 
     assert_eq!(
         socket_tools.len(),
@@ -431,7 +429,7 @@ struct InProcessHarness {
 
 impl InProcessHarness {
     async fn call(&self, tool: &'static str, params: Value) -> Result<Value, String> {
-        use transport::DaemonTransport;
+        use stapler_mcp::transport::DaemonTransport;
         transport::ChannelTransport::new(self.bridge_tx.clone())
             .call(tool, params)
             .await

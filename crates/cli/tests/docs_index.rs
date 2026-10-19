@@ -142,7 +142,7 @@ async fn docs_index_round_trip() {
     let spawner = NativeSpawner;
     let sleeper = NativeSleeper;
     let clock = NativeClock;
-    let exe = env!("CARGO_BIN_EXE_stapler-mcp").to_string();
+    let exe = env!("CARGO_BIN_EXE_stapler-mcp-daemon").to_string();
 
     client::ensure_daemon(
         &socket,

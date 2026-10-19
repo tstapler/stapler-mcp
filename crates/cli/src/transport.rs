@@ -1,65 +1,12 @@
-//! The `DaemonTransport` seam: how an `McpRouter` reaches the shared
-//! stapler-mcp daemon. `SocketTransport` is today's (and the stdio server's)
-//! only implementation, reproducing the exact `ensure_daemon` + `client::call`
-//! sequence the old `ThinClient` inlined. `ChannelTransport` backs the
-//! Streamable HTTP transport instead, via `run_bridge_consumer` below.
+//! Daemon side of the transport seam: the in-process bridge channel that lets
+//! the Streamable HTTP server reach the `!Send` `Daemon`. The `DaemonTransport`
+//! trait and the socket-based client transport live in the thin-client lib.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use futures::FutureExt;
-use stapler_mcp_core::client::{self, EnsureOptions};
+use stapler_mcp::transport::DaemonTransport;
 use stapler_mcp_core::daemon::Daemon;
-use stapler_mcp_core::paths;
-use stapler_mcp_native::{
-    NativeClock, NativeEnv, NativeSleeper, NativeSocketFactory, NativeSpawner,
-};
-
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
-
-pub trait DaemonTransport {
-    fn call(
-        &self,
-        tool: &'static str,
-        params: serde_json::Value,
-    ) -> impl std::future::Future<Output = Result<serde_json::Value, String>> + Send;
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SocketTransport;
-
-impl DaemonTransport for SocketTransport {
-    async fn call(
-        &self,
-        tool: &'static str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let env = NativeEnv;
-        let socket = NativeSocketFactory;
-        let spawner = NativeSpawner;
-        let sleeper = NativeSleeper;
-        let clock = NativeClock;
-
-        let sock_path = paths::socket_path(&env);
-        let log_path = paths::log_path(&env);
-
-        client::ensure_daemon(
-            &socket,
-            &spawner,
-            &sleeper,
-            &clock,
-            &sock_path,
-            &log_path,
-            EnsureOptions::default(),
-        )
-        .await
-        .map_err(|e| format!("ensure daemon: {e}"))?;
-
-        client::call(&socket, &sock_path, tool, Some(params), CALL_TIMEOUT)
-            .await
-            .map_err(|e| e.to_string())
-    }
-}
 
 /// One in-process daemon call: the request plus a channel to deliver its
 /// response back to the caller. The bridge consumer in `main.rs`'s
@@ -76,11 +23,6 @@ pub const BRIDGE_CHANNEL_CAPACITY: usize = 64;
 /// are conventionally `&str` (from a `panic!("literal")`) or `String` (from
 /// `panic!("{}", ...)`); anything else (a custom payload type) falls back to
 /// a fixed message rather than failing to log at all.
-// Used by `run_bridge_consumer` below and by `main.rs`; `#[allow]`ed because
-// `tests/tool_schema.rs` pulls this file in via `#[path]` into a separate
-// compilation unit that only calls `McpRouter::registered_tools()`, where
-// dead-code analysis can't see this function's real callers.
-#[allow(dead_code)]
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
@@ -102,8 +44,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// resolve. Extracted from `main.rs::run_daemon` so integration tests (see
 /// `crates/cli/tests/http_transport.rs`) can construct this exact consumer
 /// loop against a test-only `Daemon` without spawning the real binary.
-// See `panic_message`'s comment above for why this needs `#[allow(dead_code)]`.
-#[allow(dead_code)]
 pub async fn run_bridge_consumer(
     daemon: Rc<Daemon>,
     mut rx: tokio::sync::mpsc::Receiver<BridgeMessage>,
@@ -213,6 +153,7 @@ impl DaemonTransport for ChannelTransport {
 mod tests {
     use super::*;
     use stapler_mcp_core::daemon::Daemon;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn channel_transport_call_should_complete_independently_when_two_clones_call_concurrently(

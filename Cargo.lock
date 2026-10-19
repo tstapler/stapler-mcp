@@ -3658,9 +3658,6 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "stapler-mcp"
 version = "0.1.0"
 dependencies = [
- "axum",
- "futures",
- "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",
@@ -3668,8 +3665,6 @@ dependencies = [
  "stapler-mcp-native",
  "tempfile",
  "tokio",
- "tokio-util",
- "tower",
 ]
 
 [[package]]
@@ -3693,6 +3688,25 @@ dependencies = [
  "tokio-util",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "stapler-mcp-daemon"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "reqwest 0.12.28",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "stapler-mcp",
+ "stapler-mcp-core",
+ "stapler-mcp-native",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
 ]
 
 [[package]]
@@ -4341,9 +4355,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.26.1"
+version = "1.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
+checksum = "7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",

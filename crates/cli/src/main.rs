@@ -1,11 +1,8 @@
 mod http_server;
-mod mcp_router;
 mod transport;
 
 use std::rc::Rc;
 use std::time::Duration;
-
-use rmcp::{transport::stdio, ServiceExt};
 
 use stapler_mcp_core::daemon::{json_handler, Daemon, Handler};
 use stapler_mcp_core::paths;
@@ -60,13 +57,13 @@ fn type_secret_handler(browser: Rc<NativeBrowser>) -> Handler {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // `--status`/`--print-config` are checked before `--daemon` deliberately:
-    // both are read-only diagnostics meant to run from an ordinary shell
-    // against an already-running (often systemd/launchd-started) daemon, so
-    // neither may spawn one as a side effect.
+    // `--status`/`--print-config` are read-only diagnostics meant to run from an
+    // ordinary shell against an already-running (often systemd/launchd-started)
+    // daemon, so neither may spawn one as a side effect. The thin client
+    // `stapler-mcp` execs this binary for them. Any other argv (including the
+    // `--daemon` that `NativeSpawner` passes) runs the daemon.
     let is_status = args.iter().any(|a| a == "--status");
     let is_print_config = args.iter().any(|a| a == "--print-config");
-    let is_daemon = args.iter().any(|a| a == "--daemon");
 
     // Deliberately single-threaded: this daemon's work is I/O-bound, not
     // CPU-bound, and a `current_thread` runtime + `LocalSet` lets the exact
@@ -84,32 +81,30 @@ fn main() {
     } else if is_print_config {
         let code = local.block_on(&rt, run_print_config());
         std::process::exit(code);
-    } else if is_daemon {
+    } else {
         local.block_on(&rt, run_daemon());
         // `run_daemon`'s own `tokio::join!` already bounds the accept loop,
         // bridge consumer, and HTTP server tasks individually via
         // `await_with_shutdown_grace` — but giving up on a `JoinHandle`
         // doesn't abort the underlying `tokio::spawn`ed task (e.g. the HTTP
         // server can still be draining a lingering keep-alive connection).
-        // Dropping `rt` normally (the `else` branches below fall off the end
-        // of `main` and do exactly that) blocks *indefinitely* on any such
+        // Dropping `rt` normally (what falling off the end of `main`
+        // does) blocks *indefinitely* on any such
         // straggler, since `Runtime`'s destructor waits for every spawned
         // task with no timeout. `shutdown_timeout` bounds that final wait and
         // force-cancels stragglers past it, so SIGTERM/`SHUTDOWN_TOOL` always
         // produce a bounded process exit.
         rt.shutdown_timeout(SHUTDOWN_GRACE_TIMEOUT);
-    } else {
-        local.block_on(&rt, run_thin_client());
     }
 }
 
 /// Short timeout for `--status`'s liveness ping — this must never trigger
 /// `ensure_daemon`'s auto-spawn behavior, so it calls `client::ping` directly
-/// rather than going through the thin client's usual `ensure_daemon` path.
+/// rather than going through `ensure_daemon`.
 const STATUS_PING_TIMEOUT: Duration = Duration::from_secs(2);
 const STATUS_TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `stapler-mcp --status`: reports whether the shared daemon is reachable
+/// `stapler-mcp --status` (served by this binary, `stapler-mcp-daemon`): reports whether the shared daemon is reachable
 /// and, separately, whether its optional HTTP transport is configured and
 /// listening. Read-only — never spawns a daemon. Returns the process exit
 /// code (0 if the daemon itself is running, regardless of HTTP state).
@@ -128,7 +123,7 @@ async fn run_status() -> i32 {
     .await;
     let Ok(ping_result) = ping_result else {
         println!("daemon: not running");
-        println!("try: systemctl --user start stapler-mcp   (or: stapler-mcp --daemon)");
+        println!("try: systemctl --user start stapler-mcp   (or: stapler-mcp-daemon)");
         return 1;
     };
 
@@ -255,7 +250,7 @@ async fn print_http_status(env: &NativeEnv) {
     }
 }
 
-/// `stapler-mcp --print-config`: prints an MCP client config block for the
+/// `stapler-mcp --print-config` (served by this binary): prints an MCP client config block for the
 /// HTTP transport, sourced entirely from files the daemon itself already
 /// persisted (`http-token`/`http-port`) — never generates a token or port
 /// itself. Purely deterministic reads, so running this twice in a row
@@ -272,7 +267,7 @@ async fn run_print_config() -> i32 {
         }
         (None, _) => {
             println!(
-                "stapler-mcp: the daemon hasn't started with HTTP enabled yet. Start it with: STAPLER_MCP_HTTP_PORT=<port> stapler-mcp --daemon"
+                "stapler-mcp: the daemon hasn't started with HTTP enabled yet. Start it with: STAPLER_MCP_HTTP_PORT=<port> stapler-mcp-daemon"
             );
             1
         }
@@ -307,21 +302,6 @@ fn print_config_json(token: &str, port: &str) -> String {
 /// to notice cancellation and finish its own in-flight work before shutdown
 /// cleanup proceeds regardless. See `run_daemon`'s `tokio::join!` below.
 const SHUTDOWN_GRACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-async fn run_thin_client() {
-    let client = mcp_router::McpRouter::new();
-    let service = match client.serve(stdio()).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("stapler-mcp: failed to start stdio transport: {e}");
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = service.waiting().await {
-        eprintln!("stapler-mcp: stdio transport error: {e}");
-        std::process::exit(1);
-    }
-}
 
 async fn run_daemon() {
     let env = NativeEnv;

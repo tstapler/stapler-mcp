@@ -246,17 +246,21 @@ additional processes/45480 KB after.
 
 ### Release profile tuning (issue #37) — binary size
 
-`stapler-mcp` is still one binary serving both the per-session thin client
-and the shared daemon, so `[profile.release]` in the workspace `Cargo.toml`
-only picks the two tunings that help both roles with no runtime-speed
-tradeoff — `strip = true`, `lto = "fat"`, `codegen-units = 1` — and
-deliberately skips `opt-level = "z"` (also proposed in the issue), which
-would trade away the daemon's embedding/search/browser hot-path performance
-for a size win that only benefits the thin client. Splitting the thin
-client into its own crate/binary (the issue's higher-value, higher-risk
-proposal, which would also let the thin-client build opt out of
-`stapler-mcp-native`'s `chromiumoxide`/`fastembed` deps and justify
-`opt-level = "z"` for that target alone) remains open.
+The thin client (`stapler-mcp`, `crates/thin-client`) and the daemon
+(`stapler-mcp-daemon`, `crates/cli`) are now separate binaries, so the
+profile is split. `[profile.release]` in the workspace `Cargo.toml` keeps
+the tunings that help both with no runtime-speed tradeoff — `strip = true`,
+`lto = "fat"`, `codegen-units = 1` — and deliberately has no
+`opt-level = "z"`, which would trade away the daemon's embedding/search/
+browser hot-path performance. The thin client alone opts into size:
+`[profile.release.package."stapler-mcp"]` (opt-level `z`, repeating
+`strip = "symbols"` because a package override resets strip) and the
+`release-thin` profile (`cargo build --profile release-thin -p stapler-mcp`,
+gated by `scripts/check-thin-client.sh`). The thin client's dependency tree
+excludes `chromiumoxide`/`fastembed`/`reqwest` (native's default-on `heavy`
+feature; see `project_plans/thin-client-binary-trim/`).
+
+The numbers below predate the split and describe the then-single binary.
 
 Measured (`cargo build --release -p stapler-mcp`, this machine,
 2026-10-16): 65548304 bytes (unstripped) before, 45608776 bytes (stripped)

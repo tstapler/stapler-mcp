@@ -193,7 +193,7 @@ async fn start_daemon(
     let spawner = NativeSpawner;
     let sleeper = NativeSleeper;
     let clock = NativeClock;
-    let exe = env!("CARGO_BIN_EXE_stapler-mcp").to_string();
+    let exe = env!("CARGO_BIN_EXE_stapler-mcp-daemon").to_string();
 
     client::ensure_daemon(
         &socket,
@@ -236,7 +236,7 @@ async fn browser_navigate_click_type_snapshot_round_trip() {
     let spawner = NativeSpawner;
     let sleeper = NativeSleeper;
     let clock = NativeClock;
-    let exe = env!("CARGO_BIN_EXE_stapler-mcp").to_string();
+    let exe = env!("CARGO_BIN_EXE_stapler-mcp-daemon").to_string();
 
     client::ensure_daemon(
         &socket,

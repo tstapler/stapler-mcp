@@ -32,8 +32,8 @@ use stapler_mcp_core::http_auth::BearerToken;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::mcp_router::McpRouter;
 use crate::transport::{BridgeMessage, ChannelTransport};
+use stapler_mcp::mcp_router::McpRouter;
 
 /// Binds `127.0.0.1:{port}` and serves MCP-over-HTTP at `/mcp` until either
 /// the listener errors or `cancel` fires. A bind failure (e.g. `AddrInUse`)

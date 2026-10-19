@@ -12,13 +12,6 @@
 //! `McpRouter`'s tool router directly via `rmcp::ToolRouter::list_all()` —
 //! the same in-process metadata the `tools/list` MCP method serves — so it's
 //! fast, hermetic, and safe to run on every `cargo test`.
-//!
-//! `crates/cli` is a bin-only crate (no `[lib]` target), so `mcp_router.rs`
-//! isn't reachable from `tests/` via a normal `use`. `#[path]` pulls it (and
-//! `transport.rs`, which it depends on) in directly;
-//! `McpRouter::registered_tools()` (a small `#[cfg(test)]`-gated accessor
-//! added alongside `McpRouter` itself) then exposes the macro-generated tool
-//! router's metadata without a live stdio MCP client.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -36,15 +29,10 @@ use stapler_mcp_core::schema::{
     ListIndexedSourcesInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 
-#[path = "../src/mcp_router.rs"]
-mod mcp_router;
-#[path = "../src/transport.rs"]
-mod transport;
-
 #[tokio::test]
 async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_input_schema_when_tools_list_called(
 ) {
-    let tools = mcp_router::McpRouter::<transport::SocketTransport>::registered_tools();
+    let tools = stapler_mcp::mcp_router::McpRouter::<stapler_mcp::transport::SocketTransport>::registered_tools();
     let tool_names: HashSet<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert_eq!(
         tool_names.len(),
@@ -208,7 +196,7 @@ struct FakePingTransport {
     response: serde_json::Value,
 }
 
-impl transport::DaemonTransport for FakePingTransport {
+impl stapler_mcp::transport::DaemonTransport for FakePingTransport {
     async fn call(
         &self,
         _tool: &'static str,
@@ -228,7 +216,7 @@ impl transport::DaemonTransport for FakePingTransport {
 /// accessor existed but had no caller).
 #[tokio::test]
 async fn daemon_status_should_deserialize_run_daemons_camelcase_wire_keys() {
-    let router = mcp_router::McpRouter::with_transport(FakePingTransport {
+    let router = stapler_mcp::mcp_router::McpRouter::with_transport(FakePingTransport {
         response: serde_json::json!({
             "pong": true,
             "browserProfileMode": "persistent at /home/alice/.stapler-mcp/browser-profile",
