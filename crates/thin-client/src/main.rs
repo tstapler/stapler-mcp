@@ -1,9 +1,10 @@
 use rmcp::{transport::stdio, ServiceExt};
 use stapler_mcp::daemon_locator::{self, LaunchMode};
-use stapler_mcp::thin_client::ThinClient;
+use stapler_mcp::mcp_router::McpRouter;
 
 fn main() {
-    // Drop-in compatibility: `stapler-mcp --daemon` used to run the daemon.
+    // Drop-in compatibility: `stapler-mcp --daemon` used to run the daemon, and
+    // `--status`/`--print-config` are daemon-side diagnostics.
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     #[cfg(unix)]
     if daemon_locator::launch_mode(&args) == LaunchMode::Daemon {
@@ -20,7 +21,7 @@ fn main() {
 }
 
 async fn run_thin_client() {
-    let client = ThinClient::new();
+    let client = McpRouter::new();
     let service = match client.serve(stdio()).await {
         Ok(s) => s,
         Err(e) => {

@@ -9,6 +9,13 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 
+# Daemon (`stapler-mcp-daemon`) and the thin client share this profile: strip/LTO/codegen-units=1
+# (#37, NOTES.md). The daemon keeps default opt-level; only the thin client opts into size.
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+
 # Cargo only accepts opt-level/codegen-units/strip in a per-package override; `lto` is
 # profile-wide, so the thin client's full recipe lives in a named profile
 # (`cargo build --profile release-thin -p stapler-mcp`) that daemon builds never use.

@@ -11,10 +11,15 @@ mod env;
 mod fs;
 #[cfg(feature = "heavy")]
 mod http;
+pub mod http_token;
 mod lock;
+#[cfg(feature = "heavy")]
+mod network;
 mod sleep;
 mod socket;
 mod spawn;
+#[cfg(feature = "heavy")]
+mod vault;
 
 #[cfg(feature = "heavy")]
 pub use browser::NativeBrowser;
@@ -28,3 +33,5 @@ pub use lock::{NativeLock, NativeLockGuard};
 pub use sleep::{NativeClock, NativeSleeper};
 pub use socket::{NativeConn, NativeListener, NativeSocketFactory};
 pub use spawn::NativeSpawner;
+#[cfg(feature = "heavy")]
+pub use vault::NativeCredentialStore;

@@ -1,2 +1,3 @@
 pub mod daemon_locator;
-pub mod thin_client;
+pub mod mcp_router;
+pub mod transport;

@@ -41,13 +41,18 @@ pub fn daemon_exe_path() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
     Mcp,
-    /// Legacy `stapler-mcp --daemon`: run the sibling daemon instead.
+    /// Legacy `stapler-mcp --daemon`, plus the read-only `--status` /
+    /// `--print-config` diagnostics, which only the daemon binary implements:
+    /// run the sibling daemon instead.
     Daemon,
 }
 
 /// `args` excludes argv[0].
 pub fn launch_mode(args: &[OsString]) -> LaunchMode {
-    if args.iter().any(|a| a == "--daemon") {
+    if args
+        .iter()
+        .any(|a| a == "--daemon" || a == "--status" || a == "--print-config")
+    {
         LaunchMode::Daemon
     } else {
         LaunchMode::Mcp
@@ -118,5 +123,7 @@ mod tests {
             LaunchMode::Daemon
         );
         assert_eq!(launch_mode(&["--daemonize".into()]), LaunchMode::Mcp);
+        assert_eq!(launch_mode(&["--status".into()]), LaunchMode::Daemon);
+        assert_eq!(launch_mode(&["--print-config".into()]), LaunchMode::Daemon);
     }
 }

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Template for ~/Library/LaunchAgents/com.tstapler.stapler-mcp.plist — runs the
+stapler-mcp daemon as a persistent, auto-restarting launchd user agent (Unix
+socket + optional Streamable HTTP transport on STAPLER_MCP_HTTP_PORT). The
+macOS equivalent of scripts/stapler-mcp.service.example.
+
+Setup:
+  1. cargo install, giving it the path crates/cli (or `cargo install
+     stapler-mcp`, once published)
+  2. Replace /Users/YOUR_USERNAME below with your actual home directory
+     (launchd does not expand ~ or $HOME in ProgramArguments)
+  3. Copy this file to ~/Library/LaunchAgents/com.tstapler.stapler-mcp.plist
+  4. launchctl load -w ~/Library/LaunchAgents/com.tstapler.stapler-mcp.plist
+  5. Run the stapler-mcp binary's status flag to confirm:
+     daemon: running (pid ...)
+     http: listening on 127.0.0.1:47439
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tstapler.stapler-mcp</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/.cargo/bin/stapler-mcp</string>
+        <string>--daemon</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>STAPLER_MCP_HTTP_PORT</key>
+        <string>47439</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
