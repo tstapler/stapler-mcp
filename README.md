@@ -149,7 +149,7 @@ scripts/install.sh
 # `stapler-mcp --daemon` still works: the thin client execs the sibling daemon.
 
 # After upgrading, restart a running daemon (it is not replaced automatically):
-#   pkill -f stapler-mcp-daemon
+#   pkill -f 'stapler-mcp-daemon|stapler-mcp --daemon'   # the latter matches a pre-split daemon
 ```
 
 ### npm / Node (no Rust toolchain needed)

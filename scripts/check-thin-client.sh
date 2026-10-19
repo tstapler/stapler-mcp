@@ -27,6 +27,9 @@ check_tree() {
   fi
 }
 
+# Positive control: the filter must match something where heavy crates really are, or the check proves nothing.
+[ -n "$(cargo tree -e normal --prefix none -p stapler-mcp-daemon | crate_names)" ] \
+  || { echo "FAIL: control: denylist matched nothing in the daemon tree" >&2; exit 1; }
 check_tree -p stapler-mcp
 check_tree -p stapler-mcp-native --no-default-features
 HEAVY_PATTERN='stapler-mcp-native feature "heavy"'
@@ -52,6 +55,9 @@ if command -v readelf >/dev/null; then
 else
   echo "WARN: readelf not found, skipping the strip check" >&2
 fi
+command -v strings >/dev/null || { echo "FAIL: strings not installed, string scan would be vacuous" >&2; exit 1; }
+[ "$(strings -a "$THIN_BIN" | count 'stapler-mcp')" -gt 0 ] \
+  || { echo "FAIL: control: strings found nothing in $THIN_BIN" >&2; exit 1; }
 DAEMON_BIN=target/release/stapler-mcp-daemon
 if [ -f "$DAEMON_BIN" ] && [ "$(strings -a "$DAEMON_BIN" | count 'chromiumoxide|fastembed|reqwest')" -eq 0 ]; then
   echo "FAIL: control: heavy strings not found in $DAEMON_BIN, string scan proves nothing" >&2
