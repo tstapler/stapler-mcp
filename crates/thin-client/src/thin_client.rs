@@ -58,7 +58,12 @@ async fn call_daemon<In: Serialize, Out: DeserializeOwned>(
         },
     )
     .await
-    .map_err(|e| format!("ensure daemon: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "ensure daemon: {e} ({})",
+            crate::daemon_locator::lookup_hint()
+        )
+    })?;
 
     let params = serde_json::to_value(input).map_err(|e| e.to_string())?;
     let result = client::call(&socket, &sock_path, tool, Some(params), CALL_TIMEOUT)
@@ -440,11 +445,6 @@ impl ThinClient {
     /// `tests/tool_schema.rs` to verify Story 5.2.1's `tools/list`
     /// acceptance criterion (all docs-index tools present with non-empty
     /// descriptions and schemas matching their `*Input` structs).
-    ///
-    /// Only called from that separate integration-test binary (which pulls
-    /// this file in via `#[path]`, since `crates/thin-client` has no `[lib]`
-    /// target) — invisible to dead-code analysis of *this* compilation
-    /// unit, hence the explicit allow.
     pub fn registered_tools() -> Vec<rmcp::model::Tool> {
         Self::tool_router().list_all()
     }

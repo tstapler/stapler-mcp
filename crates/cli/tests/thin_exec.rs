@@ -3,8 +3,10 @@
 //! package's binary, so the thin client is located beside it; build both with
 //! `cargo build --workspace` (or `scripts/install.sh`) before running.
 //!
-//! Single `#[tokio::test]` per scenario would race on process-global env, so
-//! the isolated state dir is passed to children through `Command::env` only.
+//! Tests run in parallel, so each child gets its isolated state dir through
+//! `Command::env`, never the process-global environment.
+
+#![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -25,6 +27,12 @@ fn thin_exe() -> PathBuf {
     assert!(
         thin.is_file(),
         "{} not found: run `cargo build --workspace` first (a lone `cargo test -p stapler-mcp-daemon` does not build the thin client)",
+        thin.display()
+    );
+    let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).unwrap();
+    assert!(
+        mtime(&thin) + Duration::from_secs(1) >= mtime(&daemon_exe()),
+        "{} is older than the daemon binary: rebuild with `cargo build --workspace`",
         thin.display()
     );
     thin
@@ -54,7 +62,6 @@ async fn shutdown(sock: &str) {
     let _ = client::call(&socket, sock, "shutdown", None, Duration::from_secs(2)).await;
 }
 
-#[cfg(target_os = "linux")]
 fn exe_name_of_pid(pid: u32) -> String {
     std::fs::read_link(format!("/proc/{pid}/exe"))
         .expect("read /proc/<pid>/exe")
@@ -71,7 +78,6 @@ fn reap(mut child: Child) {
 
 /// AC6: a tool call with no daemon running makes the thin client auto-start
 /// the sibling `stapler-mcp-daemon` (not another copy of itself).
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn thin_client_should_autostart_sibling_daemon_when_tool_call_arrives_with_no_daemon() {
     let tmp = tempfile::tempdir().unwrap();
@@ -120,10 +126,16 @@ async fn thin_client_should_autostart_sibling_daemon_when_tool_call_arrives_with
     // being reachable is what proves the spawn path.
     wait_for_ping(&sock_path, Duration::from_secs(40)).await;
 
-    let pid: u32 = std::fs::read_to_string(home.join("daemon.lock"))
-        .expect("daemon.lock")
-        .trim()
-        .parse()
+    let pid: u32 = (0..50)
+        .find_map(|_| {
+            let pid = std::fs::read_to_string(home.join("daemon.lock"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok());
+            if pid.is_none() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            pid
+        })
         .expect("pid in daemon.lock");
     assert_eq!(exe_name_of_pid(pid), "stapler-mcp-daemon");
 
@@ -132,7 +144,6 @@ async fn thin_client_should_autostart_sibling_daemon_when_tool_call_arrives_with
 }
 
 /// Drop-in compatibility: `stapler-mcp --daemon` execs the sibling daemon.
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn thin_client_daemon_flag_should_exec_sibling_daemon() {
     let tmp = tempfile::tempdir().unwrap();

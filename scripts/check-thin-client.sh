@@ -10,6 +10,10 @@ SIZE_CEILING="${SIZE_CEILING:-8000000}"
 BASELINE_BYTES=48517136 # pre-split stripped `stapler-mcp` at 628ec11
 THIN_BIN="${THIN_BIN:-target/release-thin/stapler-mcp}"
 
+# Count matches without `grep -q`: under `pipefail` an early-exiting grep SIGPIPEs
+# the producer and the pipeline reports failure even when there were matches.
+count() { grep -ciE "$1" || true; }
+
 crate_names() { awk '{print $1}' | grep -xE "$DENYLIST" || true; }
 
 # Exact crate-name match so e.g. `dtoa-short` never trips `ort`.
@@ -25,13 +29,16 @@ check_tree() {
 
 check_tree -p stapler-mcp
 check_tree -p stapler-mcp-native --no-default-features
-if cargo tree -e features --prefix none -p stapler-mcp | grep -q 'stapler-mcp-native feature "heavy"'; then
+HEAVY_PATTERN='stapler-mcp-native feature "heavy"'
+# Positive control: the pattern must match where `heavy` really is on, or the check proves nothing.
+[ "$(cargo tree -e features --prefix none -p stapler-mcp-daemon | count "$HEAVY_PATTERN")" -gt 0 ] \
+  || { echo "FAIL: control: heavy pattern not found in daemon feature tree" >&2; exit 1; }
+if [ "$(cargo tree -e features --prefix none -p stapler-mcp | count "$HEAVY_PATTERN")" -gt 0 ]; then
   echo 'FAIL: `heavy` feature enabled for the thin client' >&2
   exit 1
 fi
 
-# Bare repo-root default selection must also yield a light thin client.
-cargo build --profile release-thin
+cargo build --profile release-thin -p stapler-mcp
 [ -f "$THIN_BIN" ] || { echo "FAIL: $THIN_BIN not built" >&2; exit 1; }
 
 size=$(stat -c %s "$THIN_BIN" 2>/dev/null || stat -f %z "$THIN_BIN")
@@ -39,7 +46,12 @@ if [ "$size" -gt "$SIZE_CEILING" ]; then
   echo "FAIL: $THIN_BIN is $size bytes, ceiling $SIZE_CEILING" >&2
   exit 1
 fi
-if strings -a "$THIN_BIN" | grep -qiE 'chromiumoxide|fastembed|reqwest|onnx'; then
+DAEMON_BIN=target/release/stapler-mcp-daemon
+if [ -f "$DAEMON_BIN" ] && [ "$(strings -a "$DAEMON_BIN" | count 'chromiumoxide|fastembed|reqwest')" -eq 0 ]; then
+  echo "FAIL: control: heavy strings not found in $DAEMON_BIN, string scan proves nothing" >&2
+  exit 1
+fi
+if [ "$(strings -a "$THIN_BIN" | count 'chromiumoxide|fastembed|reqwest|onnx')" -gt 0 ]; then
   echo "FAIL: heavy symbols found in $THIN_BIN" >&2
   exit 1
 fi

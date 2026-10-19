@@ -1,6 +1,6 @@
 //! Finds the sibling `stapler-mcp-daemon` and handles the legacy `--daemon` argv.
 //!
-//! The thin client contains no daemon code, so it must always hand
+//! Unix-only (exec). The thin client contains no daemon code, so it must always hand
 //! `NativeSpawner` an explicit `exe_hint`: with `None` the spawner would re-exec
 //! the current binary (this thin client) with `--daemon`.
 
@@ -11,10 +11,24 @@ pub const DAEMON_BIN: &str = "stapler-mcp-daemon";
 pub const INSTALL_HINT: &str =
     "scripts/install.sh (installs stapler-mcp and stapler-mcp-daemon into the same directory)";
 
-/// `stapler-mcp-daemon` beside `current_exe`, if it is a file.
+/// `stapler-mcp-daemon` beside `current_exe` (as given, then symlink-resolved,
+/// since macOS `current_exe` may not resolve symlinks), if it is a file.
 pub fn sibling_daemon_path(current_exe: Option<&Path>) -> Option<PathBuf> {
-    let sibling = current_exe?.with_file_name(DAEMON_BIN);
-    sibling.is_file().then_some(sibling)
+    let exe = current_exe?;
+    let candidates = [Some(exe.to_path_buf()), std::fs::canonicalize(exe).ok()];
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|p| p.with_file_name(DAEMON_BIN))
+        .find(|sibling| sibling.is_file())
+}
+
+/// Suffix for errors when the daemon cannot be started: says where we looked.
+pub fn lookup_hint() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+    format!("looked for {DAEMON_BIN} beside {exe}, then PATH; install both binaries with {INSTALL_HINT}")
 }
 
 /// Sibling daemon path, else the bare name for a `PATH` lookup by the spawner.
@@ -32,8 +46,8 @@ pub enum LaunchMode {
 }
 
 /// `args` excludes argv[0].
-pub fn launch_mode(args: impl IntoIterator<Item = OsString>) -> LaunchMode {
-    if args.into_iter().any(|a| a == "--daemon") {
+pub fn launch_mode(args: &[OsString]) -> LaunchMode {
+    if args.iter().any(|a| a == "--daemon") {
         LaunchMode::Daemon
     } else {
         LaunchMode::Mcp
@@ -47,7 +61,10 @@ pub fn exec_daemon(args: Vec<OsString>) -> ! {
 
     let exe = daemon_exe_path();
     let err = std::process::Command::new(&exe).args(args).exec();
-    eprintln!("stapler-mcp: cannot start {DAEMON_BIN} ({exe}): {err}; install both binaries with {INSTALL_HINT}");
+    eprintln!(
+        "stapler-mcp: cannot exec {DAEMON_BIN} ({exe}): {err}; {}",
+        lookup_hint()
+    );
     std::process::exit(127);
 }
 
@@ -74,14 +91,32 @@ mod tests {
         assert_eq!(sibling_daemon_path(Some(&exe)), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn finds_sibling_through_symlinked_exe() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let daemon = real.path().join(DAEMON_BIN);
+        std::fs::write(&daemon, b"").unwrap();
+        let target = real.path().join("stapler-mcp");
+        std::fs::write(&target, b"").unwrap();
+        let link = links.path().join("stapler-mcp");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let found = sibling_daemon_path(Some(&link)).unwrap();
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            daemon.canonicalize().unwrap()
+        );
+    }
+
     #[test]
     fn launch_mode_detects_daemon_flag() {
-        assert_eq!(launch_mode(Vec::<OsString>::new()), LaunchMode::Mcp);
-        assert_eq!(launch_mode(["--daemon".into()]), LaunchMode::Daemon);
+        assert_eq!(launch_mode(&[]), LaunchMode::Mcp);
+        assert_eq!(launch_mode(&["--daemon".into()]), LaunchMode::Daemon);
         assert_eq!(
-            launch_mode(["--other".into(), "--daemon".into()]),
+            launch_mode(&["--other".into(), "--daemon".into()]),
             LaunchMode::Daemon
         );
-        assert_eq!(launch_mode(["--daemonize".into()]), LaunchMode::Mcp);
+        assert_eq!(launch_mode(&["--daemonize".into()]), LaunchMode::Mcp);
     }
 }

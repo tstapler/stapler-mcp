@@ -12,7 +12,6 @@
 //! `ThinClient`'s tool router directly via `rmcp::ToolRouter::list_all()` —
 //! the same in-process metadata the `tools/list` MCP method serves — so it's
 //! fast, hermetic, and safe to run on every `cargo test`.
-//!
 
 use std::collections::HashSet;
 use std::sync::Arc;

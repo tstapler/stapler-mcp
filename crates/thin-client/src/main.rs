@@ -5,7 +5,7 @@ use stapler_mcp::thin_client::ThinClient;
 fn main() {
     // Drop-in compatibility: `stapler-mcp --daemon` used to run the daemon.
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if daemon_locator::launch_mode(args.iter().cloned()) == LaunchMode::Daemon {
+    if daemon_locator::launch_mode(&args) == LaunchMode::Daemon {
         daemon_locator::exec_daemon(args);
     }
 
