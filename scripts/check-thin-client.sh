@@ -46,8 +46,12 @@ if [ "$size" -gt "$SIZE_CEILING" ]; then
   echo "FAIL: $THIN_BIN is $size bytes, ceiling $SIZE_CEILING" >&2
   exit 1
 fi
-command -v readelf >/dev/null && [ "$(readelf -S "$THIN_BIN" 2>/dev/null | count '\.symtab')" -eq 0 ] \
-  || { echo "FAIL: $THIN_BIN still has a symbol table (strip not applied)" >&2; exit 1; }
+if command -v readelf >/dev/null; then
+  [ "$(readelf -S "$THIN_BIN" | count '\.symtab')" -eq 0 ] \
+    || { echo "FAIL: $THIN_BIN still has a symbol table (strip not applied)" >&2; exit 1; }
+else
+  echo "WARN: readelf not found, skipping the strip check" >&2
+fi
 DAEMON_BIN=target/release/stapler-mcp-daemon
 if [ -f "$DAEMON_BIN" ] && [ "$(strings -a "$DAEMON_BIN" | count 'chromiumoxide|fastembed|reqwest')" -eq 0 ]; then
   echo "FAIL: control: heavy strings not found in $DAEMON_BIN, string scan proves nothing" >&2

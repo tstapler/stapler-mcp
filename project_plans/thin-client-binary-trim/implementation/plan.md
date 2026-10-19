@@ -62,7 +62,7 @@ Inputs: `requirements.md`, `research/{stack,architecture,pitfalls,build-vs-buy}.
 | Launch mode | Sum type `LaunchMode` + `launch_mode(&[String])` | type-driven-design | `bool` or ad-hoc `args.contains` in `main` | Exhaustive `match`; unit-testable; extensible if a third mode appears |
 | Legacy `--daemon` | exec the sibling (ADR-002) | Adapter / forwarding stub | Reject with error; ignore flag | Keeps drop-in constraint; breaks no service unit |
 | Size tuning | Named Cargo profile (ADR-001) | Cargo profiles | Workspace-wide LTO; build-std; UPX | `lto` not per-package; daemon unchanged; UPX/build-std rejected in build-vs-buy |
-| Thin-client test access to `ThinClient` | Keep `#[path = "../src/thin_client.rs"]` in `tests/tool_schema.rs` | pragmatic | Add `[lib]` | Works today; `[lib]` only if friction appears |
+| Thin-client test access to `ThinClient` | Add a `[lib]` target; `tests/tool_schema.rs` and `tests/daemon_exec.rs` import `stapler_mcp::thin_client` | pragmatic | Keep `#[path]` include | Superseded: `[lib]` was needed to test `daemon_locator` and dropped the dead-code hack |
 | Verification | Executable gate script (`scripts/check-thin-client.sh`) run locally and by CI | Fitness function | Prose checklist | Regression of feature unification is silent otherwise |
 | Domain/wire types | No new newtypes: only `String` paths and constants cross boundaries | PoEAA Transaction Script is enough | Domain Model | No domain logic added; this is build/packaging work |
 

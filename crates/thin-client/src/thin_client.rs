@@ -10,6 +10,7 @@ use rmcp::{tool, tool_handler, tool_router, Json, ServerHandler};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::daemon_locator;
 use stapler_mcp_core::client::{self, EnsureOptions};
 use stapler_mcp_core::paths;
 use stapler_mcp_core::schema::{
@@ -53,17 +54,12 @@ async fn call_daemon<In: Serialize, Out: DeserializeOwned>(
         &sock_path,
         &log_path,
         EnsureOptions {
-            exe_hint: Some(crate::daemon_locator::daemon_exe_path()),
+            exe_hint: Some(daemon_locator::daemon_exe_path()),
             ..Default::default()
         },
     )
     .await
-    .map_err(|e| {
-        format!(
-            "ensure daemon: {e} ({})",
-            crate::daemon_locator::lookup_hint()
-        )
-    })?;
+    .map_err(|e| format!("ensure daemon: {e} ({})", daemon_locator::lookup_hint()))?;
 
     let params = serde_json::to_value(input).map_err(|e| e.to_string())?;
     let result = client::call(&socket, &sock_path, tool, Some(params), CALL_TIMEOUT)

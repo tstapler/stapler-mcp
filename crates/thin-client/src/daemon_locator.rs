@@ -38,7 +38,7 @@ pub fn daemon_exe_path() -> String {
         .unwrap_or_else(|| DAEMON_BIN.to_string())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
     Mcp,
     /// Legacy `stapler-mcp --daemon`: run the sibling daemon instead.
