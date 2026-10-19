@@ -25,3 +25,7 @@ Option 1 now. Do not invent per-platform packaging and do not add `files` entrie
 ## Decision record (2026-10-18, made by the implementing agent; no user present)
 
 AC7 cannot be met as written: the npm package ships WASM only (`files: ["bin","pkg"]`) and a native `stapler-mcp-daemon` cannot be compiled to WASM, so there is nothing to bundle. Adding per-platform native packages (option 2) would be new scope and contradicts the Gatekeeper rationale in README.md. Resolution: AC7 is marked failed in the backlog with this reason; option 1 is implemented as a no-regression guard (npm build and tests pass, `npm pack --dry-run` shows no native binaries) and the README documents the side-by-side native layout. The owner decides at PR review whether to open a separate story for option 2 or 3.
+
+## Owner decision required
+
+The owner must choose one of: (1) accept npm as WASM-only (no regression; README documents the side-by-side native layout), (2) per-platform native packages (new scope, macOS signing), or (3) reword AC7 to cover native release artifacts. Until then AC7 stays failed (`fail-6`) and this ADR stays Proposed.
