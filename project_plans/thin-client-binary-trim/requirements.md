@@ -38,18 +38,12 @@ only needs the lightweight adapters: `NativeEnv`, `NativeSocketFactory`, `Native
 
 ## Acceptance Criteria
 
-1. **AC-1 (Split binary):** A new separate binary target exists for the thin client that does
-   **not** link `chromiumoxide`, `fastembed`, or `reqwest` (verified via `cargo tree -e normal
-   --package <thin-client-crate>` showing none of those crate names).
-2. **AC-2 (Daemon unchanged):** The daemon binary (`--daemon` path) continues to link all
-   existing native adapters; `cargo test` in `crates/cli` passes green.
-3. **AC-3 (Release profile):** The thin-client binary's release profile includes
-   `strip = true`, `lto = "fat"`, `opt-level = "z"`, `codegen-units = 1` (or equivalent
-   workspace-level profile override scoped to that target).
-4. **AC-4 (Binary size):** `cargo build --release` produces a thin-client binary measurably
-   smaller than the current combined binary (target: ≥ 20% reduction in stripped binary size).
-5. **AC-5 (Feature flag in native):** `stapler-mcp-native` exposes a Cargo feature (e.g.
-   `heavy`) that gates `NativeBrowser`, `NativeEmbedder`, `NativeHttp`, `NativeFs`,
-   `NativeLock` (and their transitive heavy deps) — the thin-client crate opts out of it.
-6. **AC-6 (CI):** `make ready` (ansible-lint + shellcheck) is unaffected; Rust workspace
-   `cargo test --workspace` passes.
+Authoritative list is the backlog item (ec050b7d-1969-405b-ab88-9e2ed99e05fd):
+
+1. `cargo tree -e normal --package stapler-mcp` (thin-client crate) shows no `chromiumoxide`, `fastembed`, or `reqwest`.
+2. `stapler-mcp-daemon` builds and `cargo test --workspace` passes.
+3. Thin-client release profile: `strip = true`, `lto = "fat"`, `opt-level = "z"`, `codegen-units = 1`, scoped via `[profile.release.package."stapler-mcp"]`.
+4. Stripped release thin-client is >= 20% smaller than the pre-split combined binary.
+5. `stapler-mcp-native` has a default-enabled `heavy` feature gating `NativeBrowser`, `NativeEmbedder`, `NativeHttp` and their transitive deps; `crates/thin-client` uses `default-features = false`.
+6. Daemon auto-start works: thin client calls `ensure_daemon` with an `exe_hint` resolving to `stapler-mcp-daemon` in the same directory, verified by an integration test.
+7. `npm/` packaging bundles both `stapler-mcp` and `stapler-mcp-daemon`.
