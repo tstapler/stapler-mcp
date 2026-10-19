@@ -95,7 +95,7 @@ async fn daemon_architecture_and_tools_round_trip() {
     let spawner = NativeSpawner;
     let sleeper = NativeSleeper;
     let clock = NativeClock;
-    let exe = env!("CARGO_BIN_EXE_stapler-mcp").to_string();
+    let exe = env!("CARGO_BIN_EXE_stapler-mcp-daemon").to_string();
 
     // 1. Pre-daemon ping fails.
     assert!(

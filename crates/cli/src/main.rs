@@ -1,8 +1,4 @@
-mod thin_client;
-
 use std::rc::Rc;
-
-use rmcp::{transport::stdio, ServiceExt};
 
 use stapler_mcp_core::daemon::{json_handler, Daemon};
 use stapler_mcp_core::paths;
@@ -23,38 +19,17 @@ use stapler_mcp_native::{
 };
 
 fn main() {
-    let is_daemon = std::env::args().any(|a| a == "--daemon");
-
     // Deliberately single-threaded: this daemon's work is I/O-bound, not
     // CPU-bound, and a `current_thread` runtime + `LocalSet` lets the exact
     // same core (no `Send` bounds anywhere) also satisfy a `!Send`
     // wasm-bindgen adapter later, without ever needing `async-trait`.
+    // The `--daemon` arg passed by `NativeSpawner` is accepted and ignored.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build current-thread runtime");
     let local = tokio::task::LocalSet::new();
-
-    if is_daemon {
-        local.block_on(&rt, run_daemon());
-    } else {
-        local.block_on(&rt, run_thin_client());
-    }
-}
-
-async fn run_thin_client() {
-    let client = thin_client::ThinClient::new();
-    let service = match client.serve(stdio()).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("stapler-mcp: failed to start stdio transport: {e}");
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = service.waiting().await {
-        eprintln!("stapler-mcp: stdio transport error: {e}");
-        std::process::exit(1);
-    }
+    local.block_on(&rt, run_daemon());
 }
 
 async fn run_daemon() {

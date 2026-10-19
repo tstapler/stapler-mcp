@@ -13,12 +13,6 @@
 //! the same in-process metadata the `tools/list` MCP method serves — so it's
 //! fast, hermetic, and safe to run on every `cargo test`.
 //!
-//! `crates/cli` is a bin-only crate (no `[lib]` target), so `thin_client.rs`
-//! isn't reachable from `tests/` via a normal `use`. `#[path]` pulls the
-//! module in directly; `ThinClient::registered_tools()` (a small
-//! `#[cfg(test)]`-gated accessor added alongside `ThinClient` itself) then
-//! exposes the macro-generated tool router's metadata without a live stdio
-//! MCP client.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -35,13 +29,10 @@ use stapler_mcp_core::schema::{
     ListIndexedSourcesInput, RemoveIndexedSourceInput, SearchDocsInput,
 };
 
-#[path = "../src/thin_client.rs"]
-mod thin_client;
-
 #[tokio::test]
 async fn should_list_four_new_tools_with_nonempty_descriptions_and_matching_input_schema_when_tools_list_called(
 ) {
-    let tools = thin_client::ThinClient::registered_tools();
+    let tools = stapler_mcp::thin_client::ThinClient::registered_tools();
     let tool_names: HashSet<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert_eq!(
         tool_names.len(),

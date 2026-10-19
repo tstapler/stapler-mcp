@@ -57,3 +57,16 @@ test("findNativeBinary_should_return_null_when_stapler_mcp_file_on_path_but_not_
         },
     );
 });
+
+test("findNativeBinary_should_prefer_stapler_mcp_daemon_when_both_binaries_on_path", { skip: process.platform === "win32" }, () => {
+    withTempPathDir(
+        (dir) => {
+            for (const name of ["stapler-mcp", "stapler-mcp-daemon"]) {
+                fs.writeFileSync(path.join(dir, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+            }
+        },
+        (dir) => {
+            assert.strictEqual(processGlue.findNativeBinary(), path.join(dir, "stapler-mcp-daemon"));
+        },
+    );
+});

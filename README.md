@@ -22,7 +22,7 @@ This is the entire point of the project, not an optional nicety.
 
 ```
 Claude Code session 1 ──▶ stapler-mcp (thin stdio MCP server) ─┐
-Claude Code session 2 ──▶ stapler-mcp (thin stdio MCP server) ─┼──▶ ~/.stapler-mcp/daemon.sock ──▶ stapler-mcp --daemon
+Claude Code session 2 ──▶ stapler-mcp (thin stdio MCP server) ─┼──▶ ~/.stapler-mcp/daemon.sock ──▶ stapler-mcp-daemon
 Claude Code subagent N ─▶ stapler-mcp (thin stdio MCP server) ─┘         (one process, one browser pool,
                                                                            one HTTP client, one cache —
                                                                            shared machine-wide)
@@ -130,16 +130,33 @@ yet."
 ### Native
 
 ```bash
-cargo build -p stapler-mcp   # produces target/debug/stapler-mcp (or --release)
+# Two binaries: the per-session thin client and the shared daemon. They must sit
+# in the same directory — the thin client auto-starts the `stapler-mcp-daemon`
+# beside it. Build the thin client alone with `-p stapler-mcp` (selecting the
+# daemon in the same cargo invocation links its browser/embedder deps into it).
+cargo build -p stapler-mcp                # target/debug/stapler-mcp (thin client)
+cargo build -p stapler-mcp-daemon         # target/debug/stapler-mcp-daemon
+cargo build --profile release-thin -p stapler-mcp   # smallest thin client (~2.7 MB)
+
+# Or install both into one directory (cargo install takes one package per call):
+scripts/install.sh
 
 # What Claude Code should register as the MCP server command:
 ./target/debug/stapler-mcp
 
 # Manual daemon inspection (normally auto-started, not run by hand):
-./target/debug/stapler-mcp --daemon
+./target/debug/stapler-mcp-daemon
+# `stapler-mcp --daemon` still works: the thin client execs the sibling daemon.
+
+# After upgrading, restart a running daemon (it is not replaced automatically):
+#   pkill -f stapler-mcp-daemon
 ```
 
 ### npm / Node (no Rust toolchain needed)
+
+The npm package is WASM-only and ships no native binaries (so nothing to
+sign or notarize); it prefers a `stapler-mcp-daemon` on `PATH` as the daemon
+when one is installed.
 
 ```bash
 cd npm && npm install   # pulls in @modelcontextprotocol/sdk, playwright-core

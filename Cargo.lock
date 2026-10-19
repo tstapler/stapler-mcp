@@ -3591,6 +3591,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "stapler-mcp-daemon"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "stapler-mcp-core",
+ "stapler-mcp-native",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "stapler-mcp-native"
 version = "0.1.0"
 dependencies = [

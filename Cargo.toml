@@ -1,8 +1,24 @@
 [workspace]
-members = ["crates/core", "crates/native", "crates/cli", "crates/wasm"]
-default-members = ["crates/core", "crates/native", "crates/cli"]
+members = ["crates/core", "crates/native", "crates/cli", "crates/thin-client", "crates/wasm"]
+# Thin client only (native has default-on `heavy`, so it must not be a default member): a bare `cargo build` must not unify the daemon's `heavy` feature into it.
+# Build the daemon with `-p stapler-mcp-daemon` or `--workspace`.
+default-members = ["crates/core", "crates/thin-client"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+# Cargo only accepts opt-level/codegen-units in a per-package override; `lto` is
+# profile-wide, so the thin client's full recipe lives in a named profile
+# (`cargo build --profile release-thin -p stapler-mcp`) that daemon builds never use.
+[profile.release.package."stapler-mcp"]
+opt-level = "z"
+codegen-units = 1
+
+[profile.release-thin]
+inherits = "release"
+lto = "fat"
+opt-level = "z"
+codegen-units = 1
+strip = true

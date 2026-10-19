@@ -4,7 +4,7 @@ const path = require("path");
 
 const NATIVE_BINARY_NAMES = process.platform === "win32"
     ? ["stapler-mcp.exe", "stapler-mcp.cmd"]
-    : ["stapler-mcp"];
+    : ["stapler-mcp-daemon", "stapler-mcp"]; // `stapler-mcp` = pre-split combined binary
 
 // Both adapters speak the identical wire protocol and are interoperable on
 // the same machine (see README's "Two distributions, one core"), so if the

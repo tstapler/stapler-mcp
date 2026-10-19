@@ -21,6 +21,19 @@ jobs:
       # NativeEmbedder model-load tests) are #[ignore]d by design and
       # correctly skipped here — see their doc comments.
       - run: cargo test --workspace
+      # Without the `heavy` feature the native crate must still lint and test.
+      - run: cargo clippy -p stapler-mcp-native --no-default-features --all-targets -- -D warnings
+      - run: cargo test -p stapler-mcp-native --no-default-features
+
+  # Own job: the cold fat-LTO build is slow. Checks the thin client's graph
+  # (-p stapler-mcp alone, so `heavy` is not unified in) and size ceiling.
+  thin-client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/check-thin-client.sh
 
   # crates/core and crates/wasm compile for wasm32-unknown-unknown (the
   # npm-distributed thin client target); crates/native and crates/cli are

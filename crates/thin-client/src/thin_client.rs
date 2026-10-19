@@ -52,7 +52,10 @@ async fn call_daemon<In: Serialize, Out: DeserializeOwned>(
         &clock,
         &sock_path,
         &log_path,
-        EnsureOptions::default(),
+        EnsureOptions {
+            exe_hint: Some(crate::daemon_locator::daemon_exe_path()),
+            ..Default::default()
+        },
     )
     .await
     .map_err(|e| format!("ensure daemon: {e}"))?;
@@ -439,11 +442,9 @@ impl ThinClient {
     /// descriptions and schemas matching their `*Input` structs).
     ///
     /// Only called from that separate integration-test binary (which pulls
-    /// this file in via `#[path]`, since `crates/cli` has no `[lib]`
+    /// this file in via `#[path]`, since `crates/thin-client` has no `[lib]`
     /// target) — invisible to dead-code analysis of *this* compilation
     /// unit, hence the explicit allow.
-    #[cfg(test)]
-    #[allow(dead_code)]
     pub fn registered_tools() -> Vec<rmcp::model::Tool> {
         Self::tool_router().list_all()
     }
