@@ -1,0 +1,36 @@
+# Architecture Review: read-website-daemon-recovery
+**Date**: 2026-10-29
+**Verdict**: CONCERNS
+
+Scope: `implementation/plan.md`, `decisions/ADR-001`, `decisions/ADR-002` vs `requirements.md`, with claims checked against the worktree (HEAD ec2a245 + staged plan files). No `docs/adr/` directory exists, so there is no architecture constitution to check. `.claude/inspect.json` is absent, so kibitzer checks were skipped (review is from source reads).
+
+Claims verified against code (all held): F1 (`daemon.rs:160,187` use `?`), F4 (`client.rs:78-105`, `DIAL_TIMEOUT` 2s, default 10s), F5/F6 (`wasm/src/socket.rs:30-37` only yields `Timeout` or `Io`), F7 (`transport.rs:44-57`), F9 (`mcp_router.rs:866-877`, three struct literals in `cli/src/main.rs:162,178,191`), F10 (three `DaemonTransport` impls), F13 (`libc` only in `native`, `futures` already in `cli`). Constraint "no new `PortError` variant" is correct for the wasm adapter.
+
+## Constitution Violations
+None (no constitution file in repo).
+
+## Ports-and-adapters boundary check
+- Core stays wasm-portable: `serve_logged` and the `ensure_daemon` rewrite use only existing ports (`SocketFactory`, `ProcessSpawner`, `SleepPort`, `ClockPort`); no new native dependency enters `crates/core`. `ensure_daemon` branches on the existing typed `PortError::Timeout` (ADR-001), which is the right call given the wasm adapter's two-variant error mapping. PASS.
+- `ensure_error_message` and `status_probe` live in `thin-client` (adapter), not core. PASS.
+- Native-only pieces (`libc`, SIGKILL tests) are confined to `cli` dev-deps. PASS.
+
+## Blockers
+None.
+
+## Concerns
+- [ ] Task 3.1.2b (`DaemonTransport::status_probe` default body) — The trait has no `Sync` supertrait (`transport.rs:18`; bounds `Send + Sync` are only on `McpRouter<T>` impls). A default method returning `impl Future + Send` whose body is `async { self.call(..).await ... }` captures `&Self`, which requires `Self: Sync`. This will likely fail to compile in the default body (INFERRED; not compiled). `ChannelTransport::call` is a plain `fn -> impl Future + Send` (`cli/src/transport.rs:105`), so the pattern differs from `SocketTransport`'s `async fn`. Remediation: add `where Self: Sync` on `status_probe` (or `trait DaemonTransport: Sync`), and make "cargo check -p stapler-mcp -p stapler-mcp-daemon" the first step of 3.1.2b.
+- [ ] Story 3.1.2 / ADR-002 (`status_probe` on `SocketTransport`) — The probe uses a 2s `client::call` against a serial daemon (F3). A busy-but-alive daemon (serving a long `read_website`) returns `PortError::Timeout`, which the plan reports as `pong: false`, i.e. "down". That reintroduces the same alive-vs-down confusion ADR-001 fixes for `ensure_daemon`, and misleads exactly the agent doing diagnosis. Remediation: classify in `status_probe` the same way as ADR-001 and say so in `error` (e.g. "reachable, busy serving another request"); add an AC/test for the Timeout case. Consider reusing one shared classifier rather than two.
+- [ ] `DaemonStatusOutput` shape (task 3.1.2a) — Adding `error`/`socket_path`/`log_path` to a type shared by the daemon's wire response, the CLI `--status` printer and the MCP outputSchema allows illegal combinations (`pong: true` with `error: Some`; `pong: false` with `browser_profile_mode: Some`). The additive/skip-if-none approach is wire-compatible and `#[derive(Default)]` is safe (verified: `cli/src/main.rs:162` already uses `pong: false` as the "unparseable" fallback), but note that `Default` now means "down". Remediation: keep the flat struct for compatibility, but add a small constructor `DaemonStatusOutput::unreachable(error, socket, log)` in core and use it from both `status_probe` paths instead of ad-hoc literals; document the invariant on the fields. A tagged enum is the stricter option and is reasonably rejected for outputSchema compatibility.
+- [ ] `DaemonTransport` trait change (task 3.1.2b) — `status_probe` is a diagnostic/query concern added to the call-transport trait (ISP). Defaulted-method approach keeps `ChannelTransport` and `FakePingTransport` compiling (F10), so cost is low, but the default's semantics ("down" from any `call` error) are subtly different for `ChannelTransport`, where `call` has no ensure step at all. Remediation: document that the default is "best effort via call" and that only `SocketTransport` is guaranteed non-spawning; add a doc comment on the trait method stating this. A separate `StatusProbe` port is acceptable but not required at this scale.
+- [ ] Task 1.1.1a (`eprintln!` in `crates/core/src/daemon.rs`) — `Daemon::run` is shared with the wasm adapter (`wasm/src/lib.rs` calls plain `run`). On `wasm32-unknown-unknown`, `eprintln!` has no sink, so the AC2 "daemon logs the per-connection error" requirement is met natively only, and the plan's own test cannot assert the log (AC2 log is "verified by code review and the e2e daemon log"). `paths.rs:74` already sets the `eprintln!` precedent, so this is acceptable, but the AC2 log-line claim is weakly tested. Remediation: either add an assertion in `daemon_client_disconnect.rs` that `daemon.log` contains `connection error (continuing)` (cheap, uses the existing redirect), or introduce a one-method `LogPort`/callback on `Daemon`. The first is sufficient.
+- [ ] Task 2.1.1a / ADR-001 — Wedged-daemon behavior: a daemon that is alive but never answers (hung handler beyond the 30s cap is bounded, but a silent client holds the loop up to `CONN_TIMEOUT` 120s, Known limit 2) now yields `Timeout` after 30s/45s with no respawn, where previously a (useless) spawn was attempted. The ADR records this, but with parallel research subagents a single silent client can stall every later caller for up to 120s, beyond the 30s AC0/AC1 budget. Remediation: acknowledge the interaction between Known limit 2 and AC1 explicitly in the plan, or lower `CONN_TIMEOUT` for the first-frame read (separate from response write) as a small follow-up story.
+
+## Nitpicks
+- `ensure_error_message` is reused for the status probe error, so a status failure reads "ensure daemon: ..." even though no ensure ran (3.1.2b). Use a neutral prefix parameter or a second formatter.
+- ADRs are "Proposed" while plan.md says "Ready for implementation"; set ADR status to Accepted when the plan is approved.
+- Parallel cold start (AC1, 4.1.1b): every one of N clients spawns once, so N-1 loser processes start and exit on the flock. ADR-001 notes this as harmless; the e2e test asserts exactly one live PID, which is the right check. Consider also asserting no leftover orphan daemon processes.
+- Tech Debt Disposition covers every touched hotspot named in the plan (accept loops, `run_daemon` ordering, `transport.rs` seam); no `research/architecture.md` exists, so Lens 4 item 12 has no external hotspot list to compare against. "Extend as-is" for `daemon.rs` does not deepen the duplicated-loop violation (fix lands in one helper).
+- 45s `STARTUP_TIMEOUT` plus 120s `CALL_TIMEOUT` may exceed an MCP host's own tool timeout; not a plan defect, worth a line in the PR.
+
+## Summary
+0 blockers, 6 concerns, 5 nitpicks. Boundaries (wasm-portable core, native/thin-client adapters) are respected; the main risks are a probable compile error in the defaulted `status_probe`, and `status_probe` reporting a busy daemon as down.
