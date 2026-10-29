@@ -21,3 +21,7 @@ Branch on the existing typed `PortError::Timeout`: Timeout means "alive but busy
 
 - A genuinely wedged daemon (alive, never answers) is not respawned; the caller gets `Timeout` after the startup deadline with the socket/log paths in the message (AC4). Watchdog/restart of a wedged daemon is out of scope.
 - A spurious extra spawn on a non-Timeout `Io` error (e.g. a connection reset) is harmless: the loser exits on the flock (`crates/cli/src/main.rs:344-349`).
+
+## Amendment (pre-mortem P1)
+
+`PortError::Timeout` now means "listener exists and is busy": `ensure_daemon` returns `Ok(())` rather than polling to the deadline, because the ping itself queues behind in-flight requests in the serial daemon. See implementation/plan.md "Pre-mortem resolutions".
