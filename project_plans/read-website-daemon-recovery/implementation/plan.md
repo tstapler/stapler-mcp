@@ -284,3 +284,14 @@ Reviews: `architecture-review.md`, `adversarial-review.md` in this directory. Co
 5. **Logging is tested.** 4.1.1c asserts the connection-error line appears in `daemon.log`; unit tests assert `serve_logged` returns Ok on connection error. (arch, adv C6)
 6. **AC1 vs CALL_TIMEOUT.** AC1 is verified with N=8 short-page requests (well under 120s); the >~4 long-request limit stays documented under Known limits. (adv C5)
 7. **Silent-client stall (≤120s CONN_TIMEOUT)** stays a documented limit; out of scope (concurrent handling).
+
+## Pre-mortem resolutions (SUPERSEDE conflicting text above)
+
+Source: `pre-mortem.md` (1 P1, 4 P2, 2 P3). Where these conflict with Story 2.1.1 / Task 2.1.1a/b, Review resolution 3, or ADR-001, **this section wins**.
+
+- **P1 — `PortError::Timeout` from a ping means "alive": `ensure_daemon` returns `Ok(())`** (initial ping or any poll ping), so the real call queues under `CALL_TIMEOUT` instead of burning the startup budget in the serial queue. Spawn + poll-to-deadline only for non-Timeout errors. Replace Story 2.1.1's Timeout criteria with: *Given a fake whose first ping yields `Timeout`, When `ensure_daemon` runs, Then `Ok(())` with 0 spawns.* Replace tests `..._not_spawn_when_ping_times_out_then_recovers` / `..._return_timeout_without_spawning_after_deadline` with `ensure_daemon_should_return_ok_without_spawning_when_ping_times_out` and `ensure_daemon_should_return_ok_when_poll_ping_times_out_after_spawn`. Add an e2e fan-out test (4.1.1b): one slow in-flight request while 8 clients run `ensure_daemon` then a real call; all succeed.
+- **Resolution 3 (cap of 2 spawns) is dropped.** Spawn at most once per call; a lost-flock race is covered because the poll loop treats a later Timeout as success and refused keeps polling to the deadline.
+- **P2 accept errors:** `accept()` errors of kind EMFILE/ENFILE/ECONNABORTED/EINTR are logged and retried after 100 ms in both loops; others stay fatal. Keep `run_should_return_err_when_accept_fails` using a non-transient error; add a transient-retry test. (Check whether `PortError::Io(String)` allows kind detection; if not, match on the OS error text and document it.)
+- **P2 e2e hygiene:** drop-guard per test sends `shutdown` then SIGKILL; liveness via failed ping or `/proc/<pid>/stat` state != `Z`, not `kill(pid,0)`; client budget 45 s with assertion at 30 s; kill orphaned Chrome in the kill test.
+- **P2 old daemon:** PR body and verify checklist say to shut down any running daemon (`shutdown` tool or kill) before manual verification.
+- **P3:** Timeout error text is moot after the P1 change; keep the `kill <pid>` hint only if cheap. `cargo check` the `status_probe` default first.
