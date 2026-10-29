@@ -684,18 +684,24 @@ impl NativeBrowser {
     /// looks like an auth wall and is off `auth_host`) or `auth_wait`
     /// elapses. Reads only URL and DOM text — never cookies or form values.
     async fn wait_for_login(&self, page: &Page, requested: &str, auth_host: &str) -> bool {
+        // Two consecutive clean polls: a multi-hop SSO chain can briefly land
+        // on an intermediate page that looks clean (e.g. an MFA prompt).
         let poll = async {
+            let mut clean_polls = 0u8;
             loop {
                 tokio::time::sleep(AUTH_POLL_INTERVAL).await;
-                let Ok(Some(url)) = page.url().await else {
-                    continue;
-                };
-                let Ok(html) = page.content().await else {
+                let (Ok(Some(url)), Ok(html)) = (page.url().await, page.content().await) else {
+                    clean_polls = 0;
                     continue;
                 };
                 let off_idp = auth::host_of(&url).is_some_and(|h| h != auth_host);
                 if off_idp && auth::detect_auth_wall(requested, &url, &html).is_none() {
-                    return;
+                    clean_polls += 1;
+                    if clean_polls >= 2 {
+                        return;
+                    }
+                } else {
+                    clean_polls = 0;
                 }
             }
         };

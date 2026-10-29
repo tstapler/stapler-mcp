@@ -503,6 +503,10 @@ where
     let seed = Url::parse(&input.url).map_err(|e| format!("invalid url: {e}"))?;
     let (max_depth, max_pages) = resolve_limits(input.max_depth, input.max_pages);
     let mut auth_required_urls = Vec::new();
+    // Hosts whose browser fallback already failed this call; later pages on
+    // them report the HTTP detection without paying for another browser trip.
+    let mut fallback_failed_hosts: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut remaining_budget =
         resolve_inline_budget(input.max_inline_chars, input.always_save_to_file);
 
@@ -545,6 +549,11 @@ where
                 let Some(http_info) = crawler.take_auth_hit() else {
                     continue;
                 };
+                let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+                if fallback_failed_hosts.contains(&host) {
+                    auth_required_urls.push(http_info);
+                    continue;
+                }
                 match browser
                     .navigate_and_extract(url.as_str(), AUTH_FALLBACK_TIMEOUT)
                     .await
@@ -555,10 +564,12 @@ where
                         extract.html
                     }
                     Err(PortError::AuthRequired(info)) => {
+                        fallback_failed_hosts.insert(host);
                         auth_required_urls.push(info);
                         continue;
                     }
                     Err(_) => {
+                        fallback_failed_hosts.insert(host);
                         auth_required_urls.push(http_info);
                         continue;
                     }
@@ -1296,12 +1307,21 @@ mod read_website_auth_tests {
         status: u16,
         body: &'static str,
         final_url: &'static str,
+        /// `(url suffix, status)` overrides, checked before the defaults.
+        overrides: Vec<(&'static str, u16)>,
     }
 
     impl HttpClient for Http {
         async fn get(&self, url: &str, _: &[(String, String)]) -> Result<HttpResponse, PortError> {
             if url.ends_with("/robots.txt") {
                 return Err(PortError::Other("no robots".into()));
+            }
+            if let Some((_, status)) = self.overrides.iter().find(|(s, _)| url.ends_with(s)) {
+                return Ok(HttpResponse {
+                    status: *status,
+                    body: Vec::new(),
+                    final_url: url.to_string(),
+                });
             }
             Ok(HttpResponse {
                 status: self.status,
@@ -1363,6 +1383,7 @@ mod read_website_auth_tests {
             status: 401,
             body: "",
             final_url: URL,
+            overrides: vec![],
         };
         let info = AuthRequiredInfo {
             requested_url: URL.into(),
@@ -1383,6 +1404,7 @@ mod read_website_auth_tests {
             status: 200,
             body: LOGIN,
             final_url: "https://idp.example.com/login",
+            overrides: vec![],
         };
         let browser = FakeBrowserDriver::new().with_extract(Err(PortError::Timeout));
         let out = run(&http, &browser, &Fs::default()).await;
@@ -1398,6 +1420,7 @@ mod read_website_auth_tests {
             status: 403,
             body: "",
             final_url: URL,
+            overrides: vec![],
         };
         let browser = FakeBrowserDriver::new().with_extract(Ok(PageExtract {
             title: "Doc".into(),
@@ -1421,11 +1444,40 @@ mod read_website_auth_tests {
             status: 200,
             body: CONTENT,
             final_url: URL,
+            overrides: vec![],
         };
         let browser = FakeBrowserDriver::new();
         let out = run(&http, &browser, &Fs::default()).await;
         assert_eq!(out.pages.len(), 1);
         assert!(out.auth_required_urls.is_empty());
         assert_eq!(browser.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_try_browser_once_per_host_when_fallback_keeps_failing() {
+        const SEED: &str = r#"<html><head><title>Doc</title></head><body><article><p>Real documentation content long enough to keep. <a href="/a">a</a> <a href="/b">b</a></p></article></body></html>"#;
+        let http = Http {
+            status: 200,
+            body: SEED,
+            final_url: URL,
+            overrides: vec![("/a", 403), ("/b", 403)],
+        };
+        // The fake allows exactly one navigate_and_extract; a second call panics.
+        let browser = FakeBrowserDriver::new().with_extract(Err(PortError::Timeout));
+        let mut inp = input();
+        inp.max_depth = Some(1);
+        inp.max_pages = Some(5);
+        let out = read_website(
+            &http,
+            &browser,
+            &Fs::default(),
+            "/cache",
+            inp,
+            NetworkPolicy::from_env(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.auth_required_urls.len(), 2);
+        assert_eq!(browser.call_count(), 1);
     }
 }

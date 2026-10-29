@@ -128,7 +128,9 @@ pub fn from_status(requested: &str, status: u16, final_url: &str) -> Option<Auth
 pub fn detect_auth_wall(requested: &str, final_url: &str, html: &str) -> Option<AuthRequiredInfo> {
     let lower = html.to_ascii_lowercase();
     let changed = host_changed(requested, final_url);
-    let marker = has_password_field(&lower) || title_says_login(&lower);
+    // A login-ish title alone is too weak ("Login help"); it must come with a form.
+    let marker =
+        has_password_field(&lower) || (title_says_login(&lower) && lower.contains("<form"));
     let thin = visible_text_len(html) < THIN_PAGE_CHARS;
     let sso_host = changed && host_of(final_url).is_some_and(|h| sso_like_host(&h));
     ((marker && (changed || thin)) || sso_host).then(|| info(requested, final_url))
@@ -177,6 +179,18 @@ mod tests {
     fn sso_hostname_redirect_is_auth_wall_even_without_markers() {
         let html = "<html><body><div id=app></div></body></html>";
         assert!(detect_auth_wall("https://wiki.a.com", "https://a.okta.com/app", html).is_some());
+    }
+
+    #[test]
+    fn thin_page_titled_login_without_form_is_not_auth_wall() {
+        let html = "<html><head><title>Login help</title></head><body><p>Forgot how to sign in? Call IT.</p></body></html>";
+        assert!(detect_auth_wall("https://a.com/x", "https://a.com/help", html).is_none());
+    }
+
+    #[test]
+    fn login_titled_page_with_form_is_auth_wall() {
+        let html = "<html><head><title>Log in</title></head><body><form><input name=u></form></body></html>";
+        assert!(detect_auth_wall("https://a.com/x", "https://a.com/login", html).is_some());
     }
 
     #[test]
