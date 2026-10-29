@@ -30,6 +30,25 @@ pub struct FetchPageOutput {
     pub saved_to: Option<String>,
     /// The URL after any redirects.
     pub final_url: String,
+    /// Set instead of page content when the URL is behind a login/SSO wall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_required: Option<AuthRequiredInfo>,
+}
+
+/// Reported (instead of silently empty results) when a fetch lands on a
+/// login/SSO page. Carries no page content and never any credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRequiredInfo {
+    /// The URL the caller asked for.
+    pub requested_url: String,
+    /// The URL the navigation ended on (the login page).
+    pub final_url: String,
+    /// Hostname that demanded authentication.
+    pub auth_host: String,
+    /// How to proceed (e.g. enable headed mode, or log in elsewhere and retry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -154,6 +173,9 @@ pub struct ReadSavedPageOutput {
 #[serde(rename_all = "camelCase")]
 pub struct ReadWebsiteOutput {
     pub pages: Vec<ReadWebsitePage>,
+    /// URLs skipped because they are behind a login/SSO wall. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_required_urls: Vec<AuthRequiredInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

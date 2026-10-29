@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::ports::{HttpClient, HttpResponse};
+use crate::auth;
+use crate::ports::{BrowserDriver, HttpClient, HttpResponse, PortError};
+use crate::schema::AuthRequiredInfo;
 use crate::schema::{
     DownloadWebsiteInput, DownloadWebsiteOutput, DownloadedPage, ReadSavedPageInput,
     ReadSavedPageOutput, ReadWebsiteInput, ReadWebsiteOutput, ReadWebsitePage,
@@ -288,6 +290,11 @@ pub(crate) struct Crawler<'a, H: HttpClient> {
     policy: NetworkPolicy,
     visited: HashSet<String>,
     queue: VecDeque<(Url, u32)>,
+    /// Set by `fetch_and_expand` when its `Err` was caused by a login wall
+    /// (401/403, or a 200 that is a login page) rather than a plain failure;
+    /// read-and-cleared via `take_auth_hit` so the `Err(Option<u16>)` shape
+    /// `docs`/`download_website` already match on stays unchanged.
+    auth_hit: Option<AuthRequiredInfo>,
 }
 
 impl<'a, H: HttpClient> Crawler<'a, H> {
@@ -315,7 +322,12 @@ impl<'a, H: HttpClient> Crawler<'a, H> {
             policy,
             visited,
             queue,
+            auth_hit: None,
         })
+    }
+
+    pub(crate) fn take_auth_hit(&mut self) -> Option<AuthRequiredInfo> {
+        self.auth_hit.take()
     }
 
     fn allowed(&self, url: &Url) -> bool {
@@ -356,9 +368,22 @@ impl<'a, H: HttpClient> Crawler<'a, H> {
         url: &Url,
         depth: u32,
     ) -> Result<(String, String), Option<u16>> {
-        let resp = fetch_ok(self.http, url.as_str()).await?;
+        self.auth_hit = None;
+        let resp = match fetch_ok(self.http, url.as_str()).await {
+            Ok(resp) => resp,
+            Err(Some(status)) => {
+                self.auth_hit = auth::from_status(url.as_str(), status, url.as_str());
+                return Err(Some(status));
+            }
+            Err(None) => return Err(None),
+        };
         let final_url = resp.final_url.clone();
         let html = String::from_utf8_lossy(&resp.body).into_owned();
+        if let Some(info) = auth::detect_auth_wall(url.as_str(), &final_url, &html) {
+            // A login page is not content; reported as 401 to existing callers.
+            self.auth_hit = Some(info);
+            return Err(Some(401));
+        }
 
         if depth < self.max_depth {
             for link in extract_links(&html, url) {
@@ -454,8 +479,14 @@ fn build_preview(markdown: &str, saved_path: &str) -> String {
     )
 }
 
-pub async fn read_website<H, F>(
+const AUTH_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `browser` is the fallback for login-gated pages: it shares the daemon's
+/// persistent profile (and, if enabled, headed login), which the plain HTTP
+/// client has no cookies for.
+pub async fn read_website<H, B, F>(
     http: &H,
+    browser: &B,
     fs: &F,
     cache_dir: &str,
     input: ReadWebsiteInput,
@@ -463,6 +494,7 @@ pub async fn read_website<H, F>(
 ) -> Result<ReadWebsiteOutput, String>
 where
     H: HttpClient,
+    B: BrowserDriver,
     F: crate::ports::FileStore,
 {
     if input.url.is_empty() {
@@ -470,6 +502,7 @@ where
     }
     let seed = Url::parse(&input.url).map_err(|e| format!("invalid url: {e}"))?;
     let (max_depth, max_pages) = resolve_limits(input.max_depth, input.max_pages);
+    let mut auth_required_urls = Vec::new();
     let mut remaining_budget =
         resolve_inline_budget(input.max_inline_chars, input.always_save_to_file);
 
@@ -505,18 +538,44 @@ where
             }
         }
 
-        let Ok((html, _final_url)) = crawler.fetch_and_expand(&url, depth).await else {
-            continue;
+        let mut cacheable = true;
+        let html = match crawler.fetch_and_expand(&url, depth).await {
+            Ok((html, _final_url)) => html,
+            Err(_) => {
+                let Some(http_info) = crawler.take_auth_hit() else {
+                    continue;
+                };
+                match browser
+                    .navigate_and_extract(url.as_str(), AUTH_FALLBACK_TIMEOUT)
+                    .await
+                {
+                    // Authenticated content stays out of the on-disk cache.
+                    Ok(extract) => {
+                        cacheable = false;
+                        extract.html
+                    }
+                    Err(PortError::AuthRequired(info)) => {
+                        auth_required_urls.push(info);
+                        continue;
+                    }
+                    Err(_) => {
+                        auth_required_urls.push(http_info);
+                        continue;
+                    }
+                }
+            }
         };
         let (title, markdown) = extract_title_and_markdown(&html, url.as_str())?;
 
-        let cached = CachedPage {
-            title: title.clone(),
-            markdown: markdown.clone(),
-        };
-        if let Ok(bytes) = serde_json::to_vec(&cached) {
-            // Best-effort: a cache write failure shouldn't fail the tool call.
-            let _ = fs.write_file(&cache_path, &bytes).await;
+        if cacheable {
+            let cached = CachedPage {
+                title: title.clone(),
+                markdown: markdown.clone(),
+            };
+            if let Ok(bytes) = serde_json::to_vec(&cached) {
+                // Best-effort: a cache write failure shouldn't fail the tool call.
+                let _ = fs.write_file(&cache_path, &bytes).await;
+            }
         }
 
         let (markdown, saved_path) =
@@ -529,7 +588,10 @@ where
         });
     }
 
-    Ok(ReadWebsiteOutput { pages })
+    Ok(ReadWebsiteOutput {
+        pages,
+        auth_required_urls,
+    })
 }
 
 const DEFAULT_SAVED_PAGE_LINES: usize = 500;
@@ -1220,5 +1282,150 @@ mod same_host_tests {
         let a = Url::parse("https://[::1]/login").unwrap();
         let b = Url::parse("https://[0:0:0:0:0:0:0:1]/").unwrap();
         assert!(same_host(&a, &b));
+    }
+}
+
+#[cfg(test)]
+mod read_website_auth_tests {
+    use super::*;
+    use crate::ports::{FileStore, PageExtract};
+    use crate::tools::test_support::FakeBrowserDriver;
+    use std::cell::RefCell;
+
+    struct Http {
+        status: u16,
+        body: &'static str,
+        final_url: &'static str,
+    }
+
+    impl HttpClient for Http {
+        async fn get(&self, url: &str, _: &[(String, String)]) -> Result<HttpResponse, PortError> {
+            if url.ends_with("/robots.txt") {
+                return Err(PortError::Other("no robots".into()));
+            }
+            Ok(HttpResponse {
+                status: self.status,
+                body: self.body.as_bytes().to_vec(),
+                final_url: self.final_url.to_string(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct Fs {
+        writes: RefCell<Vec<String>>,
+    }
+
+    impl FileStore for Fs {
+        async fn write_file(&self, path: &str, _: &[u8]) -> Result<(), PortError> {
+            self.writes.borrow_mut().push(path.to_string());
+            Ok(())
+        }
+        async fn read_file(&self, _: &str) -> Result<Option<Vec<u8>>, PortError> {
+            Ok(None)
+        }
+        async fn delete_file(&self, _: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    const URL: &str = "https://wiki.example.com/page";
+    const LOGIN: &str =
+        r#"<html><head><title>Sign in</title></head><body><input type="password"></body></html>"#;
+    const CONTENT: &str = "<html><head><title>Doc</title></head><body><article><p>Real documentation content that is long enough for readability to keep it.</p></article></body></html>";
+
+    fn input() -> ReadWebsiteInput {
+        ReadWebsiteInput {
+            url: URL.to_string(),
+            max_depth: Some(0),
+            max_pages: Some(1),
+            max_inline_chars: None,
+            always_save_to_file: None,
+        }
+    }
+
+    async fn run(http: &Http, browser: &FakeBrowserDriver, fs: &Fs) -> ReadWebsiteOutput {
+        read_website(
+            http,
+            browser,
+            fs,
+            "/cache",
+            input(),
+            NetworkPolicy::from_env(None, None),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn should_report_browser_auth_required_instead_of_empty_pages_on_401() {
+        let http = Http {
+            status: 401,
+            body: "",
+            final_url: URL,
+        };
+        let info = AuthRequiredInfo {
+            requested_url: URL.into(),
+            final_url: "https://idp.example.com/login".into(),
+            auth_host: "idp.example.com".into(),
+            hint: None,
+        };
+        let browser =
+            FakeBrowserDriver::new().with_extract(Err(PortError::AuthRequired(info.clone())));
+        let out = run(&http, &browser, &Fs::default()).await;
+        assert!(out.pages.is_empty());
+        assert_eq!(out.auth_required_urls, vec![info]);
+    }
+
+    #[tokio::test]
+    async fn should_fall_back_to_http_detection_when_browser_fails() {
+        let http = Http {
+            status: 200,
+            body: LOGIN,
+            final_url: "https://idp.example.com/login",
+        };
+        let browser = FakeBrowserDriver::new().with_extract(Err(PortError::Timeout));
+        let out = run(&http, &browser, &Fs::default()).await;
+        assert!(out.pages.is_empty());
+        assert_eq!(out.auth_required_urls.len(), 1);
+        assert_eq!(out.auth_required_urls[0].auth_host, "idp.example.com");
+        assert_eq!(out.auth_required_urls[0].requested_url, URL);
+    }
+
+    #[tokio::test]
+    async fn should_return_browser_content_uncached_when_session_is_valid() {
+        let http = Http {
+            status: 403,
+            body: "",
+            final_url: URL,
+        };
+        let browser = FakeBrowserDriver::new().with_extract(Ok(PageExtract {
+            title: "Doc".into(),
+            html: CONTENT.into(),
+            text: String::new(),
+            final_url: URL.into(),
+        }));
+        let fs = Fs::default();
+        let out = run(&http, &browser, &fs).await;
+        assert_eq!(out.pages.len(), 1);
+        assert!(out.auth_required_urls.is_empty());
+        assert!(
+            fs.writes.borrow().is_empty(),
+            "authenticated content must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_touch_browser_for_ordinary_pages() {
+        let http = Http {
+            status: 200,
+            body: CONTENT,
+            final_url: URL,
+        };
+        let browser = FakeBrowserDriver::new();
+        let out = run(&http, &browser, &Fs::default()).await;
+        assert_eq!(out.pages.len(), 1);
+        assert!(out.auth_required_urls.is_empty());
+        assert_eq!(browser.call_count(), 0);
     }
 }

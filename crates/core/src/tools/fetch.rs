@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::ports::{BrowserDriver, FileStore};
+use crate::ports::{BrowserDriver, FileStore, PortError};
 use crate::schema::{FetchPageInput, FetchPageOutput};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -18,16 +18,26 @@ pub async fn fetch_page<B: BrowserDriver, F: FileStore>(
         _ => DEFAULT_TIMEOUT,
     };
 
-    let extract = browser
-        .navigate_and_extract(&input.url, timeout)
-        .await
-        .map_err(|e| format!("render {}: {e}", input.url))?;
+    let extract = match browser.navigate_and_extract(&input.url, timeout).await {
+        Ok(extract) => extract,
+        Err(PortError::AuthRequired(info)) => {
+            return Ok(FetchPageOutput {
+                title: String::new(),
+                text: String::new(),
+                saved_to: None,
+                final_url: info.final_url.clone(),
+                auth_required: Some(info),
+            });
+        }
+        Err(e) => return Err(format!("render {}: {e}", input.url)),
+    };
 
     let mut out = FetchPageOutput {
         title: extract.title,
         text: extract.text,
         saved_to: None,
         final_url: extract.final_url,
+        auth_required: None,
     };
 
     // Note: unlike the original Go function (which could return a partially
@@ -45,4 +55,56 @@ pub async fn fetch_page<B: BrowserDriver, F: FileStore>(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::{FileStore, PortError};
+    use crate::schema::AuthRequiredInfo;
+    use crate::tools::test_support::FakeBrowserDriver;
+
+    struct NoFs;
+    impl FileStore for NoFs {
+        async fn write_file(&self, _: &str, _: &[u8]) -> Result<(), PortError> {
+            panic!("unused")
+        }
+        async fn read_file(&self, _: &str) -> Result<Option<Vec<u8>>, PortError> {
+            panic!("unused")
+        }
+        async fn delete_file(&self, _: &str) -> Result<(), PortError> {
+            panic!("unused")
+        }
+    }
+
+    fn input() -> FetchPageInput {
+        FetchPageInput {
+            url: "https://wiki.example.com/p".into(),
+            save_path: None,
+            timeout_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_page_should_return_auth_required_instead_of_error_when_login_wall() {
+        let info = AuthRequiredInfo {
+            requested_url: "https://wiki.example.com/p".into(),
+            final_url: "https://idp.example.com/login".into(),
+            auth_host: "idp.example.com".into(),
+            hint: None,
+        };
+        let browser =
+            FakeBrowserDriver::new().with_extract(Err(PortError::AuthRequired(info.clone())));
+        let out = fetch_page(&browser, &NoFs, input()).await.unwrap();
+        assert_eq!(out.auth_required, Some(info));
+        assert!(out.text.is_empty());
+        assert_eq!(out.final_url, "https://idp.example.com/login");
+    }
+
+    #[tokio::test]
+    async fn fetch_page_should_keep_timeout_as_a_plain_error() {
+        let browser = FakeBrowserDriver::new().with_extract(Err(PortError::Timeout));
+        let err = fetch_page(&browser, &NoFs, input()).await.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
 }
