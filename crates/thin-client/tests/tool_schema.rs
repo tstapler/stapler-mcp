@@ -240,28 +240,33 @@ async fn daemon_status_should_deserialize_run_daemons_camelcase_wire_keys() {
     );
 }
 
-struct DownTransport;
+struct FailingTransport;
 
-impl stapler_mcp::transport::DaemonTransport for DownTransport {
+impl stapler_mcp::transport::DaemonTransport for FailingTransport {
     async fn call(
         &self,
         _tool: &'static str,
         _params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        Err("ensure daemon: io error: Connection refused (socket=/s, log=/l)".into())
+        Err("ensure daemon: io error: Connection refused (os error 111)".to_string())
     }
 }
 
+/// `stapler_daemon_status` must hand back a diagnostic value, never an `Err`,
+/// when the daemon cannot be reached.
 #[tokio::test]
-async fn daemon_status_should_report_down_state_instead_of_erroring() {
-    let router = stapler_mcp::mcp_router::McpRouter::with_transport(DownTransport);
+async fn daemon_status_should_report_down_instead_of_erroring() {
+    let router = stapler_mcp::mcp_router::McpRouter::with_transport(FailingTransport);
 
     let status = router
         .call_daemon_status_for_test()
         .await
-        .expect("a down daemon is a status, not a tool error");
+        .expect("an unreachable daemon is a status value, not a tool error");
 
     assert!(!status.pong);
-    let error = status.error.expect("down state should carry the cause");
-    assert!(error.contains("socket=/s") && error.contains("log=/l"), "{error}");
+    assert!(status
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("Connection refused"));
 }

@@ -27,6 +27,7 @@ use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{keys, Browser, BrowserConfig, Page};
 use futures::StreamExt;
 
+use stapler_mcp_core::auth;
 use stapler_mcp_core::ports::{
     AxNode, AxSnapshot, BrowserDriver, ClockPort, CredentialField, CredentialRef, CredentialStore,
     HistoryAction, Locator, NavigateResult, NetworkRequestsResult, PageExtract, PortError,
@@ -472,6 +473,56 @@ pub struct NativeBrowser {
     /// RPC / `stapler_daemon_status` tool / `stapler-mcp --status`, not just
     /// `daemon.log`, so it's discoverable without an operator tailing logs.
     unsafe_profile_warning: Option<String>,
+    /// True only when `STAPLER_MCP_HEADED=1` *and* a display was found, so
+    /// Chrome was actually launched with a visible window.
+    headed: bool,
+    /// `STAPLER_MCP_HEADED=1` was set, whether or not a display existed —
+    /// lets the auth hint say which of the two is missing.
+    headed_requested: bool,
+    /// How long a headed login may take before the call gives up.
+    auth_wait: Duration,
+    /// One interactive login window at a time; concurrent auth-gated calls
+    /// get `AuthRequired` instead of stacking windows.
+    auth_in_progress: Cell<bool>,
+}
+
+const DEFAULT_AUTH_WAIT_SECS: u64 = 300;
+const AUTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Pure so it is testable without a real environment.
+fn headed_decision(flag: Option<&str>, has_display: bool) -> (bool, bool) {
+    let requested = matches!(flag, Some("1") | Some("true"));
+    (requested, requested && has_display)
+}
+
+fn auth_wait_from(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_AUTH_WAIT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn auth_hint(headed_requested: bool, headed: bool, timed_out: bool) -> String {
+    if timed_out {
+        "login was not completed in time; retry the call and finish signing in in the opened window"
+            .to_string()
+    } else if headed {
+        "another login window is already open; finish that login and retry".to_string()
+    } else if headed_requested {
+        "STAPLER_MCP_HEADED=1 is set but no display ($DISPLAY/$WAYLAND_DISPLAY) is available; open the URL in a browser on a machine with a display, log in, then retry"
+            .to_string()
+    } else {
+        "set STAPLER_MCP_HEADED=1 (with a display) to log in interactively, and STAPLER_MCP_BROWSER_PROFILE_DIR to keep the session"
+            .to_string()
+    }
+}
+
+struct AuthGuard<'a>(&'a Cell<bool>);
+impl Drop for AuthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 /// Object-safe erasure of `CredentialStore` for storage behind `dyn`.
@@ -576,8 +627,22 @@ impl NativeBrowser {
             None => None,
         };
 
-        let config = BrowserConfig::builder()
-            .user_data_dir(&user_data_dir)
+        let has_display = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+            || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+        let (headed_requested, headed) = headed_decision(
+            std::env::var("STAPLER_MCP_HEADED").ok().as_deref(),
+            has_display,
+        );
+        if headed_requested && !headed {
+            eprintln!("stapler-mcp: STAPLER_MCP_HEADED=1 but no display found — staying headless");
+        }
+        let auth_wait = auth_wait_from(std::env::var("STAPLER_MCP_AUTH_WAIT_SECS").ok().as_deref());
+
+        let mut config = BrowserConfig::builder().user_data_dir(&user_data_dir);
+        if headed {
+            config = config.with_head();
+        }
+        let config = config
             .build()
             .map_err(|e| PortError::Other(e.to_string()))?;
         let (browser, mut handler) = Browser::launch(config)
@@ -600,7 +665,47 @@ impl NativeBrowser {
             reaper: RefCell::new(Some(reaper)),
             credential_store: RefCell::new(None),
             unsafe_profile_warning,
+            headed,
+            headed_requested,
+            auth_wait,
+            auth_in_progress: Cell::new(false),
         })
+    }
+
+    pub fn headed(&self) -> bool {
+        self.headed
+    }
+
+    pub fn auth_wait(&self) -> Duration {
+        self.auth_wait
+    }
+
+    /// Polls until the tab has left the login flow (current page no longer
+    /// looks like an auth wall and is off `auth_host`) or `auth_wait`
+    /// elapses. Reads only URL and DOM text — never cookies or form values.
+    async fn wait_for_login(&self, page: &Page, requested: &str, auth_host: &str) -> bool {
+        // Two consecutive clean polls: a multi-hop SSO chain can briefly land
+        // on an intermediate page that looks clean (e.g. an MFA prompt).
+        let poll = async {
+            let mut clean_polls = 0u8;
+            loop {
+                tokio::time::sleep(AUTH_POLL_INTERVAL).await;
+                let (Ok(Some(url)), Ok(html)) = (page.url().await, page.content().await) else {
+                    clean_polls = 0;
+                    continue;
+                };
+                let off_idp = auth::host_of(&url).is_some_and(|h| h != auth_host);
+                if off_idp && auth::detect_auth_wall(requested, &url, &html).is_none() {
+                    clean_polls += 1;
+                    if clean_polls >= 2 {
+                        return;
+                    }
+                } else {
+                    clean_polls = 0;
+                }
+            }
+        };
+        tokio::time::timeout(self.auth_wait, poll).await.is_ok()
     }
 
     /// `Some` only when this browser's profile dir is persistent (opted in
@@ -1570,7 +1675,37 @@ impl BrowserDriver for NativeBrowser {
         url: &str,
         timeout: Duration,
     ) -> Result<PageExtract, PortError> {
-        let fut = async {
+        async fn extract(page: &Page, url: &str) -> Result<PageExtract, PortError> {
+            let err = |e: chromiumoxide::error::CdpError| PortError::Other(e.to_string());
+            let title: String = page
+                .evaluate("document.title")
+                .await
+                .map_err(err)?
+                .into_value()
+                .map_err(|e| PortError::Other(e.to_string()))?;
+            let text: String = page
+                .evaluate("document.body ? document.body.innerText : ''")
+                .await
+                .map_err(err)?
+                .into_value()
+                .map_err(|e| PortError::Other(e.to_string()))?;
+            let html = page.content().await.map_err(err)?;
+            let final_url = page
+                .url()
+                .await
+                .map_err(err)?
+                .unwrap_or_else(|| url.to_string());
+            Ok(PageExtract {
+                title,
+                html,
+                text,
+                final_url,
+            })
+        }
+
+        // Only the non-interactive load is bounded by `timeout`; the headed
+        // login wait below has its own `auth_wait` budget.
+        let load = async {
             let page = self
                 .browser
                 .new_page(url)
@@ -1579,40 +1714,55 @@ impl BrowserDriver for NativeBrowser {
             page.wait_for_navigation()
                 .await
                 .map_err(|e| PortError::Other(e.to_string()))?;
+            let ex = extract(&page, url).await?;
+            Ok::<_, PortError>((page, ex))
+        };
+        let (page, first) = tokio::time::timeout(timeout, load)
+            .await
+            .map_err(|_| PortError::Timeout)??;
 
-            let title: String = page
-                .evaluate("document.title")
-                .await
-                .map_err(|e| PortError::Other(e.to_string()))?
-                .into_value()
-                .map_err(|e| PortError::Other(e.to_string()))?;
-            let text: String = page
-                .evaluate("document.body ? document.body.innerText : ''")
-                .await
-                .map_err(|e| PortError::Other(e.to_string()))?
-                .into_value()
-                .map_err(|e| PortError::Other(e.to_string()))?;
-            let html = page
-                .content()
-                .await
-                .map_err(|e| PortError::Other(e.to_string()))?;
-            let final_url = page
-                .url()
-                .await
-                .map_err(|e| PortError::Other(e.to_string()))?
-                .unwrap_or_else(|| url.to_string());
-
-            Ok(PageExtract {
-                title,
-                html,
-                text,
-                final_url,
-            })
+        let Some(mut info) = auth::detect_auth_wall(url, &first.final_url, &first.html) else {
+            return Ok(first);
         };
 
-        tokio::time::timeout(timeout, fut)
-            .await
-            .map_err(|_| PortError::Timeout)?
+        let hint_for = |timed_out| auth_hint(self.headed_requested, self.headed, timed_out);
+        if !self.headed || self.auth_in_progress.get() {
+            let _ = page.close().await;
+            info.hint = Some(hint_for(false));
+            return Err(PortError::AuthRequired(info));
+        }
+
+        self.auth_in_progress.set(true);
+        let _guard = AuthGuard(&self.auth_in_progress);
+        let logged_in = self.wait_for_login(&page, url, &info.auth_host).await;
+        let result = if logged_in {
+            // Re-fetch the original URL now that the profile holds the session.
+            let reload = async {
+                page.goto(url)
+                    .await
+                    .map_err(|e| PortError::Other(e.to_string()))?;
+                page.wait_for_navigation()
+                    .await
+                    .map_err(|e| PortError::Other(e.to_string()))?;
+                extract(&page, url).await
+            };
+            match tokio::time::timeout(timeout, reload).await {
+                Ok(Ok(ex)) => match auth::detect_auth_wall(url, &ex.final_url, &ex.html) {
+                    None => Ok(ex),
+                    Some(mut again) => {
+                        again.hint = Some(hint_for(true));
+                        Err(PortError::AuthRequired(again))
+                    }
+                },
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(PortError::Timeout),
+            }
+        } else {
+            info.hint = Some(hint_for(true));
+            Err(PortError::AuthRequired(info))
+        };
+        let _ = page.close().await;
+        result
     }
 
     /// Session-registry bookkeeping (Epic 2) is fully wired here: an unknown
@@ -3287,6 +3437,29 @@ impl NativeBrowser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn headed_decision_should_require_flag_and_display() {
+        assert_eq!(headed_decision(Some("1"), true), (true, true));
+        assert_eq!(headed_decision(Some("1"), false), (true, false));
+        assert_eq!(headed_decision(None, true), (false, false));
+        assert_eq!(headed_decision(Some("0"), true), (false, false));
+    }
+
+    #[test]
+    fn auth_wait_should_default_and_reject_zero_or_garbage() {
+        assert_eq!(auth_wait_from(None), Duration::from_secs(300));
+        assert_eq!(auth_wait_from(Some("0")), Duration::from_secs(300));
+        assert_eq!(auth_wait_from(Some("abc")), Duration::from_secs(300));
+        assert_eq!(auth_wait_from(Some("45")), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn auth_hint_should_name_the_missing_piece() {
+        assert!(auth_hint(true, false, false).contains("no display"));
+        assert!(auth_hint(false, false, false).contains("STAPLER_MCP_HEADED=1"));
+        assert!(auth_hint(true, true, true).contains("not completed in time"));
+    }
+
     use super::*;
     use std::cell::Cell as StdCell;
     use std::future::Future;

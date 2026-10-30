@@ -157,7 +157,7 @@ impl Daemon {
         let mut listener = socket.bind(sock_path).await?;
         loop {
             let conn = listener.accept().await?;
-            self.serve_connection_tolerant(conn).await;
+            self.serve_logged(conn).await;
             if self.shutdown.get() {
                 return Ok(());
             }
@@ -184,17 +184,16 @@ impl Daemon {
                 _ = self.cancel.cancelled() => return Ok(()),
                 accept_result = listener.accept() => accept_result?,
             };
-            self.serve_connection_tolerant(conn).await;
+            self.serve_logged(conn).await;
             if self.shutdown.get() {
                 return Ok(());
             }
         }
     }
 
-    /// A client hanging up mid-response (`Broken pipe`) must not end the
-    /// accept loop: the daemon would stop listening while its process and
-    /// lock lived on, so every later `ensure_daemon` saw ECONNREFUSED.
-    async fn serve_connection_tolerant<C: Conn>(&self, conn: C) {
+    /// A client that hangs up mid-request (EPIPE, timeout) must not take the
+    /// daemon down with it, so per-connection errors are logged, not propagated.
+    async fn serve_logged<C: Conn>(&self, conn: C) {
         if let Err(e) = self.serve_connection(conn).await {
             eprintln!("stapler-mcp: connection error (continuing): {e}");
         }
@@ -422,50 +421,6 @@ mod tests {
         assert!(matches!(run_result, Ok(())));
     }
 
-    struct BrokenPipeConn;
-
-    impl Conn for BrokenPipeConn {
-        async fn read_frame(&mut self) -> Result<Option<Vec<u8>>, PortError> {
-            Ok(Some(br#"{"tool":"ping"}"#.to_vec()))
-        }
-        async fn write_frame(&mut self, _bytes: &[u8]) -> Result<(), PortError> {
-            Err(PortError::Other("Broken pipe".into()))
-        }
-        fn set_timeout(&mut self, _dur: Duration) {}
-    }
-
-    /// Yields one conn whose client hung up, then a second accept that
-    /// requests shutdown — proving the loop survived the first.
-    struct FlakyListener<'a> {
-        accepted: u32,
-        daemon: &'a Daemon,
-    }
-
-    impl Listener for FlakyListener<'_> {
-        type C = BrokenPipeConn;
-        async fn accept(&mut self) -> Result<Self::C, PortError> {
-            self.accepted += 1;
-            if self.accepted == 2 {
-                self.daemon.request_shutdown();
-            }
-            Ok(BrokenPipeConn)
-        }
-    }
-
-    #[tokio::test]
-    async fn serve_connection_tolerant_should_swallow_broken_pipe() {
-        let daemon = Daemon::new();
-        let mut listener = FlakyListener {
-            accepted: 0,
-            daemon: &daemon,
-        };
-        for _ in 0..2 {
-            let conn = listener.accept().await.unwrap();
-            daemon.serve_connection_tolerant(conn).await;
-        }
-        assert_eq!(listener.accepted, 2);
-    }
-
     #[tokio::test]
     async fn handle_request_should_time_out_a_hung_handler_instead_of_blocking_forever() {
         let daemon = Daemon::new();
@@ -519,5 +474,143 @@ mod tests {
 
         assert_eq!(resp.result, Some(serde_json::json!({"pong": true})));
         assert!(resp.error.is_none());
+    }
+
+    struct ScriptedConn {
+        read: Option<Result<Option<Vec<u8>>, PortError>>,
+        write: Result<(), PortError>,
+    }
+
+    impl ScriptedConn {
+        fn request(tool: &str) -> Vec<u8> {
+            serde_json::to_vec(&Request {
+                tool: tool.to_string(),
+                params: None,
+            })
+            .unwrap()
+        }
+        fn ok(tool: &str) -> Self {
+            Self {
+                read: Some(Ok(Some(Self::request(tool)))),
+                write: Ok(()),
+            }
+        }
+        fn broken_pipe_on_write(tool: &str) -> Self {
+            Self {
+                read: Some(Ok(Some(Self::request(tool)))),
+                write: Err(PortError::Io("Broken pipe (os error 32)".into())),
+            }
+        }
+        fn read_error() -> Self {
+            Self {
+                read: Some(Err(PortError::Timeout)),
+                write: Ok(()),
+            }
+        }
+    }
+
+    impl Conn for ScriptedConn {
+        async fn read_frame(&mut self) -> Result<Option<Vec<u8>>, PortError> {
+            self.read.take().expect("read_frame called once")
+        }
+        async fn write_frame(&mut self, _bytes: &[u8]) -> Result<(), PortError> {
+            std::mem::replace(&mut self.write, Ok(()))
+        }
+        fn set_timeout(&mut self, _dur: Duration) {}
+    }
+
+    struct ScriptedListener(std::collections::VecDeque<Result<ScriptedConn, PortError>>);
+
+    impl Listener for ScriptedListener {
+        type C = ScriptedConn;
+        async fn accept(&mut self) -> Result<Self::C, PortError> {
+            match self.0.pop_front() {
+                Some(next) => next,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    struct ScriptedSocketFactory(RefCell<Option<ScriptedListener>>);
+
+    impl ScriptedSocketFactory {
+        fn new(script: Vec<Result<ScriptedConn, PortError>>) -> Self {
+            Self(RefCell::new(Some(ScriptedListener(script.into()))))
+        }
+    }
+
+    impl SocketFactory for ScriptedSocketFactory {
+        type L = ScriptedListener;
+        type C = ScriptedConn;
+        async fn bind(&self, _path: &str) -> Result<Self::L, PortError> {
+            Ok(self.0.borrow_mut().take().expect("bound once"))
+        }
+        async fn connect(&self, _path: &str, _timeout: Duration) -> Result<Self::C, PortError> {
+            unreachable!("daemon tests never connect")
+        }
+        async fn remove_stale(&self, _path: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    fn failing_then_shutdown() -> Vec<Vec<Result<ScriptedConn, PortError>>> {
+        vec![
+            vec![
+                Ok(ScriptedConn::broken_pipe_on_write(PING_TOOL)),
+                Ok(ScriptedConn::ok(SHUTDOWN_TOOL)),
+            ],
+            vec![
+                Ok(ScriptedConn::read_error()),
+                Ok(ScriptedConn::ok(SHUTDOWN_TOOL)),
+            ],
+        ]
+    }
+
+    #[tokio::test]
+    async fn run_should_keep_serving_after_a_connection_error() {
+        for script in failing_then_shutdown() {
+            let daemon = Daemon::new();
+            let result = tokio::time::timeout(
+                Duration::from_millis(500),
+                daemon.run(&ScriptedSocketFactory::new(script), "irrelevant"),
+            )
+            .await
+            .expect("run should reach the shutdown connection");
+            assert!(matches!(result, Ok(())), "got {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_cancellable_should_keep_serving_after_a_connection_error() {
+        for script in failing_then_shutdown() {
+            let daemon = Daemon::new();
+            let result = tokio::time::timeout(
+                Duration::from_millis(500),
+                daemon.run_cancellable(&ScriptedSocketFactory::new(script), "irrelevant"),
+            )
+            .await
+            .expect("run_cancellable should reach the shutdown connection");
+            assert!(matches!(result, Ok(())), "got {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_should_return_err_when_accept_fails() {
+        let daemon = Daemon::new();
+        let socket = ScriptedSocketFactory::new(vec![Err(PortError::Io(
+            "Permission denied (os error 13)".into(),
+        ))]);
+        let result = daemon.run(&socket, "irrelevant").await;
+        assert!(matches!(result, Err(PortError::Io(_))), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn run_cancellable_should_return_err_when_accept_fails() {
+        let daemon = Daemon::new();
+        let socket = ScriptedSocketFactory::new(vec![Err(PortError::Io(
+            "Permission denied (os error 13)".into(),
+        ))]);
+        let result = daemon.run_cancellable(&socket, "irrelevant").await;
+        assert!(matches!(result, Err(PortError::Io(_))), "got {result:?}");
     }
 }

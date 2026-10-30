@@ -240,6 +240,7 @@ fn clone_port_error(e: &PortError) -> PortError {
         PortError::CredentialUnauthenticated(s) => PortError::CredentialUnauthenticated(s.clone()),
         PortError::CredentialRateLimited(s) => PortError::CredentialRateLimited(s.clone()),
         PortError::CredentialExpired(s) => PortError::CredentialExpired(s.clone()),
+        PortError::AuthRequired(i) => PortError::AuthRequired(i.clone()),
     }
 }
 

@@ -159,12 +159,7 @@ fn browser_profile_status_lines(status: &DaemonStatusOutput) -> Vec<String> {
 /// `run_daemon`'s wire format ever drifts from this struct.
 fn print_browser_profile_status(ping_result: &serde_json::Value) {
     let status: DaemonStatusOutput =
-        serde_json::from_value(ping_result.clone()).unwrap_or(DaemonStatusOutput {
-            pong: false,
-            browser_profile_mode: None,
-            browser_profile_warning: None,
-            error: None,
-        });
+        serde_json::from_value(ping_result.clone()).unwrap_or_default();
     for line in browser_profile_status_lines(&status) {
         println!("{line}");
     }
@@ -178,9 +173,7 @@ mod browser_profile_status_tests {
     fn should_default_to_ephemeral_when_mode_absent() {
         let status = DaemonStatusOutput {
             pong: true,
-            browser_profile_mode: None,
-            browser_profile_warning: None,
-            error: None,
+            ..Default::default()
         };
         assert_eq!(
             browser_profile_status_lines(&status),
@@ -196,7 +189,7 @@ mod browser_profile_status_tests {
                 "persistent at /home/alice/.stapler-mcp/browser-profile".to_string(),
             ),
             browser_profile_warning: Some("looks unsafe".to_string()),
-            error: None,
+            ..Default::default()
         };
         assert_eq!(
             browser_profile_status_lines(&status),
@@ -413,6 +406,8 @@ async fn run_daemon() {
     daemon.set_status_extra(serde_json::json!({
         "browserProfileMode": browser_profile_mode,
         "browserProfileWarning": browser.unsafe_profile_warning(),
+        "headedMode": browser.headed(),
+        "authWaitTimeoutSecs": browser.auth_wait().as_secs(),
     }));
 
     daemon.register(
@@ -469,16 +464,26 @@ async fn run_daemon() {
         "read_website",
         json_handler({
             let http = http.clone();
+            let browser = browser.clone();
             let fs = fs.clone();
             let cache_dir = cache_dir.clone();
             let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
+                let browser = browser.clone();
                 let fs = fs.clone();
                 let cache_dir = cache_dir.clone();
                 let network_policy = network_policy.clone();
                 async move {
-                    webcrawl::read_website(&*http, &*fs, &cache_dir, input, network_policy).await
+                    webcrawl::read_website(
+                        &*http,
+                        &*browser,
+                        &*fs,
+                        &cache_dir,
+                        input,
+                        network_policy,
+                    )
+                    .await
                 }
             }
         }),

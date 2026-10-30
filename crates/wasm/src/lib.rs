@@ -135,17 +135,26 @@ pub async fn run_daemon() -> Result<(), JsValue> {
         "read_website",
         json_handler({
             let http = http.clone();
+            let browser = browser.clone();
             let fsstore = fsstore.clone();
             let cache_dir = cache_dir.clone();
             let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
+                let browser = browser.clone();
                 let fsstore = fsstore.clone();
                 let cache_dir = cache_dir.clone();
                 let network_policy = network_policy.clone();
                 async move {
-                    webcrawl::read_website(&*http, &*fsstore, &cache_dir, input, network_policy)
-                        .await
+                    webcrawl::read_website(
+                        &*http,
+                        &*browser,
+                        &*fsstore,
+                        &cache_dir,
+                        input,
+                        network_policy,
+                    )
+                    .await
                 }
             }
         }),

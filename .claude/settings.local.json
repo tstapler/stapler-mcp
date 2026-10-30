@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "F='/home/tstapler/.stapler-squad/workspaces/d685c4b1a423cca3/hook-proofs/'\"$STAPLER_SESSION_UUID\"; T='/home/tstapler/.stapler-squad/workspaces/d685c4b1a423cca3/auth/local-api-token.header'; set --; [ -n \"$STAPLER_SESSION_UUID\" ] \u0026\u0026 [ -f \"$F\" ] \u0026\u0026 [ -r \"$F\" ] \u0026\u0026 set -- -H \"@$F\"; [ -f \"$T\" ] \u0026\u0026 [ -r \"$T\" ] \u0026\u0026 set -- \"$@\" -H \"@$T\"; curl -s --max-time 300 -X POST 'http://127.0.0.1:8543/api/hooks/permission-request' -H 'Content-Type: application/json' -H 'X-CS-Session-ID: stapler-mcp-daemon-resilient-restart-100b6198' \"$@\" -d @-",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "F='/home/tstapler/.stapler-squad/workspaces/d685c4b1a423cca3/hook-proofs/'\"$STAPLER_SESSION_UUID\"; T='/home/tstapler/.stapler-squad/workspaces/d685c4b1a423cca3/auth/local-api-token.header'; set --; [ -n \"$STAPLER_SESSION_UUID\" ] \u0026\u0026 [ -f \"$F\" ] \u0026\u0026 [ -r \"$F\" ] \u0026\u0026 set -- -H \"@$F\"; [ -f \"$T\" ] \u0026\u0026 [ -r \"$T\" ] \u0026\u0026 set -- \"$@\" -H \"@$T\"; curl -s --max-time 300 -X POST 'http://127.0.0.1:8543/api/hooks/post-tool-use-drift-check' -H 'Content-Type: application/json' -H 'X-CS-Session-ID: stapler-mcp-daemon-resilient-restart-100b6198' \"$@\" -d @-",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}
