@@ -24,6 +24,7 @@ futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+libc = "0.2"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 # Plain-HTTP only (127.0.0.1, no TLS) — no TLS backend feature needed.
