@@ -87,3 +87,14 @@ Small (evaluation only) — a few hours of research, architecture analysis, and 
 - How often do stale-ref errors actually occur in real agent usage sessions? Without this data, sizing the problem is speculative.
 - Is there a way to detect "stale ref" (AX node ID recycled or removed) vs. "element gone" (no equivalent element exists) in the CDP AX tree response, and surface that distinction in the error message?
 - Could the daemon cache the last snapshot's AX tree per session and attempt a simple re-resolve (by role+name, not LLM) before failing? This would be a zero-LLM-dependency, daemon-internal optimization that avoids the AI dependency entirely.
+
+## Acceptance Criteria (from backlog item 3dfa3377)
+
+1. Decision document answers the four evaluation questions (this directory's `plan.md`, "Decision answers").
+2. Stale-ref `PortError::NotFound` from click/type names `stapler_browser_snapshot` as the recovery action, distinct from session-not-found.
+3. `refId` doc comments in `BrowserClickInput`/`BrowserTypeInput` describe the stale-ref failure and the re-snapshot+retry recovery.
+4. **Conditional on Part 3 approval**: on `NotFound`, re-snapshot and retry if exactly one node has the same role+name; set `BrowserActionOutput.note`. If Part 3 is not approved, this criterion is not applicable (`/backlog/fail-3` with that reason, not silently passed).
+5. No LLM calls and no new API keys in the daemon on any path.
+6. `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` pass.
+
+Note: "Must not modify source code" under Constraints applies to the evaluation phases (1-4); criteria 2-3 and 6 are the implementation phase.

@@ -11,7 +11,11 @@
 
 ## Recommendation: Three-part improvement, no LLM dependency
 
-### Part 1 — Improve error messages to make agent-side retry obvious (P1 of this item)
+### Part 1 — Stale-ref error messages (AC2): VERIFIED ALREADY SATISFIED, no code change
+
+Correction after reading the code path (commands: `grep -n "resolve_locator_impl\|verify_node_live" crates/native/src/browser.rs`; `sed -n 675,760p` of the same file): click/type resolve refs via `resolve_locator_impl` (`crates/native/src/browser.rs:682`) and `verify_node_live` (`:707`). Both return `PortError::NotFound` — the same variant as session-not-found (`not_found_message`, `:162`). The stale-ref messages already say "call stapler_browser_snapshot for current refs" and are distinct from the session message ("start a new session"); existing tests assert this (`resolve_locator_should_return_stale_ref_message_when_ref_issued_before_navigation`, `ux_ac3_locator_not_found_error_should_name_ref_and_page_url_and_corrective_call`). `map_error` (`crates/core/src/tools/browser.rs:88`) passes the message through unchanged. The earlier claim below that the message needs improving was wrong; AC2 needs only a verification, not a change. Residual wart: the `PortError::NotFound` doc comment in `crates/core/src/ports.rs:20-23` says "always start a new session", which is misleading for stale refs — fix that comment (doc-only).
+
+Original (superseded) text:
 
 The existing `PortError::NotFound` error for stale refs should include a structured recovery hint. Current message (approximate): something identifying the session and failing ref. Improved message:
 
@@ -19,7 +23,7 @@ The existing `PortError::NotFound` error for stale refs should include a structu
 
 This zero-cost change makes the agent-side retry idiom explicit. An LLM agent that reads this message knows exactly what to do. Implementation: modify `not_found_message` in `crates/native/src/browser.rs` (and the wasm equivalent) to include a structured hint when the failure is a locator resolution error vs. a session-not-found error.
 
-### Part 2 — Add recovery hint to tool schema descriptions (P2 of this item)
+### Part 2 — Add recovery hint (AC3; KEPT — edit already drafted in `crates/core/src/schema.rs`) to tool schema descriptions (P2 of this item)
 
 The `stapler_browser_click` and `stapler_browser_type` tool schema descriptions (doc comments in `crates/core/src/schema.rs`) should note:
 
@@ -27,7 +31,7 @@ The `stapler_browser_click` and `stapler_browser_type` tool schema descriptions 
 
 This surfaces the retry pattern to the LLM before it even makes the first call — not just when it fails. Zero implementation cost.
 
-### Part 3 — Evaluate daemon-side last-snapshot re-resolve (P3 of this item, lower priority)
+### Part 3 (AC4 depends on this being approved; the decision here is NOT approved — deferred) — Evaluate daemon-side last-snapshot re-resolve (P3 of this item, lower priority)
 
 A zero-LLM-dependency middle ground: cache the last `AxSnapshot` per session (already returned after every action) and on a `NotFound` failure:
 1. Re-take a fresh snapshot (one CDP round-trip).

@@ -95,3 +95,7 @@ The plan's core recommendation is sound: do not add LLM calls to the daemon, imp
 4. Add a plan revision condition: "If stale-ref failure rate proves high in practice, revisit the LLM-based approach with explicit appetite sizing."
 
 **No blocking issues.** Parts 1 and 2 can proceed immediately without further validation. Part 3 remains correctly deferred.
+
+## Addendum (code-path verification)
+
+Challenge 1 is resolved by reading the code: the stale-ref message is already actionable (see plan.md Part 1). Required adjustment 1 ("treat Part 1 as a bug fix") is withdrawn. AC4 is conditional on Part 3 approval; the plan defers Part 3, so AC4 is reported as not applicable, with the reason. Gate: PASS for Parts 1-2 (doc-only changes) and the decision document.
