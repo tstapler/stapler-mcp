@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod client;
 pub mod daemon;
 pub mod http_auth;

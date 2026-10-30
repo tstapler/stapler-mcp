@@ -201,7 +201,7 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
 impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
     #[tool(
         name = "fetch_page",
-        description = "Render a URL in a headless browser and return its title and extracted text (optionally saving the rendered HTML to a local file). Backed by the shared stapler-mcp daemon's browser pool."
+        description = "Render a URL in a headless browser and return its title and extracted text (optionally saving the rendered HTML to a local file). Backed by the shared stapler-mcp daemon's browser pool. A URL behind a login/SSO wall returns authRequired (requestedUrl, finalUrl, authHost, hint) instead of content; with STAPLER_MCP_HEADED=1 and a display the daemon opens a window for you to log in (waits up to STAPLER_MCP_AUTH_WAIT_SECS, default 300) and then returns the page."
     )]
     async fn fetch_page(
         &self,
@@ -261,7 +261,7 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
 
     #[tool(
         name = "read_website",
-        description = "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon. Once the combined Markdown across all pages returned passes ~60,000 characters (tunable via maxInlineChars, or force it for every page with alwaysSaveToFile), further pages come back as a short preview plus savedPath instead — use read_saved_page to search or page through the full content."
+        description = "Fetch a URL (optionally crawling same-host links up to maxDepth/maxPages), extract the main content via Readability-style extraction, and return it as Markdown. Cached by URL on the daemon. Once the combined Markdown across all pages returned passes ~60,000 characters (tunable via maxInlineChars, or force it for every page with alwaysSaveToFile), further pages come back as a short preview plus savedPath instead — use read_saved_page to search or page through the full content. Pages behind a login/SSO wall are not returned empty: they are listed in authRequiredUrls (requestedUrl, finalUrl, authHost, hint); set STAPLER_MCP_HEADED=1 on the daemon (with a display) to log in interactively, and STAPLER_MCP_BROWSER_PROFILE_DIR to keep the session."
     )]
     async fn read_website(
         &self,

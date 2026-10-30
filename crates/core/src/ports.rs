@@ -56,6 +56,10 @@ pub enum PortError {
     /// The resolved TOTP code's ~30s validity window elapsed before it
     /// could be typed. The one immediately-retryable case in this family.
     CredentialExpired(String),
+    /// Navigation landed on a login/SSO wall instead of the requested
+    /// content. Distinct from `Timeout`/`Other` so callers can tell "needs a
+    /// human to log in" from "page broken" — see `crate::auth`.
+    AuthRequired(crate::schema::AuthRequiredInfo),
 }
 
 impl std::fmt::Display for PortError {
@@ -77,6 +81,11 @@ impl std::fmt::Display for PortError {
             PortError::CredentialUnauthenticated(e) => write!(f, "vault unauthenticated: {e}"),
             PortError::CredentialRateLimited(e) => write!(f, "vault rate-limited: {e}"),
             PortError::CredentialExpired(e) => write!(f, "credential expired: {e}"),
+            PortError::AuthRequired(info) => write!(
+                f,
+                "auth required: {} redirected to login at {}",
+                info.requested_url, info.auth_host
+            ),
         }
     }
 }

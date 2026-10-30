@@ -20,6 +20,7 @@ use crate::ports::{
 pub(crate) type NetworkArgs = (Option<String>, Option<usize>, bool);
 
 pub(crate) struct FakeBrowserDriver {
+    extract_result: RefCell<Option<Result<PageExtract, PortError>>>,
     navigate_result: RefCell<Option<Result<crate::ports::NavigateResult, PortError>>>,
     click_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
     type_result: RefCell<Option<Result<AxSnapshot, PortError>>>,
@@ -64,6 +65,7 @@ pub(crate) struct FakeBrowserDriver {
 impl FakeBrowserDriver {
     pub(crate) fn new() -> Self {
         FakeBrowserDriver {
+            extract_result: RefCell::new(None),
             navigate_result: RefCell::new(None),
             click_result: RefCell::new(None),
             type_result: RefCell::new(None),
@@ -199,6 +201,11 @@ impl FakeBrowserDriver {
         self
     }
 
+    pub(crate) fn with_extract(self, result: Result<PageExtract, PortError>) -> Self {
+        *self.extract_result.borrow_mut() = Some(result);
+        self
+    }
+
     pub(crate) fn call_count(&self) -> usize {
         self.calls.borrow().len()
     }
@@ -210,7 +217,10 @@ impl BrowserDriver for FakeBrowserDriver {
         _url: &str,
         _timeout: Duration,
     ) -> Result<PageExtract, PortError> {
-        panic!("navigate_and_extract should never be called by the browser-automation tools");
+        self.calls.borrow_mut().push("navigate_and_extract");
+        self.extract_result.borrow_mut().take().expect(
+            "navigate_and_extract is only valid after with_extract (fetch_page/read_website tests)",
+        )
     }
 
     async fn navigate(

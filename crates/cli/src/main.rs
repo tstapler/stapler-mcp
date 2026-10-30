@@ -410,6 +410,8 @@ async fn run_daemon() {
     daemon.set_status_extra(serde_json::json!({
         "browserProfileMode": browser_profile_mode,
         "browserProfileWarning": browser.unsafe_profile_warning(),
+        "headedMode": browser.headed(),
+        "authWaitTimeoutSecs": browser.auth_wait().as_secs(),
     }));
 
     daemon.register(
@@ -466,16 +468,26 @@ async fn run_daemon() {
         "read_website",
         json_handler({
             let http = http.clone();
+            let browser = browser.clone();
             let fs = fs.clone();
             let cache_dir = cache_dir.clone();
             let network_policy = network_policy.clone();
             move |input: ReadWebsiteInput| {
                 let http = http.clone();
+                let browser = browser.clone();
                 let fs = fs.clone();
                 let cache_dir = cache_dir.clone();
                 let network_policy = network_policy.clone();
                 async move {
-                    webcrawl::read_website(&*http, &*fs, &cache_dir, input, network_policy).await
+                    webcrawl::read_website(
+                        &*http,
+                        &*browser,
+                        &*fs,
+                        &cache_dir,
+                        input,
+                        network_policy,
+                    )
+                    .await
                 }
             }
         }),
