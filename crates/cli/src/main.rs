@@ -951,13 +951,17 @@ async fn run_daemon() {
     // residual risk (see the timeout branches inside the helper).
     let (run_result, _bridge_result, _http_result) = tokio::join!(
         async {
-            await_with_shutdown_grace(
+            let result = await_with_shutdown_grace(
                 daemon.run_cancellable(&socket, &sock_path),
                 &cancel_token,
                 "accept loop",
             )
             .await
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()));
+            // The bridge/HTTP tasks only exit on cancellation; without this a
+            // dead accept loop leaves the process (and its lock) alive forever.
+            daemon.request_shutdown();
+            result
         },
         await_with_shutdown_grace(bridge_consumer_handle, &cancel_token, "bridge consumer"),
         async {
