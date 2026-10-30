@@ -867,13 +867,7 @@ impl<T: DaemonTransport + Send + Sync + 'static> McpRouter<T> {
         &self,
         _params: Parameters<DaemonStatusInput>,
     ) -> Result<Json<DaemonStatusOutput>, String> {
-        let result = self
-            .transport
-            .call(stapler_mcp_core::protocol::PING_TOOL, serde_json::json!({}))
-            .await?;
-        serde_json::from_value(result)
-            .map_err(|e| e.to_string())
-            .map(Json)
+        Ok(Json(self.transport.status_probe().await))
     }
 }
 

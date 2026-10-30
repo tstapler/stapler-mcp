@@ -159,11 +159,7 @@ fn browser_profile_status_lines(status: &DaemonStatusOutput) -> Vec<String> {
 /// `run_daemon`'s wire format ever drifts from this struct.
 fn print_browser_profile_status(ping_result: &serde_json::Value) {
     let status: DaemonStatusOutput =
-        serde_json::from_value(ping_result.clone()).unwrap_or(DaemonStatusOutput {
-            pong: false,
-            browser_profile_mode: None,
-            browser_profile_warning: None,
-        });
+        serde_json::from_value(ping_result.clone()).unwrap_or(DaemonStatusOutput::default());
     for line in browser_profile_status_lines(&status) {
         println!("{line}");
     }
@@ -177,8 +173,7 @@ mod browser_profile_status_tests {
     fn should_default_to_ephemeral_when_mode_absent() {
         let status = DaemonStatusOutput {
             pong: true,
-            browser_profile_mode: None,
-            browser_profile_warning: None,
+            ..Default::default()
         };
         assert_eq!(
             browser_profile_status_lines(&status),
@@ -194,6 +189,7 @@ mod browser_profile_status_tests {
                 "persistent at /home/alice/.stapler-mcp/browser-profile".to_string(),
             ),
             browser_profile_warning: Some("looks unsafe".to_string()),
+            ..Default::default()
         };
         assert_eq!(
             browser_profile_status_lines(&status),
