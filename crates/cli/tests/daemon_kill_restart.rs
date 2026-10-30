@@ -15,10 +15,11 @@ async fn sigkill_should_be_recovered_by_next_ensure_daemon_within_30s() {
         .expect("initial daemon start");
     let old_pid = h.daemon_pid();
 
-    assert_eq!(unsafe { libc::kill(old_pid, libc::SIGKILL) }, 0);
-    // Wait for the kernel to reap the socket's owner; an unreaped child of this
-    // test would be a zombie, but the daemon is detached, so it is not.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(common::signal(old_pid, libc::SIGKILL));
+    assert!(
+        common::wait_for_exit(old_pid, Duration::from_secs(5)),
+        "daemon should die after SIGKILL"
+    );
 
     let err = h
         .ping(Duration::from_secs(2))

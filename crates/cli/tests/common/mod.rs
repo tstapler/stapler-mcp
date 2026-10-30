@@ -85,31 +85,68 @@ pub async fn ensure(
     .await
 }
 
+/// Sends `sig` to `pid`; refuses pids <= 1 so a corrupt lock file can never
+/// signal a process group or every process.
+pub fn signal(pid: i32, sig: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: kill(2) takes plain integers and touches no Rust memory; `pid` is
+    // our own daemon's, read from its lock file and guarded above.
+    unsafe { libc::kill(pid, sig) == 0 }
+}
+
+/// Polls until `pid` is gone (or a zombie) or `within` elapses.
+pub fn wait_for_exit(pid: i32, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+        // Field 3 of /proc/<pid>/stat is the state; 'Z' = exited, awaiting reap.
+        let alive = state
+            .as_deref()
+            .and_then(|s| s.rsplit(')').next())
+            .and_then(|rest| rest.trim_start().chars().next())
+            .is_some_and(|c| c != 'Z');
+        if !alive {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 impl Drop for Harness {
-    /// Graceful `shutdown` first, SIGKILL as the fallback, so a failed test
-    /// does not leave a daemon (and its Chrome) running.
+    /// Graceful `shutdown` first, SIGKILL if the daemon is still alive after,
+    /// so a failed test does not leave a daemon (and its Chrome) running.
     fn drop(&mut self) {
         let pid = std::fs::read_to_string(&self.lock_path)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok());
         let sock = self.sock_path.clone();
-        let _ = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+        // A separate thread with its own runtime: `block_on` directly inside a
+        // `#[tokio::test]` runtime would panic.
+        let shutdown = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap()
-                .block_on(client::call(
-                    &NativeSocketFactory,
-                    &sock,
-                    "shutdown",
-                    None,
-                    Duration::from_secs(5),
-                ))
+                .ok()?;
+            rt.block_on(client::call(
+                &NativeSocketFactory,
+                &sock,
+                "shutdown",
+                None,
+                Duration::from_secs(5),
+            ))
+            .ok()
         })
         .join();
+        if !matches!(shutdown, Ok(Some(_))) {
+            eprintln!("harness: graceful daemon shutdown failed");
+        }
         if let Some(pid) = pid {
-            std::thread::sleep(Duration::from_millis(500));
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            if !wait_for_exit(pid, Duration::from_secs(5)) {
+                signal(pid, libc::SIGKILL);
+            }
         }
     }
 }

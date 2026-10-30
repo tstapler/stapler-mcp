@@ -6,6 +6,23 @@ use tokio::net::{UnixListener, UnixStream};
 use stapler_mcp_core::ports::{Conn, Listener, PortError, SocketFactory};
 
 const DEFAULT_CONN_TIMEOUT: Duration = Duration::from_secs(120);
+const ACCEPT_RETRY_START: Duration = Duration::from_millis(100);
+const ACCEPT_RETRY_CAP: Duration = Duration::from_secs(2);
+
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOMEM
+                | libc::ENOBUFS
+                | libc::ECONNABORTED
+                | libc::EINTR
+                | libc::EPROTO
+        )
+    )
+}
 
 pub struct NativeConn {
     stream: UnixStream,
@@ -70,15 +87,25 @@ impl Listener for NativeListener {
     type C = NativeConn;
 
     async fn accept(&mut self) -> Result<Self::C, PortError> {
-        let (stream, _addr) = self
-            .inner
-            .accept()
-            .await
-            .map_err(|e| PortError::Io(e.to_string()))?;
-        Ok(NativeConn {
-            stream,
-            timeout: DEFAULT_CONN_TIMEOUT,
-        })
+        let mut backoff = ACCEPT_RETRY_START;
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, _addr)) => {
+                    return Ok(NativeConn {
+                        stream,
+                        timeout: DEFAULT_CONN_TIMEOUT,
+                    })
+                }
+                // Resource pressure or an aborted handshake says "try again", not
+                // "the listener is broken"; exiting here would kill the daemon.
+                Err(e) if is_transient_accept_error(&e) => {
+                    eprintln!("stapler-mcp: transient accept error (retrying in {backoff:?}): {e}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(ACCEPT_RETRY_CAP);
+                }
+                Err(e) => return Err(PortError::Io(e.to_string())),
+            }
+        }
     }
 }
 
@@ -104,5 +131,26 @@ impl SocketFactory for NativeSocketFactory {
     async fn remove_stale(&self, path: &str) -> Result<(), PortError> {
         let _ = std::fs::remove_file(path);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_transient_accept_error_should_accept_fd_exhaustion_and_reject_permission_denied() {
+        assert!(is_transient_accept_error(
+            &std::io::Error::from_raw_os_error(libc::EMFILE)
+        ));
+        assert!(is_transient_accept_error(
+            &std::io::Error::from_raw_os_error(libc::ECONNABORTED)
+        ));
+        assert!(!is_transient_accept_error(
+            &std::io::Error::from_raw_os_error(libc::EACCES)
+        ));
+        assert!(!is_transient_accept_error(&std::io::Error::other(
+            "no errno"
+        )));
     }
 }

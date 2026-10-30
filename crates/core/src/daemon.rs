@@ -22,26 +22,6 @@ pub type Handler = Box<dyn Fn(Option<serde_json::Value>) -> LocalBoxFuture<'stat
 
 const CONN_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[cfg(not(target_arch = "wasm32"))]
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
-
-/// `accept()` failures that say "try again" (fd exhaustion, aborted handshake,
-/// EINTR) rather than "the listener is broken". `PortError::Io` carries only
-/// the OS error text, so this matches on that (Linux and macOS errno values).
-#[cfg(not(target_arch = "wasm32"))]
-fn is_transient_accept_error(e: &PortError) -> bool {
-    let PortError::Io(msg) = e else { return false };
-    [
-        "os error 24)",
-        "os error 23)",
-        "os error 4)",
-        "os error 103)",
-        "os error 53)",
-    ]
-    .iter()
-    .any(|code| msg.contains(code))
-}
-
 /// Bounds one registered handler call so a hung tool can never block the
 /// accept loop (or, in a later phase, the channel bridge consumer) forever.
 /// Shortened under `#[cfg(test)]` so the timeout tests don't need to wait
@@ -202,15 +182,7 @@ impl Daemon {
         loop {
             let conn = tokio::select! {
                 _ = self.cancel.cancelled() => return Ok(()),
-                accept_result = listener.accept() => match accept_result {
-                    Ok(conn) => conn,
-                    Err(e) if is_transient_accept_error(&e) => {
-                        eprintln!("stapler-mcp: transient accept error (retrying): {e}");
-                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                },
+                accept_result = listener.accept() => accept_result?,
             };
             self.serve_logged(conn).await;
             if self.shutdown.get() {
@@ -633,23 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_cancellable_should_retry_transient_accept_errors() {
-        let daemon = Daemon::new();
-        let socket = ScriptedSocketFactory::new(vec![
-            Err(PortError::Io("Too many open files (os error 24)".into())),
-            Ok(ScriptedConn::ok(SHUTDOWN_TOOL)),
-        ]);
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            daemon.run_cancellable(&socket, "irrelevant"),
-        )
-        .await
-        .expect("should retry past EMFILE and reach shutdown");
-        assert!(matches!(result, Ok(())), "got {result:?}");
-    }
-
-    #[tokio::test]
-    async fn run_cancellable_should_return_err_for_non_transient_accept_error() {
+    async fn run_cancellable_should_return_err_when_accept_fails() {
         let daemon = Daemon::new();
         let socket = ScriptedSocketFactory::new(vec![Err(PortError::Io(
             "Permission denied (os error 13)".into(),

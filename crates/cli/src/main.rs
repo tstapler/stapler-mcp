@@ -159,7 +159,7 @@ fn browser_profile_status_lines(status: &DaemonStatusOutput) -> Vec<String> {
 /// `run_daemon`'s wire format ever drifts from this struct.
 fn print_browser_profile_status(ping_result: &serde_json::Value) {
     let status: DaemonStatusOutput =
-        serde_json::from_value(ping_result.clone()).unwrap_or(DaemonStatusOutput::default());
+        serde_json::from_value(ping_result.clone()).unwrap_or_default();
     for line in browser_profile_status_lines(&status) {
         println!("{line}");
     }

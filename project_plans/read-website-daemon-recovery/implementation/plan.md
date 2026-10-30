@@ -295,3 +295,10 @@ Source: `pre-mortem.md` (1 P1, 4 P2, 2 P3). Where these conflict with Story 2.1.
 - **P2 e2e hygiene:** drop-guard per test sends `shutdown` then SIGKILL; liveness via failed ping or `/proc/<pid>/stat` state != `Z`, not `kill(pid,0)`; client budget 45 s with assertion at 30 s; kill orphaned Chrome in the kill test.
 - **P2 old daemon:** PR body and verify checklist say to shut down any running daemon (`shutdown` tool or kill) before manual verification.
 - **P3:** Timeout error text is moot after the P1 change; keep the `kill <pid>` hint only if cheap. `cargo check` the `status_probe` default first.
+
+## Implementation notes (post-verify)
+
+- **Transient `accept()` retry lives in `NativeListener::accept`** (`crates/native/src/socket.rs`), classified by real errno with exponential backoff (100 ms to 2 s). It replaced the planned string-matching in core, so both accept loops are covered and core stays wasm-portable.
+- **Known limit: a wedged-but-alive daemon is never restarted.** `ensure_daemon` treats `Timeout` as alive (pre-mortem P1), so a daemon that holds the socket but never answers makes calls wait out `CALL_TIMEOUT`. Fix by `kill`ing the pid in `daemon.lock`. Not addressed here.
+- **Not done:** daemon.log pid/kill hint in the error text; orphaned-Chrome cleanup in the kill test.
+- **Before manually verifying after merge:** shut down any already-running daemon (`shutdown` tool or kill it); an old binary keeps the bug until it dies.

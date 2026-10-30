@@ -17,7 +17,7 @@ async fn abandoned_connections_should_not_kill_daemon_and_should_be_logged() {
 
     // Send a full request, then hang up without reading the response: the
     // daemon's reply hits a closed socket (EPIPE).
-    for _ in 0..5 {
+    for _ in 0..20 {
         let mut stream = UnixStream::connect(&h.sock_path).expect("connect");
         stream.write_all(b"{\"tool\":\"ping\"}\n").unwrap();
         drop(stream);
