@@ -598,6 +598,10 @@ pub struct DaemonStatusOutput {
     /// unsafe (inside a git repo or a cloud-synced folder).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_profile_warning: Option<String>,
+    /// Set (with `pong: false`) when the daemon could not be reached or
+    /// started, so the tool reports the down state instead of failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -54,7 +54,12 @@ impl DaemonTransport for SocketTransport {
             },
         )
         .await
-        .map_err(|e| format!("ensure daemon: {e} ({})", daemon_locator::lookup_hint()))?;
+        .map_err(|e| {
+            format!(
+                "ensure daemon: {e} (socket={sock_path}, log={log_path}; {})",
+                daemon_locator::lookup_hint()
+            )
+        })?;
 
         client::call(&socket, &sock_path, tool, Some(params), CALL_TIMEOUT)
             .await

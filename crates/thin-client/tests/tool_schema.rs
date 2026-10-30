@@ -239,3 +239,29 @@ async fn daemon_status_should_deserialize_run_daemons_camelcase_wire_keys() {
         Some("looks unsafe")
     );
 }
+
+struct DownTransport;
+
+impl stapler_mcp::transport::DaemonTransport for DownTransport {
+    async fn call(
+        &self,
+        _tool: &'static str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("ensure daemon: io error: Connection refused (socket=/s, log=/l)".into())
+    }
+}
+
+#[tokio::test]
+async fn daemon_status_should_report_down_state_instead_of_erroring() {
+    let router = stapler_mcp::mcp_router::McpRouter::with_transport(DownTransport);
+
+    let status = router
+        .call_daemon_status_for_test()
+        .await
+        .expect("a down daemon is a status, not a tool error");
+
+    assert!(!status.pong);
+    let error = status.error.expect("down state should carry the cause");
+    assert!(error.contains("socket=/s") && error.contains("log=/l"), "{error}");
+}

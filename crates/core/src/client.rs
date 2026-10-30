@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::ports::{ClockPort, Conn, PortError, ProcessSpawner, SleepPort, SocketFactory};
 use crate::protocol::{Request, Response, PING_TOOL};
 
-const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_START: Duration = Duration::from_millis(50);
 const POLL_CAP: Duration = Duration::from_millis(500);
@@ -58,7 +58,7 @@ pub async fn ping<S: SocketFactory>(
 
 /// Ping; if that fails, spawn a daemon and poll with exponential backoff
 /// (50ms doubling, capped at 500ms) until a ping succeeds, `opts.startup_timeout`
-/// elapses (default 10s), or `clock`/`sleeper` report otherwise.
+/// elapses (default 30s, enough for a cold Chromium launch), or `clock`/`sleeper` report otherwise.
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_daemon<S, Sp, Sl, C>(
     socket: &S,

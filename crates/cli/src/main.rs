@@ -163,6 +163,7 @@ fn print_browser_profile_status(ping_result: &serde_json::Value) {
             pong: false,
             browser_profile_mode: None,
             browser_profile_warning: None,
+            error: None,
         });
     for line in browser_profile_status_lines(&status) {
         println!("{line}");
@@ -179,6 +180,7 @@ mod browser_profile_status_tests {
             pong: true,
             browser_profile_mode: None,
             browser_profile_warning: None,
+            error: None,
         };
         assert_eq!(
             browser_profile_status_lines(&status),
@@ -194,6 +196,7 @@ mod browser_profile_status_tests {
                 "persistent at /home/alice/.stapler-mcp/browser-profile".to_string(),
             ),
             browser_profile_warning: Some("looks unsafe".to_string()),
+            error: None,
         };
         assert_eq!(
             browser_profile_status_lines(&status),
@@ -943,13 +946,17 @@ async fn run_daemon() {
     // residual risk (see the timeout branches inside the helper).
     let (run_result, _bridge_result, _http_result) = tokio::join!(
         async {
-            await_with_shutdown_grace(
+            let result = await_with_shutdown_grace(
                 daemon.run_cancellable(&socket, &sock_path),
                 &cancel_token,
                 "accept loop",
             )
             .await
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()));
+            // The bridge/HTTP tasks only exit on cancellation; without this a
+            // dead accept loop leaves the process (and its lock) alive forever.
+            daemon.request_shutdown();
+            result
         },
         await_with_shutdown_grace(bridge_consumer_handle, &cancel_token, "bridge consumer"),
         async {
