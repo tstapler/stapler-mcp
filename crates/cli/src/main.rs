@@ -912,7 +912,7 @@ async fn run_daemon() {
     // resolve their own handles. That's why its own handle isn't explicitly
     // joined into the `tokio::join!` below.
     let sigterm_daemon = daemon.clone();
-    tokio::task::spawn_local(async move {
+    let sigterm_handle = tokio::task::spawn_local(async move {
         let mut sigterm =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
@@ -970,6 +970,11 @@ async fn run_daemon() {
             }
         },
     );
+
+    // On the accept-loop-error path the task is still parked in `recv()` and
+    // holds an `Rc<Daemon>`; release it so `shutdown_cleanup` can own the browser.
+    sigterm_handle.abort();
+    let _ = sigterm_handle.await;
 
     shutdown_cleanup(daemon, browser).await;
 
