@@ -18,9 +18,9 @@ pub enum PortError {
     Timeout,
     Other(String),
     /// No entry exists for the given id — either it was never issued, or it
-    /// was evicted (e.g. by the session idle reaper) — fix: start a new
-    /// session. Also used for a stale element `ref` (page re-rendered since the
-    /// snapshot) — fix: call `stapler_browser_snapshot` and retry.
+    /// was evicted (e.g. by the session idle reaper). Fix: start a new
+    /// session. Also used for a stale element `ref` (the page re-rendered since
+    /// the snapshot); fix: call `stapler_browser_snapshot` and retry.
     NotFound(String),
     /// The entry is still present but its underlying resource has died (e.g.
     /// a browser tab crashed). Deliberately distinct from `NotFound`: the

@@ -369,8 +369,8 @@ pub struct BrowserClickInput {
     pub session_id: String,
     /// A `ref` from a previous `AxSnapshotOutput`. Refs go stale when the
     /// page re-renders or navigates after the snapshot; the call then fails
-    /// with an error naming `stapler_browser_snapshot` — call it for fresh
-    /// refs and retry with the new `ref`.
+    /// with a not-found error. Call `stapler_browser_snapshot` for fresh refs
+    /// and retry with the new ref.
     pub ref_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u32>,
@@ -382,8 +382,8 @@ pub struct BrowserTypeInput {
     pub session_id: String,
     /// A `ref` from a previous `AxSnapshotOutput`. Refs go stale when the
     /// page re-renders or navigates after the snapshot; the call then fails
-    /// with an error naming `stapler_browser_snapshot` — call it for fresh
-    /// refs and retry with the new `ref`.
+    /// with a not-found error. Call `stapler_browser_snapshot` for fresh refs
+    /// and retry with the new ref.
     pub ref_id: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

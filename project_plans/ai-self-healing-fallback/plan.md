@@ -9,21 +9,13 @@
 
 **Self-healing belongs at the agent layer, not the daemon layer.** The calling LLM agent is already in the best position to handle stale-ref failures: it has context about what it was trying to accomplish, can decide whether re-snapshot+retry makes sense or whether a different strategy is needed, and can absorb the extra round-trip without surprising the user.
 
-## Recommendation: Three-part improvement, no LLM dependency
+## Recommendation: Two doc-only changes now, one deferred option, no LLM dependency
 
-### Part 1 — Stale-ref error messages (AC2): VERIFIED ALREADY SATISFIED, no code change
+### Part 1 — Stale-ref error messages (AC2): already satisfied; only the `NotFound` doc comment changes
 
-Correction after reading the code path (commands: `grep -n "resolve_locator_impl\|verify_node_live" crates/native/src/browser.rs`; `sed -n 675,760p` of the same file): click/type resolve refs via `resolve_locator_impl` (`crates/native/src/browser.rs:682`) and `verify_node_live` (`:707`). Both return `PortError::NotFound` — the same variant as session-not-found (`not_found_message`, `:162`). The stale-ref messages already say "call stapler_browser_snapshot for current refs" and are distinct from the session message ("start a new session"); existing tests assert this (`resolve_locator_should_return_stale_ref_message_when_ref_issued_before_navigation`, `ux_ac3_locator_not_found_error_should_name_ref_and_page_url_and_corrective_call`). `map_error` (`crates/core/src/tools/browser.rs:88`) passes the message through unchanged. The earlier claim below that the message needs improving was wrong; AC2 needs only a verification, not a change. Residual wart: the `PortError::NotFound` doc comment in `crates/core/src/ports.rs:20-23` says "always start a new session", which is misleading for stale refs — fix that comment (doc-only).
+Click/type resolve refs via `resolve_locator_impl` (`crates/native/src/browser.rs`) and `verify_node_live` (same file). Both return `PortError::NotFound` — the same variant as session-not-found (`not_found_message`, same file). The stale-ref messages already say "call stapler_browser_snapshot for current refs" and are distinct from the session message ("start a new session"); existing tests assert this (`resolve_locator_should_return_stale_ref_message_when_ref_issued_before_navigation`, `ux_ac3_locator_not_found_error_should_name_ref_and_page_url_and_corrective_call`). `map_error` (`crates/core/src/tools/browser.rs`) passes the message through unchanged. The one fix: the `PortError::NotFound` doc comment in `crates/core/src/ports.rs` said "always start a new session", which is wrong for stale refs; it now covers both cases (doc-only).
 
-Original (superseded) text:
-
-The existing `PortError::NotFound` error for stale refs should include a structured recovery hint. Current message (approximate): something identifying the session and failing ref. Improved message:
-
-> `element ref '{ref_id}' is no longer in the current accessibility tree (the page may have re-rendered); call stapler_browser_snapshot to get fresh refs and retry`
-
-This zero-cost change makes the agent-side retry idiom explicit. An LLM agent that reads this message knows exactly what to do. Implementation: modify `not_found_message` in `crates/native/src/browser.rs` (and the wasm equivalent) to include a structured hint when the failure is a locator resolution error vs. a session-not-found error.
-
-### Part 2 — Add recovery hint (AC3; KEPT — edit already drafted in `crates/core/src/schema.rs`) to tool schema descriptions (P2 of this item)
+### Part 2 — Recovery hint on `refId` schema docs (AC3), done in `crates/core/src/schema.rs`
 
 The `stapler_browser_click` and `stapler_browser_type` tool schema descriptions (doc comments in `crates/core/src/schema.rs`) should note:
 
@@ -31,7 +23,7 @@ The `stapler_browser_click` and `stapler_browser_type` tool schema descriptions 
 
 This surfaces the retry pattern to the LLM before it even makes the first call — not just when it fails. Zero implementation cost.
 
-### Part 3 (AC4 depends on this being approved; the decision here is NOT approved — deferred) — Evaluate daemon-side last-snapshot re-resolve (P3 of this item, lower priority)
+### Part 3 — Daemon-side last-snapshot re-resolve (NOT approved; deferred; AC4 applies only if approved)
 
 A zero-LLM-dependency middle ground: cache the last `AxSnapshot` per session (already returned after every action) and on a `NotFound` failure:
 1. Re-take a fresh snapshot (one CDP round-trip).
@@ -49,12 +41,12 @@ This handles the most common stale-ref case (SPA re-render without content chang
 - Logic in `click`/`type_text` driver implementations to trigger it on `NotFound`.
 - A `note` field in the success response indicating self-heal fired.
 
-This is a "nice-to-have" for the deferred backlog. The error-message improvement (Part 1) is the highest-value, lowest-cost change.
+This is a "nice-to-have" for the deferred backlog. Role+name matching has limited coverage on pages with repeated element names (several "Submit" buttons, repeated "Learn more" links), which are the pages where stale refs are most likely.
 
 ## Decision answers (from requirements.md evaluation questions)
 
 **Q1: Is daemon-side self-healing worth doing at all?**
-No, for LLM-based self-healing. Yes, for the zero-LLM last-snapshot re-resolve (Part 3, deferred). The agent-side retry pattern (already possible) plus improved error messages (Part 1) covers 80% of the value.
+No, for LLM-based self-healing. Not now, for the zero-LLM last-snapshot re-resolve (Part 3): revisit once real usage shows how often callers hit stale refs. Until then, the agent-side retry (already possible, since the stale-ref error names `stapler_browser_snapshot`) plus the Part 2 schema docs is the recovery path.
 
 **Q2: Which approach fits better — Stagehand or Skyvern?**
 Neither, for the daemon. Stagehand's re-snapshot+LLM-relocate requires an LLM dependency that violates the daemon's design. Skyvern's vision-hybrid is a different product architecture entirely and doesn't map to incremental improvement. The zero-LLM analog of Stagehand (Part 3) is the closest viable option.
@@ -67,43 +59,39 @@ New API key class in the daemon environment, ~$0.001/call (low but non-zero), +2
 
 ## Implementation roadmap (if approved)
 
-### Epic 1 — Error message improvements (small, do first)
+### Epic 1 — Doc-only changes (done)
 
-**Story 1.1** — Distinguish "ref stale" from "session not found" in `PortError::NotFound`  
-Currently, both session-not-found and element-not-found map to `PortError::NotFound`. Adding a sub-variant or a structured message for the element-not-found case enables Part 1's improvement.
-- `crates/native/src/browser.rs` — `not_found_message` function: add explicit recovery hint for locator resolution failure.
-- `crates/wasm/src/browser.rs` — equivalent JS glue change.
-- Estimate: 2h.
+**Story 1.1** — `PortError::NotFound` doc comment covers stale refs (`crates/core/src/ports.rs`). Cost: XS.
 
-**Story 1.2** — Update tool schema doc comments  
-`crates/core/src/schema.rs` — `BrowserClickInput.ref_id` and `BrowserTypeInput.ref_id` doc comment additions.
-- Estimate: 30m.
+**Story 1.2** — `BrowserClickInput.ref_id` and `BrowserTypeInput.ref_id` docs describe the stale-ref failure and the re-snapshot+retry pattern (`crates/core/src/schema.rs`). Cost: XS. Other ref-taking inputs (`BrowserTypeSecretInput`, `BrowserHoverInput`, `BrowserSelectOptionInput`, `BrowserFormField`, `BrowserSetCheckedInput`) keep the bare wording; extending them is a follow-up outside this item's ACs.
+
+Known gap: the wasm adapter's stale-ref error (`crates/wasm/src/glue/browser.js`, `describeActionError`) does not name `stapler_browser_snapshot`, so the schema docs say "not-found error" rather than promising the tool name. Adding the hint there is a follow-up.
 
 ### Epic 2 — Zero-LLM daemon re-resolve (medium, defer)
 
 **Story 2.1** — Cache last AxSnapshot per session in `NativeBrowser`  
 Add `last_snapshot: Option<AxSnapshot>` to the session struct; update on every successful snapshot return.
 - `crates/native/src/browser.rs` — session struct + update sites.
-- Estimate: 1h.
+- Cost: S.
 
 **Story 2.2** — Re-resolve by role+name on locator NotFound  
 On `PortError::NotFound` in `click`/`type_text`, check last snapshot for an unambiguous role+name match, re-try CDP dispatch with new ref.
 - `crates/native/src/browser.rs` — click/type_text implementations.
-- Estimate: 3h.
+- Cost: M.
 
 **Story 2.3** — Surface `note` field on self-heal  
 Add "self-heal fired: re-resolved '{role}/{name}' to new ref" to the `BrowserActionOutput.note` field.
 - `crates/core/src/tools/browser.rs` — `browser_click`/`browser_type` note construction.
-- Estimate: 1h.
+- Cost: S.
 
 **Story 2.4** — Test coverage for re-resolve  
 Integration test: navigate, snapshot, force AX tree rebuild (navigate same URL), click with stale ref — expect success + note. Unit test: role+name scan on a fake AX tree with ambiguous + unambiguous cases.
 - `crates/cli/tests/browser_session.rs` — new `#[ignore]` real-browser test.
-- Estimate: 2h.
+- Cost: S.
 
 **Story 2.5** — Wasm adapter equivalent  
 `crates/wasm/src/browser.rs` — same last-snapshot cache + re-resolve logic in JS glue.
-- Estimate: 2h.
+- Cost: L; wasm parity has been the costly part of earlier browser work, so size it separately.
 
 ## Locator format note
 
@@ -118,4 +106,4 @@ Refs are opaque CDP AX backend node IDs, consistent with `playwright-mcp`'s mode
 
 ## Deferral condition
 
-Parts 1 and 2 (error message + schema doc comment) should ship as a fast-follow to the browser automation work already done. Part 3 (daemon re-resolve) should be deferred until there is evidence (from real agent usage) that stale-ref errors are frequent enough to justify the implementation cost. The key signal: how often do callers see `PortError::NotFound` on `click`/`type` after a successful navigate/snapshot in the same session?
+Parts 1 and 2 (the `NotFound` doc comment and the `refId` schema docs) are doc-only and ship now. Part 3 (daemon re-resolve) should be deferred until there is evidence (from real agent usage) that stale-ref errors are frequent enough to justify the implementation cost. The key signal: how often do callers see `PortError::NotFound` on `click`/`type` after a successful navigate/snapshot in the same session?
