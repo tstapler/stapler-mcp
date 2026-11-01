@@ -912,7 +912,7 @@ async fn run_daemon() {
     // resolve their own handles. That's why its own handle isn't explicitly
     // joined into the `tokio::join!` below.
     let sigterm_daemon = daemon.clone();
-    tokio::task::spawn_local(async move {
+    let sigterm_handle = tokio::task::spawn_local(async move {
         let mut sigterm =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
@@ -951,13 +951,17 @@ async fn run_daemon() {
     // residual risk (see the timeout branches inside the helper).
     let (run_result, _bridge_result, _http_result) = tokio::join!(
         async {
-            await_with_shutdown_grace(
+            let result = await_with_shutdown_grace(
                 daemon.run_cancellable(&socket, &sock_path),
                 &cancel_token,
                 "accept loop",
             )
             .await
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()));
+            // The bridge/HTTP tasks only exit on cancellation; without this a
+            // dead accept loop leaves the process (and its lock) alive forever.
+            daemon.request_shutdown();
+            result
         },
         await_with_shutdown_grace(bridge_consumer_handle, &cancel_token, "bridge consumer"),
         async {
@@ -966,6 +970,11 @@ async fn run_daemon() {
             }
         },
     );
+
+    // On the accept-loop-error path the task is still parked in `recv()` and
+    // holds an `Rc<Daemon>`; release it so `shutdown_cleanup` can own the browser.
+    sigterm_handle.abort();
+    let _ = sigterm_handle.await;
 
     shutdown_cleanup(daemon, browser).await;
 
