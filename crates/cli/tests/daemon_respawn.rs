@@ -71,10 +71,15 @@ async fn ensure_daemon_should_survive_parallel_cold_start_sigkill_and_client_han
         drop(s);
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    ping().await.expect("daemon must keep serving after client hang-ups");
+    ping()
+        .await
+        .expect("daemon must keep serving after client hang-ups");
 
     // AC0: SIGKILL the daemon, then the next caller respawns it.
-    let pid = std::fs::read_to_string(&lock_path).unwrap().trim().to_string();
+    let pid = std::fs::read_to_string(&lock_path)
+        .unwrap()
+        .trim()
+        .to_string();
     assert!(std::process::Command::new("kill")
         .args(["-9", &pid])
         .status()
@@ -87,7 +92,9 @@ async fn ensure_daemon_should_survive_parallel_cold_start_sigkill_and_client_han
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(ping().await.is_err(), "daemon should be down after SIGKILL");
-    ensure().await.expect("ensure_daemon should respawn a killed daemon");
+    ensure()
+        .await
+        .expect("ensure_daemon should respawn a killed daemon");
     ping().await.expect("respawned daemon reachable");
 
     let _ = client::call(
