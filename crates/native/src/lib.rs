@@ -15,6 +15,8 @@ pub mod http_token;
 mod lock;
 #[cfg(feature = "heavy")]
 mod network;
+#[cfg(feature = "heavy")]
+mod oopif;
 mod sleep;
 mod socket;
 mod spawn;
