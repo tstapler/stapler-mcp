@@ -155,9 +155,10 @@ pub async fn capture_snapshot(
 /// before nodes from different frames are flattened into one `Vec` for
 /// `build_tree`. Depth-limited by `MAX_FRAME_DEPTH`. A child frame that
 /// fails to resolve — cross-origin (a different renderer process, per
-/// site-isolation, that this CDP session can't traverse into), closed
-/// mid-capture, or lacking a content document — is left as a childless
-/// `Iframe` leaf rather than failing the whole capture.
+/// site-isolation) is fetched through a child CDP session via
+/// `fetch_oopif_tree`. A child frame that still fails to resolve — closed
+/// mid-capture, lacking a content document, or OOPIF attach unavailable —
+/// is left as a childless `Iframe` leaf rather than failing the whole capture.
 fn fetch_frame_tree<'a>(
     ctx: &'a FrameCtx<'a>,
     session: Option<SessionId>,
@@ -235,10 +236,17 @@ fn fetch_frame_tree<'a>(
                 // Cross-origin: this session can't see into the frame's
                 // process, so attach a child session to its target (an
                 // OOPIF's target id is its frame id).
-                Err(_) => match fetch_oopif_tree(ctx, &child_frame_id, depth + 1).await {
-                    Ok(nodes) => nodes,
-                    Err(_) => continue,
-                },
+                Err(same_process_err) => {
+                    match fetch_oopif_tree(ctx, &child_frame_id, depth + 1).await {
+                        Ok(nodes) => nodes,
+                        Err(oopif_err) => {
+                            eprintln!(
+                                "ax: iframe left as leaf (same-process: {same_process_err}; OOPIF: {oopif_err})"
+                            );
+                            continue;
+                        }
+                    }
+                }
             };
             if let Some(child_root) = child_nodes.iter_mut().find(|n| n.parent_id.is_none()) {
                 child_root.parent_id = Some(iframe_node_id);
