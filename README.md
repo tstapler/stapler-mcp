@@ -88,6 +88,44 @@ launchctl load -w ~/Library/LaunchAgents/com.tstapler.stapler-mcp.plist
 stapler-mcp --status
 ```
 
+## Redeploying the latest version
+
+Two processes need updating: the per-session thin client and the shared
+daemon. The daemon is **not** replaced automatically, so a stale one keeps
+serving the old code after a rebuild.
+
+```bash
+git checkout main && git pull
+# Build in-repo (what a `command` pointing at ./target/release/stapler-mcp runs).
+# Separate invocations: building both together links the heavy deps into the thin client.
+cargo build --release --locked -p stapler-mcp-daemon   # ~4 min cold
+cargo build --release --locked -p stapler-mcp          # thin client, ~2 MB
+# Or install both beside each other in ~/.cargo/bin instead:
+#   scripts/install.sh
+
+# Restart the daemon so it picks up the new binary:
+systemctl --user restart stapler-mcp      # if the service unit is installed
+# otherwise:
+pkill -f 'stapler-mcp-daemon|stapler-mcp --daemon'
+stapler-mcp --status                      # never auto-spawns; "not running" is expected here
+# next tool call spawns the new daemon, or start it now:
+#   setsid nohup stapler-mcp-daemon >/dev/null 2>&1 &
+
+stapler-mcp --status                      # expect: daemon: running (pid ...)
+```
+
+If you run from the repo build rather than `~/.cargo/bin`, point the unit at it
+after copying the example: `ExecStart=%h/Programming/stapler-mcp/target/release/stapler-mcp-daemon`.
+With the HTTP transport registered in `~/.claude.json` (see "First time enabling
+HTTP"), sessions connect straight to the daemon with no thin-client subprocess,
+so a `systemctl --user restart stapler-mcp` is the whole redeploy.
+
+Already-running Claude Code sessions keep their old thin-client process until
+restarted; restart the session (or `/mcp` reconnect) to pick up the new binary.
+Use the `stapler-mcp` that your MCP client config points at — `--status` from
+another copy on `PATH` reports the same daemon, but the thin client it execs
+may be an older build.
+
 ## Troubleshooting
 
 Work through these in order:
