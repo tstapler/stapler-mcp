@@ -21,9 +21,12 @@ use chromiumoxide::cdp::browser_protocol::dom::{
     BackendNodeId, DescribeNodeParams, ResolveNodeParams,
 };
 use chromiumoxide::cdp::browser_protocol::page::FrameId;
+use chromiumoxide::cdp::browser_protocol::target::SessionId;
 use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
 use chromiumoxide::Page;
 use futures::future::BoxFuture;
+
+use crate::oopif::OopifHub;
 
 use stapler_mcp_core::ports::{AxNode, AxSnapshot, PortError, REDACTED_PLACEHOLDER};
 
@@ -59,6 +62,9 @@ struct RawAxNode {
     name: Option<String>,
     value: Option<String>,
     backend_node_id: Option<i64>,
+    /// Came from a child CDP session (cross-origin iframe), so
+    /// `backend_node_id` is only meaningful inside that other process.
+    oopif: bool,
 }
 
 /// A `ref`-resolved element handle: the `BackendNodeId` `browser.rs`'s
@@ -70,6 +76,11 @@ struct RawAxNode {
 pub struct ResolvedRef {
     pub backend_node_id: BackendNodeId,
     pub role: String,
+    /// Node lives in a cross-origin iframe's process: its `BackendNodeId`
+    /// cannot be resolved through the parent `Page`, so click/type must
+    /// refuse it and redaction must not probe it. Click/type routing
+    /// through the child session is not implemented yet.
+    pub is_oopif: bool,
 }
 
 /// `capture_snapshot`'s full result: the platform-agnostic `AxSnapshot`
@@ -98,6 +109,7 @@ pub struct AxCapture {
 /// error this produced for any ref used after an intervening click).
 pub async fn capture_snapshot(
     page: &Page,
+    oopif_ws_url: Option<&str>,
     next_ref_id: &Cell<u64>,
     previous_refs: &HashMap<String, ResolvedRef>,
 ) -> Result<AxCapture, PortError> {
@@ -116,7 +128,12 @@ pub async fn capture_snapshot(
         .map_err(|e| PortError::Other(e.to_string()))?
         .unwrap_or_default();
 
-    let raw = fetch_frame_tree(page, frame_id, 0).await?;
+    let hub = OopifHub::new(oopif_ws_url);
+    let ctx = FrameCtx { page, hub: &hub };
+    let raw = fetch_frame_tree(&ctx, None, frame_id, 0).await;
+    // Detach on success and error alike, before anything can early-return.
+    hub.detach_all().await;
+    let raw = raw?;
 
     let mut capture = build_tree(&raw, next_ref_id, url, previous_refs);
     let probe = PageProbe(page);
@@ -141,26 +158,30 @@ pub async fn capture_snapshot(
 /// site-isolation, that this CDP session can't traverse into), closed
 /// mid-capture, or lacking a content document — is left as a childless
 /// `Iframe` leaf rather than failing the whole capture.
-fn fetch_frame_tree(
-    page: &Page,
+fn fetch_frame_tree<'a>(
+    ctx: &'a FrameCtx<'a>,
+    session: Option<SessionId>,
     frame_id: Option<FrameId>,
     depth: usize,
-) -> BoxFuture<'_, Result<Vec<RawAxNode>, PortError>> {
+) -> BoxFuture<'a, Result<Vec<RawAxNode>, PortError>> {
     Box::pin(async move {
         let params = match frame_id.clone() {
             Some(id) => GetFullAxTreeParams::builder().frame_id(id).build(),
             None => GetFullAxTreeParams::default(),
         };
-        let resp = page
-            .execute(params)
-            .await
-            .map_err(|e| PortError::Other(e.to_string()))?;
+        let resp = ctx.exec(session.as_ref(), params).await?;
 
-        let frame_key = frame_id.as_ref().map(|f| f.inner().as_str()).unwrap_or("");
+        // Namespaced by session too: an OOPIF's AXNodeIds are only unique
+        // within its own process, and its root has no frame id.
+        let frame_key = format!(
+            "{}/{}",
+            session.as_ref().map(|s| s.inner().as_str()).unwrap_or(""),
+            frame_id.as_ref().map(|f| f.inner().as_str()).unwrap_or("")
+        );
         let prefix = |id: &str| format!("{frame_key}:{id}");
+        let oopif = session.is_some();
 
         let mut raw: Vec<RawAxNode> = resp
-            .result
             .nodes
             .iter()
             .map(|n| RawAxNode {
@@ -171,10 +192,12 @@ fn fetch_frame_tree(
                 name: n.name.as_ref().and_then(ax_value_to_string),
                 value: n.value.as_ref().and_then(ax_value_to_string),
                 backend_node_id: n.backend_dom_node_id.as_ref().map(|id| *id.inner()),
+                oopif,
             })
             .collect();
 
-        if depth >= MAX_FRAME_DEPTH {
+        // Also bounds OOPIF attaches: they only happen below this point.
+        if !may_descend(depth) {
             return Ok(raw);
         }
 
@@ -185,8 +208,9 @@ fn fetch_frame_tree(
             .collect();
 
         for (iframe_node_id, backend_id) in iframe_nodes {
-            let describe = match page
-                .execute(
+            let describe = match ctx
+                .exec(
+                    session.as_ref(),
                     DescribeNodeParams::builder()
                         .backend_node_id(BackendNodeId::new(backend_id))
                         .build(),
@@ -196,14 +220,26 @@ fn fetch_frame_tree(
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            let Some(child_frame_id) = describe.result.node.frame_id.clone() else {
+            let Some(child_frame_id) = describe.node.frame_id.clone() else {
                 continue;
             };
-            let mut child_nodes =
-                match fetch_frame_tree(page, Some(child_frame_id), depth + 1).await {
+            let same_process = fetch_frame_tree(
+                ctx,
+                session.clone(),
+                Some(child_frame_id.clone()),
+                depth + 1,
+            )
+            .await;
+            let mut child_nodes = match same_process {
+                Ok(nodes) => nodes,
+                // Cross-origin: this session can't see into the frame's
+                // process, so attach a child session to its target (an
+                // OOPIF's target id is its frame id).
+                Err(_) => match fetch_oopif_tree(ctx, &child_frame_id, depth + 1).await {
                     Ok(nodes) => nodes,
                     Err(_) => continue,
-                };
+                },
+            };
             if let Some(child_root) = child_nodes.iter_mut().find(|n| n.parent_id.is_none()) {
                 child_root.parent_id = Some(iframe_node_id);
             }
@@ -212,6 +248,46 @@ fn fetch_frame_tree(
 
         Ok(raw)
     })
+}
+
+/// Whether a frame at `depth` may look for child iframes — and so attach
+/// child sessions.
+fn may_descend(depth: usize) -> bool {
+    depth < MAX_FRAME_DEPTH
+}
+
+async fn fetch_oopif_tree(
+    ctx: &FrameCtx<'_>,
+    child_frame_id: &FrameId,
+    depth: usize,
+) -> Result<Vec<RawAxNode>, PortError> {
+    let child_session = ctx.hub.attach(child_frame_id.inner()).await?;
+    fetch_frame_tree(ctx, Some(child_session), None, depth).await
+}
+
+/// What `fetch_frame_tree` needs to talk CDP: the page's own session, plus
+/// the hub for child sessions into cross-origin iframes.
+struct FrameCtx<'a> {
+    page: &'a Page,
+    hub: &'a OopifHub,
+}
+
+impl FrameCtx<'_> {
+    async fn exec<C: chromiumoxide::Command>(
+        &self,
+        session: Option<&SessionId>,
+        cmd: C,
+    ) -> Result<C::Response, PortError> {
+        match session {
+            None => self
+                .page
+                .execute(cmd)
+                .await
+                .map(|r| r.result)
+                .map_err(|e| PortError::Other(e.to_string())),
+            Some(s) => self.hub.call(s, cmd).await,
+        }
+    }
 }
 
 /// Best-effort extraction of a plain string out of an `AXValue`'s `optional
@@ -251,7 +327,7 @@ fn build_tree(
     // installs one `AxCapture`'s worth of refs at a time); last-write-wins in
     // that case, which is no worse than picking arbitrarily.
     let mut previous_by_backend_id: HashMap<i64, &str> = HashMap::new();
-    for (r, resolved) in previous_refs {
+    for (r, resolved) in previous_refs.iter().filter(|(_, v)| !v.is_oopif) {
         previous_by_backend_id.insert(*resolved.backend_node_id.inner(), r.as_str());
     }
 
@@ -357,10 +433,13 @@ fn walk_children<'a>(
         // otherwise a node that is still live and unchanged gets a brand-new
         // ref on every single capture, invalidating any ref a caller is
         // still holding from an earlier snapshot in the same navigation.
-        let node_ref = match child
+        // OOPIF backend ids live in another process's namespace and can
+        // equal a parent id, so they never reuse a previous ref.
+        let reusable = child
             .backend_node_id
-            .and_then(|id| previous_by_backend_id.get(&id))
-        {
+            .filter(|_| !child.oopif)
+            .and_then(|id| previous_by_backend_id.get(&id));
+        let node_ref = match reusable {
             Some(existing) => existing.to_string(),
             None => {
                 let n = next_ref_id.get();
@@ -375,6 +454,7 @@ fn walk_children<'a>(
                 ResolvedRef {
                     backend_node_id: BackendNodeId::new(backend_id),
                     role: child.role.clone().unwrap_or_default(),
+                    is_oopif: child.oopif,
                 },
             );
         }
@@ -537,8 +617,11 @@ fn redact_form_control_values<'a>(
     Box::pin(async move {
         if is_form_control_role(&node.role) {
             if let Some(resolved) = refs.get(&node.node_ref) {
-                let result = probe.probe(resolved.backend_node_id).await;
-                if !matches!(result, Ok(false)) {
+                // A probe on the parent session can't resolve a
+                // cross-process id, so OOPIF controls fail safe unprobed.
+                let redact = resolved.is_oopif
+                    || !matches!(probe.probe(resolved.backend_node_id).await, Ok(false));
+                if redact {
                     node.value = Some(REDACTED_PLACEHOLDER.to_string());
                 }
             }
@@ -568,6 +651,7 @@ mod tests {
             name: name.map(|n| n.to_string()),
             value: None,
             backend_node_id: Some(id.parse().unwrap_or(0)),
+            oopif: false,
         }
     }
 
@@ -808,6 +892,7 @@ mod tests {
             name: None,
             value: Some(value.to_string()),
             backend_node_id: Some(id.parse().unwrap_or(0)),
+            oopif: false,
         }
     }
 
@@ -971,6 +1056,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn may_descend_should_stop_oopif_attaches_at_max_frame_depth() {
+        assert!(may_descend(MAX_FRAME_DEPTH - 1));
+        assert!(!may_descend(MAX_FRAME_DEPTH));
+    }
+
+    struct PanicProbe;
+
+    impl RedactionProbe for PanicProbe {
+        fn probe(&self, _backend_node_id: BackendNodeId) -> BoxFuture<'_, Result<bool, ()>> {
+            panic!("an OOPIF node must never be probed on the parent session");
+        }
+    }
+
+    #[tokio::test]
+    async fn redact_form_control_values_should_redact_oopif_textbox_without_probing() {
+        let next_ref_id = Cell::new(1);
+        let mut oopif_input = node_with_value("2", Some("1"), "textbox", "hunter2");
+        oopif_input.oopif = true;
+        let nodes = vec![node("1", None, false, None, None), oopif_input];
+        let mut capture = build_tree(
+            &nodes,
+            &next_ref_id,
+            "https://example.com".into(),
+            &HashMap::new(),
+        );
+
+        redact_form_control_values(&mut capture.snapshot.root, &capture.refs, &PanicProbe).await;
+
+        assert_eq!(
+            capture.snapshot.root.children[0].value.as_deref(),
+            Some(REDACTED_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn build_tree_should_not_collide_oopif_and_parent_nodeids() {
+        let next_ref_id = Cell::new(1);
+        let mut parent_btn = node("5", Some("p:root"), false, Some("button"), Some("parent"));
+        parent_btn.node_id = "/main:5".into();
+        parent_btn.parent_id = Some("/main:0".into());
+        let mut child_btn = node("5", None, false, Some("button"), Some("child"));
+        child_btn.node_id = "sess/frame:5".into();
+        child_btn.parent_id = Some("/main:0".into());
+        child_btn.oopif = true;
+        let mut root = node("0", None, false, Some("RootWebArea"), None);
+        root.node_id = "/main:0".into();
+        let nodes = [root, parent_btn, child_btn];
+
+        let capture = build_tree(&nodes, &next_ref_id, String::new(), &HashMap::new());
+
+        assert_eq!(capture.snapshot.root.children.len(), 2);
+        assert_eq!(capture.refs.len(), 2);
+        assert_eq!(capture.refs.values().filter(|r| r.is_oopif).count(), 1);
+    }
+
+    #[test]
+    fn build_tree_should_not_reuse_parent_ref_for_oopif_node_with_same_backend_id() {
+        let mut oopif_btn = node("7", Some("1"), false, Some("button"), Some("child"));
+        oopif_btn.oopif = true;
+        let nodes = vec![node("1", None, false, None, None), oopif_btn];
+        let mut previous = HashMap::new();
+        previous.insert(
+            "e1".to_string(),
+            ResolvedRef {
+                backend_node_id: BackendNodeId::new(7),
+                role: "button".into(),
+                is_oopif: false,
+            },
+        );
+
+        let capture = build_tree(&nodes, &Cell::new(2), String::new(), &previous);
+
+        assert_ne!(capture.snapshot.root.children[0].node_ref, "e1");
+    }
+
     // ---- Epic 2.2, Story 2.2.2: shadow-DOM integration coverage ----
     //
     // Both tests below need a real Chrome (they launch `chromiumoxide`'s own
@@ -1080,7 +1241,7 @@ customElements.define('my-login', class extends HTMLElement {
             .expect("evaluate: autofill password field out-of-band");
 
         let next_ref_id = Cell::new(1);
-        let capture = capture_snapshot(&page, &next_ref_id, &HashMap::new())
+        let capture = capture_snapshot(&page, None, &next_ref_id, &HashMap::new())
             .await
             .expect("capture_snapshot should succeed");
 
@@ -1103,7 +1264,7 @@ customElements.define('my-login', class extends HTMLElement {
         let (browser, page) = launch_headless_chrome_page(&html).await;
 
         let next_ref_id = Cell::new(1);
-        let capture = capture_snapshot(&page, &next_ref_id, &HashMap::new())
+        let capture = capture_snapshot(&page, None, &next_ref_id, &HashMap::new())
             .await
             .expect("capture_snapshot should succeed");
 
@@ -1138,7 +1299,7 @@ customElements.define('my-login', class extends HTMLElement {
         let (browser, page) = launch_headless_chrome_page(&html).await;
 
         let next_ref_id = Cell::new(1);
-        let capture = capture_snapshot(&page, &next_ref_id, &HashMap::new())
+        let capture = capture_snapshot(&page, None, &next_ref_id, &HashMap::new())
             .await
             .expect("capture_snapshot should succeed");
 
@@ -1172,6 +1333,106 @@ customElements.define('my-login', class extends HTMLElement {
         node.children
             .iter()
             .find_map(|c| find_node_by_role(c, role))
+    }
+
+    /// Serves `body` for every request on an ephemeral 127.0.0.1 port from a
+    /// detached thread; returns the port. Two of these, addressed as
+    /// `127.0.0.1` and `localhost`, are different sites to Chrome's site
+    /// isolation, so an iframe from one embedded in the other is an OOPIF.
+    fn serve_html_forever(body: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn count_nodes(node: &AxNode) -> usize {
+        1 + node.children.iter().map(count_nodes).sum::<usize>()
+    }
+
+    fn find_named<'a>(node: &'a AxNode, name: &str) -> Option<&'a AxNode> {
+        if node.name == name {
+            return Some(node);
+        }
+        node.children.iter().find_map(|c| find_named(c, name))
+    }
+
+    async fn oopif_target_attached(browser: &chromiumoxide::Browser) -> bool {
+        use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+        let targets = browser
+            .execute(GetTargetsParams::default())
+            .await
+            .expect("getTargets");
+        targets
+            .result
+            .target_infos
+            .iter()
+            .find(|t| t.r#type == "iframe" && t.url.starts_with("http://localhost"))
+            .expect("OOPIF target")
+            .attached
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real Chrome; run with `cargo test -- --ignored`"]
+    async fn snapshot_should_include_nodes_from_cross_origin_iframe() {
+        let inner = serve_html_forever(
+            "<!doctype html><button>inner-btn</button><input type=password value=hunter2>",
+        );
+        let outer = serve_html_forever(Box::leak(
+            format!("<!doctype html><iframe src='http://localhost:{inner}/'></iframe>")
+                .into_boxed_str(),
+        ));
+        let (browser, page) = launch_headless_chrome_page("").await;
+        page.goto(format!("http://127.0.0.1:{outer}/"))
+            .await
+            .expect("goto");
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        let attached_before = oopif_target_attached(&browser).await;
+        let ws = browser.websocket_address().clone();
+        let next_ref_id = Cell::new(1);
+        // Twice: a repeat capture must re-attach cleanly, not reuse a dead session.
+        for _ in 0..2 {
+            let capture = capture_snapshot(&page, Some(&ws), &next_ref_id, &HashMap::new())
+                .await
+                .expect("capture_snapshot should succeed");
+            let iframe = find_node_by_role(&capture.snapshot.root, "Iframe")
+                .expect("Iframe node should be present");
+            assert!(count_nodes(iframe) > 1, "Iframe node must have children");
+            assert!(find_named(iframe, "inner-btn").is_some());
+            let pw = find_node_by_role(iframe, "textbox").expect("password field");
+            assert_eq!(pw.value.as_deref(), Some(REDACTED_PLACEHOLDER));
+            let r = capture.refs.get(&pw.node_ref).expect("ref for password");
+            assert!(r.is_oopif);
+        }
+
+        assert_eq!(
+            oopif_target_attached(&browser).await,
+            attached_before,
+            "child session leaked after capture"
+        );
+
+        // Without a websocket URL the iframe degrades to a childless leaf.
+        let capture = capture_snapshot(&page, None, &next_ref_id, &HashMap::new())
+            .await
+            .expect("snapshot must still succeed");
+        let iframe = find_node_by_role(&capture.snapshot.root, "Iframe").expect("Iframe");
+        assert!(iframe.children.is_empty());
+
+        let mut browser = browser;
+        let _ = browser.close().await;
     }
 
     // ---- Epic 2.2, Story 2.2.3: empirical headless-vs-headed check ----

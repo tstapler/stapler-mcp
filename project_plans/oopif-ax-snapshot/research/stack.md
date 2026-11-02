@@ -80,3 +80,13 @@ Given the open questions about chromiumoxide's session API, and the "evaluate de
 - `fetch_frame_tree`'s existing `Err(_) => continue` for unattachable frames is the right degradation model — extend, don't replace.
 - The `prefix = |id: &str| format!("{frame_key}:{id}")` scheme must be extended to OOPIF nodes, using the child target's `targetId` as the prefix key (not `frameId`, which may not be unique across processes).
 - Integration tests follow the `#[ignore = "requires a real Chrome..."]` pattern established in `ax.rs` tests.
+
+## Task 0.1 Finding: GO (Path A, typed raw commands)
+
+Probe result against chromiumoxide 0.9.1 (done within the 8h time-box):
+
+- `Page` is bound to a single session and has no public constructor from an existing `SessionId`; `Browser::get_page` cannot serve an OOPIF target. Path B is not viable.
+- `chromiumoxide::Connection`, `Command`, and the typed `Target.attachToTarget` / `Target.detachFromTarget` params are public. A second browser-level connection can attach (`flatten: true`) and send typed commands (e.g. `Accessibility.getFullAXTree`) with a `SessionId`. Path A is viable without hand-built JSON.
+- No version bump needed (Path C unnecessary).
+
+Implemented in `crates/native/src/oopif.rs` (`OopifHub`, lazy connect, `detach_all` on every exit path). Verified end to end by the `#[ignore]`d test `ax::tests::snapshot_should_include_nodes_from_cross_origin_iframe` (passes against real Chrome). Click/type routing into OOPIF nodes remains out of scope.

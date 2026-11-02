@@ -685,6 +685,12 @@ fn resolve_locator_impl(
     url: &str,
 ) -> Result<(BackendNodeId, String), PortError> {
     if let Some(r) = latest_refs.get(&locator.0) {
+        if r.is_oopif {
+            return Err(PortError::Other(format!(
+                "ref '{}' is inside a cross-origin iframe; click/type into cross-origin iframes is not supported yet",
+                locator.0
+            )));
+        }
         return Ok((r.backend_node_id, r.role.clone()));
     }
     let stale = known_refs
@@ -766,15 +772,16 @@ async fn verify_node_live(
 /// the new document.
 async fn wait_and_capture(
     page: &Page,
+    oopif_ws_url: &str,
     next_ref_id: &Cell<u64>,
     previous_refs: &HashMap<String, ax::ResolvedRef>,
 ) -> Result<ax::AxCapture, PortError> {
-    let first = ax::capture_snapshot(page, next_ref_id, previous_refs).await?;
+    let first = ax::capture_snapshot(page, Some(oopif_ws_url), next_ref_id, previous_refs).await?;
     if !first.snapshot.root.children.is_empty() {
         return Ok(first);
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
-    ax::capture_snapshot(page, next_ref_id, previous_refs).await
+    ax::capture_snapshot(page, Some(oopif_ws_url), next_ref_id, previous_refs).await
 }
 
 /// Resolves `backend_node_id` to a live `RemoteObject`/`objectId` via `DOM
@@ -1753,7 +1760,13 @@ impl BrowserDriver for NativeBrowser {
                     // nothing to borrow across the `.await` — pass an empty
                     // map directly rather than holding a `RefCell` borrow
                     // live over an await point (clippy::await_holding_refcell_ref).
-                    let capture = wait_and_capture(&page, &next_ref_id, &HashMap::new()).await?;
+                    let capture = wait_and_capture(
+                        &page,
+                        self.browser.websocket_address(),
+                        &next_ref_id,
+                        &HashMap::new(),
+                    )
+                    .await?;
                     let snapshot = install_snapshot(
                         &tab_state.latest_refs,
                         &tab_state.known_refs,
@@ -1877,7 +1890,13 @@ impl BrowserDriver for NativeBrowser {
                     // reused across navigations), so identity must not carry
                     // over — pass an empty map rather than the (about to be
                     // discarded) old-page `latest_refs`.
-                    let capture = wait_and_capture(&page, &next_ref_id, &HashMap::new()).await?;
+                    let capture = wait_and_capture(
+                        &page,
+                        self.browser.websocket_address(),
+                        &next_ref_id,
+                        &HashMap::new(),
+                    )
+                    .await?;
                     let snapshot = install_snapshot(
                         &latest_refs,
                         &known_refs,
@@ -2091,7 +2110,13 @@ impl BrowserDriver for NativeBrowser {
             }
 
             let previous_refs = latest_refs.borrow().clone();
-            let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
+            let capture = wait_and_capture(
+                &page,
+                self.browser.websocket_address(),
+                &next_ref_id,
+                &previous_refs,
+            )
+            .await?;
             let mut snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -2180,7 +2205,13 @@ impl BrowserDriver for NativeBrowser {
             // (and risks a panic if another task borrows `latest_refs` while
             // this future is suspended).
             let previous_refs = latest_refs.borrow().clone();
-            let capture = ax::capture_snapshot(&page, &next_ref_id, &previous_refs).await?;
+            let capture = ax::capture_snapshot(
+                &page,
+                Some(self.browser.websocket_address()),
+                &next_ref_id,
+                &previous_refs,
+            )
+            .await?;
             let snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -2400,7 +2431,13 @@ impl BrowserDriver for NativeBrowser {
                     // A brand-new tab, so (like `navigate`'s real-navigation
                     // branches) there are no refs from a prior document that
                     // could still apply.
-                    let capture = wait_and_capture(&page, &next_ref_id, &HashMap::new()).await?;
+                    let capture = wait_and_capture(
+                        &page,
+                        self.browser.websocket_address(),
+                        &next_ref_id,
+                        &HashMap::new(),
+                    )
+                    .await?;
                     let snapshot = install_snapshot(
                         &new_tab_state.latest_refs,
                         &new_tab_state.known_refs,
@@ -2469,7 +2506,13 @@ impl BrowserDriver for NativeBrowser {
                     // tab's own history rather than whichever tab was active
                     // before this call (#34).
                     let previous_refs = latest_refs.borrow().clone();
-                    let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
+                    let capture = wait_and_capture(
+                        &page,
+                        self.browser.websocket_address(),
+                        &next_ref_id,
+                        &previous_refs,
+                    )
+                    .await?;
                     let snapshot = install_snapshot(
                         &latest_refs,
                         &known_refs,
@@ -2683,7 +2726,13 @@ impl BrowserDriver for NativeBrowser {
             }
 
             let previous_refs = latest_refs.borrow().clone();
-            let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
+            let capture = wait_and_capture(
+                &page,
+                self.browser.websocket_address(),
+                &next_ref_id,
+                &previous_refs,
+            )
+            .await?;
             let snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -3016,7 +3065,13 @@ impl BrowserDriver for NativeBrowser {
                 .map_err(|e| PortError::Other(e.to_string()))?;
 
             let previous_refs = latest_refs.borrow().clone();
-            let capture = ax::capture_snapshot(&page, &next_ref_id, &previous_refs).await?;
+            let capture = ax::capture_snapshot(
+                &page,
+                Some(self.browser.websocket_address()),
+                &next_ref_id,
+                &previous_refs,
+            )
+            .await?;
             let snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -3257,7 +3312,13 @@ impl NativeBrowser {
             // `RefCell` before the `.await` rather than holding a borrow
             // across it.
             let previous_refs = latest_refs.borrow().clone();
-            let capture = wait_and_capture(&page, &next_ref_id, &previous_refs).await?;
+            let capture = wait_and_capture(
+                &page,
+                self.browser.websocket_address(),
+                &next_ref_id,
+                &previous_refs,
+            )
+            .await?;
             let mut snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -3669,6 +3730,7 @@ mod tests {
         ax::ResolvedRef {
             backend_node_id: BackendNodeId::new(id as i64),
             role: role.to_string(),
+            is_oopif: false,
         }
     }
 
