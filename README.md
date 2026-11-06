@@ -101,7 +101,10 @@ git checkout main && git pull
 cargo build --release --locked -p stapler-mcp-daemon   # ~4 min cold
 cargo build --release --locked -p stapler-mcp          # thin client, ~2 MB
 # Or install both beside each other in ~/.cargo/bin instead:
-#   scripts/install.sh
+#   scripts/install.sh   # downloads the prebuilt release if one exists for this platform,
+#                        # else builds from source with the faster `release-fast` profile
+#                        # (STAPLER_MCP_FROM_SOURCE=1 to force a build, STAPLER_MCP_PROFILE=release
+#                        # for the fat-LTO build). Releases come from pushing a `v*` tag.
 
 # Restart the daemon so it picks up the new binary:
 systemctl --user restart stapler-mcp      # if the service unit is installed

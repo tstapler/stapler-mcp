@@ -25,6 +25,14 @@ opt-level = "z"
 codegen-units = 1
 strip = "symbols"
 
+# Local daemon installs: fat LTO + codegen-units=1 is single-threaded and dominates
+# build time. Thin LTO with parallel codegen trades a little runtime speed/size for a much
+# faster build; released binaries still use `release`.
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 [profile.release-thin]
 inherits = "release"
 lto = "fat"

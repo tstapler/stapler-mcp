@@ -1,0 +1,57 @@
+name: Release
+
+# Publishes prebuilt thin client + daemon so scripts/install.sh can skip the
+# multi-minute fat-LTO compile. Push a tag like v0.1.0 to trigger.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Separate invocations: building both together links the daemon's heavy
+      # deps into the thin client (see README "Redeploying").
+      - run: cargo build --release --locked -p stapler-mcp-daemon
+      - run: cargo build --profile release-thin --locked -p stapler-mcp
+      - name: Package
+        run: |
+          asset="stapler-mcp-${{ matrix.target }}.tar.gz"
+          mkdir dist
+          cp target/release/stapler-mcp-daemon dist/
+          cp target/release-thin/stapler-mcp dist/
+          tar -czf "$asset" -C dist stapler-mcp stapler-mcp-daemon
+          shasum -a 256 "$asset" > "$asset.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            stapler-mcp-${{ matrix.target }}.tar.gz
+            stapler-mcp-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --generate-notes
