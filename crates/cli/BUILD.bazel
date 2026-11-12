@@ -1,0 +1,71 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+DEPS = [
+    "//crates/core",
+    "//crates/native",
+    "//crates/thin-client:stapler_mcp",
+] + all_crate_deps(normal = True)
+
+rust_binary(
+    name = "stapler-mcp-daemon",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "stapler_mcp_daemon",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    version = "0.1.0",
+    visibility = ["//visibility:public"],
+    deps = DEPS,
+)
+
+# cargo test --bins
+rust_test(
+    name = "daemon_unit_test",
+    crate = ":stapler-mcp-daemon",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# `cargo build --workspace --examples`: a spot-check tool, built (not run) so it cannot rot.
+rust_binary(
+    name = "relevance_spot_check",
+    srcs = ["examples/relevance_spot_check.rs"],
+    crate_name = "relevance_spot_check",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "crates/cli"},
+    deps = DEPS,
+)
+
+# tests/thin_exec.rs looks for the thin client beside the daemon binary, as installed.
+genrule(
+    name = "installed_bins",
+    srcs = [
+        ":stapler-mcp-daemon",
+        "//crates/thin-client:stapler-mcp",
+    ],
+    outs = [
+        "installed/stapler-mcp-daemon",
+        "installed/stapler-mcp",
+    ],
+    cmd = "cp $(location :stapler-mcp-daemon) $(location installed/stapler-mcp-daemon) && cp $(location //crates/thin-client:stapler-mcp) $(location installed/stapler-mcp)",
+)
+
+# One rust_test per tests/*.rs; tests/common/ is shared source (`mod common;`), as in Cargo.
+[
+    rust_test(
+        name = f[len("tests/"):-len(".rs")] + "_test",
+        srcs = [f] + glob(["tests/common/**/*.rs"]),
+        # http_transport.rs pulls src/http_server.rs and src/transport.rs in with #[path].
+        compile_data = glob(["src/*.rs"]),
+        crate_root = f,
+        data = ["installed/stapler-mcp-daemon", "installed/stapler-mcp"],
+        edition = "2021",
+        proc_macro_deps = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True),
+        rustc_env = {"CARGO_BIN_EXE_stapler-mcp-daemon": "$(rootpath installed/stapler-mcp-daemon)"},
+        deps = DEPS + all_crate_deps(normal_dev = True),
+    )
+    for f in glob(["tests/*.rs"])
+]

@@ -1,0 +1,56 @@
+load("@crates//:defs.bzl", "all_crate_deps", "crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Cargo feature `heavy` (default-on): browser/embedder/HTTP adapters and their transitive deps. The thin client
+# links `native_light` (no `heavy`), the daemon links `native`; a lib per feature set keeps the graphs apart
+# (scripts/check-thin-client-bazel.sh proves the light graph holds no heavy crate).
+# crate_deps resolves each name to the version this package's Cargo.toml asks for (reqwest 0.13 here, 0.12 in cli).
+LIGHT_DEPS = ["//crates/core"] + crate_deps(["futures", "libc", "rand", "serde_json", "tokio"])
+
+HEAVY_DEPS = crate_deps(["chromiumoxide", "fastembed", "reqwest", "url"])
+
+rust_library(
+    name = "native",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["heavy"],
+    crate_name = "stapler_mcp_native",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    version = "0.1.0",
+    visibility = ["//visibility:public"],
+    deps = LIGHT_DEPS + HEAVY_DEPS,
+)
+
+rust_library(
+    name = "native_light",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "stapler_mcp_native",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    version = "0.1.0",
+    visibility = ["//visibility:public"],
+    deps = LIGHT_DEPS,
+)
+
+# `cargo test -p stapler-mcp-native` (default features) and `--no-default-features`.
+rust_test(
+    name = "native_unit_test",
+    crate = ":native",
+    crate_features = ["heavy"],  # not inherited from the crate
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "native_light_unit_test",
+    crate = ":native_light",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "native_doc_test",
+    crate = ":native",
+)

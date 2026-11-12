@@ -8,3 +8,7 @@
 # artifact, not source.
 npm/pkg/
 npm/node_modules/
+
+# Bazel
+/bazel-*
+user.bazelrc

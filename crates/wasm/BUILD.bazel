@@ -1,0 +1,26 @@
+exports_files(["Cargo.toml"])
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
+
+# The npm-distributed crate. `bazel build --config=wasm //crates/wasm:stapler_mcp_wasm` builds the .wasm for
+# wasm32-unknown-unknown; wasm-bindgen-cli then makes npm/pkg from it (see the wasm job in
+# .github/workflows/ci.yml). Like `cargo test --workspace`, `bazel test //...` also builds and tests it on the host.
+rust_shared_library(
+    name = "stapler_mcp_wasm",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["src/glue/**"]),
+    crate_name = "stapler_mcp_wasm",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    version = "0.1.0",
+    visibility = ["//visibility:public"],
+    deps = ["//crates/core"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "stapler_mcp_wasm_unit_test",
+    crate = ":stapler_mcp_wasm",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)

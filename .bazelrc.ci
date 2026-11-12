@@ -1,0 +1,9 @@
+# Used as `bazel ... --config=ci` (GitHub Actions: .github/workflows/ci.yml).
+# The disk and repository caches are provided by tstapler/gha-actions/setup-bazel (~/.bazelrc on the runner).
+build:ci --color=no
+build:ci --curses=no
+build:ci --show_timestamps
+build:ci --verbose_failures
+build:ci --keep_going
+build:ci --jobs=HOST_CPUS*0.75
+test:ci --test_output=errors

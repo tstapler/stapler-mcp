@@ -1,0 +1,67 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Thin client: size-optimised, as [profile.release.package."stapler-mcp"] in the root Cargo.toml (its dependencies
+# keep the profile-wide settings; --config=dist adds fat LTO, strip and codegen-units=1 to everything).
+SIZE_FLAGS = ["-Copt-level=z"]
+
+DEPS = [
+    "//crates/core",
+    "//crates/native:native_light",
+    "@crates//:rmcp",
+    "@crates//:serde",
+    "@crates//:serde_json",
+    "@crates//:tokio",
+]
+
+rust_library(
+    name = "stapler_mcp",
+    srcs = glob(["src/*.rs"], exclude = ["src/main.rs"]),
+    crate_name = "stapler_mcp",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_flags = SIZE_FLAGS,
+    version = "0.1.0",
+    visibility = ["//visibility:public"],
+    deps = DEPS,
+)
+
+rust_binary(
+    name = "stapler-mcp",
+    srcs = ["src/main.rs"],
+    crate_name = "stapler_mcp_bin",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_flags = SIZE_FLAGS,
+    version = "0.1.0",
+    visibility = ["//visibility:public"],
+    deps = [":stapler_mcp"] + DEPS,
+)
+
+rust_test(
+    name = "stapler_mcp_unit_test",
+    crate = ":stapler_mcp",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "stapler_mcp_doc_test",
+    crate = ":stapler_mcp",
+)
+
+[
+    rust_test(
+        name = f[len("tests/"):-len(".rs")] + "_test",
+        srcs = [f],
+        crate_root = f,
+        data = ["//crates/thin-client:stapler-mcp"],
+        edition = "2021",
+        proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+        rustc_env = {"CARGO_BIN_EXE_stapler-mcp": "$(rootpath //crates/thin-client:stapler-mcp)"},
+        deps = [":stapler_mcp"] + DEPS + all_crate_deps(normal_dev = True),
+    )
+    for f in glob(["tests/*.rs"])
+]

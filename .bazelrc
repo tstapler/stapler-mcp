@@ -1,0 +1,31 @@
+# Layering (lowest to highest): this file < .bazelrc.ci (--config=ci) < user.bazelrc (git-ignored, per machine)
+# < ~/.bazelrc < command line. Bazel 9 (.bazelversion), bzlmod only.
+# The disk cache is deliberately NOT set here: it is machine/CI policy (~/.bazelrc locally, setup-bazel in CI).
+common --enable_bzlmod
+
+build --incompatible_strict_action_env
+build --nostamp
+
+test --test_output=errors
+test --test_env=PATH
+test --test_env=TMPDIR=/tmp
+
+# Profiles. fastbuild (default) == cargo dev without debuginfo; opt == cargo --release.
+# dist == [profile.release] (fat LTO, stripped) of Cargo.toml; the thin client adds opt-level=z in its BUILD file.
+build:dist --compilation_mode=opt
+build:dist --@rules_rust//rust/settings:lto=fat
+build:dist --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
+build:dist --@rules_rust//rust/settings:extra_rustc_flag=-Ccodegen-units=1
+
+# wasm32 build of the npm-distributed crates: bazel build --config=wasm //crates/wasm:stapler_mcp_wasm
+build:wasm --platforms=//build:wasm32
+
+# lint: bazel build --config=lint //...  (rustfmt + clippy -D warnings, as `cargo clippy -- -D warnings`)
+build:lint --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:lint --output_groups=+rustfmt_checks,+clippy_checks
+build:lint --@rules_rust//rust/settings:clippy_flags=-D,warnings
+build:lint --keep_going
+
+import %workspace%/.bazelrc.ci
+try-import %workspace%/user.bazelrc

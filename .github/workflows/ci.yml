@@ -5,13 +5,79 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # setup-bazel owns the output base and the caches in CI, so scripts/bazel.sh passes arguments through unchanged.
+  SM_BAZEL_PLAIN: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
 jobs:
+  # Bazel is the build and test system (MODULE.bazel; Cargo.toml/Cargo.lock stay the dependency source of truth).
+  # Real network/model-download tests are #[ignore]d by design, as under Cargo. Google Chrome ships preinstalled on
+  # GitHub-hosted ubuntu runners, so the browser tests run here.
+  bazel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: tstapler/gha-actions/setup-bazel@d2b534169ec63d7644d56f5abf2717fdd90b96fa # feat/rust-bazel-publish
+        with:
+          disk-cache: "true"
+          cache-key: ci-bazel
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - run: bazel build --config=ci //...
+      - run: bazel test --config=ci //...
+      - name: test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-testlogs
+          path: bazel-testlogs/**/test.log
+          if-no-files-found: ignore
+
+  # rustfmt + clippy -D warnings through Bazel (the Cargo equivalents run in `native`).
+  bazel-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: tstapler/gha-actions/setup-bazel@d2b534169ec63d7644d56f5abf2717fdd90b96fa # feat/rust-bazel-publish
+        with:
+          disk-cache: "true"
+          cache-key: ci-bazel-lint
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - run: bazel build --config=ci --config=lint //...
+
+  # Cargo and Bazel must agree, and the thin client's Bazel graph and dist size must hold.
+  bazel-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: tstapler/gha-actions/setup-bazel@d2b534169ec63d7644d56f5abf2717fdd90b96fa # feat/rust-bazel-publish
+        with:
+          disk-cache: "true"
+          cache-key: ci-bazel-checks
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - run: scripts/check-bazel-cargo-sync.sh --selftest
+      - run: scripts/check-bazel-cargo-sync.sh
+      - run: scripts/check-thin-client-bazel.sh
+
+  # The Cargo leg: Cargo.toml / Cargo.lock keep building, linting and testing with plain cargo
+  # (the manifests are what `cargo install`, scripts/install.sh and the release workflow use).
   native:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.1 # rust-toolchain.toml; MODULE.bazel RUST_VERSION
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
@@ -31,14 +97,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - run: scripts/check-thin-client.sh
 
   # crates/core and crates/wasm compile for wasm32-unknown-unknown (the
   # npm-distributed thin client target); crates/native and crates/cli are
   # native-only (Unix sockets, headless Chrome) and excluded from this
-  # target, matching the workspace's default-members split.
+  # target, matching the workspace's default-members split. Bazel builds the
+  # .wasm (--config=wasm); `cargo check` proves the Cargo manifests still
+  # build the same crates for that target.
   #
   # Then wasm-bindgen turns that .wasm into the npm/pkg/ the package actually
   # ships, and npm test runs the real e2e suite against it — same manual
@@ -50,16 +120,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.1
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p stapler-mcp-core -p stapler-mcp-wasm --target wasm32-unknown-unknown
+      - uses: tstapler/gha-actions/setup-bazel@d2b534169ec63d7644d56f5abf2717fdd90b96fa # feat/rust-bazel-publish
+        with:
+          disk-cache: "true"
+          cache-key: ci-bazel-wasm
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - run: cargo check -p stapler-mcp-core -p stapler-mcp-wasm --target wasm32-unknown-unknown
+      - run: bazel build --config=ci --config=wasm //crates/wasm:stapler_mcp_wasm
       # Pin to the wasm-bindgen crate version in Cargo.lock — the CLI and the
       # `wasm-bindgen` crate version must match exactly or bindgen refuses to
       # process the .wasm.
       - run: cargo install wasm-bindgen-cli --version 0.2.126
-      - run: wasm-bindgen --target nodejs target/wasm32-unknown-unknown/debug/stapler_mcp_wasm.wasm --out-dir npm/pkg
+      - run: wasm-bindgen --target nodejs bazel-bin/crates/wasm/stapler_mcp_wasm.wasm --out-dir npm/pkg
       - uses: actions/setup-node@v5
         with:
           node-version: "20"
