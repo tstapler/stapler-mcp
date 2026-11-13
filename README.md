@@ -431,6 +431,30 @@ wasm-bindgen --target nodejs target/wasm32-unknown-unknown/debug/stapler_mcp_was
 cd npm && npm install && npm test
 ```
 
+### Bazel
+
+CI builds and tests with Bazel (bzlmod, `rules_rust`, third-party crates from `Cargo.lock` through `crate_universe`).
+The Cargo manifests stay the source of truth, so all the Cargo commands above keep working.
+
+```bash
+scripts/bazel.sh build //...            # needs bazelisk; Bazel version in .bazelversion
+scripts/bazel.sh test //...             # unit, integration and doc tests of every crate
+scripts/bazel.sh build --config=lint //...                        # rustfmt + clippy -D warnings
+scripts/bazel.sh build --config=dist //crates/thin-client:stapler-mcp   # fat LTO, stripped (cargo --profile release-thin)
+scripts/bazel.sh build --config=wasm //crates/wasm:stapler_mcp_wasm     # the .wasm that wasm-bindgen turns into npm/pkg
+scripts/check-bazel-cargo-sync.sh       # Cargo and Bazel agree (toolchain, lock, members, features)
+```
+
+After changing a dependency in a `Cargo.toml`, run `CARGO_BAZEL_REPIN=1 scripts/bazel.sh build //...` and commit the
+updated `cargo-bazel-lock.json`; `scripts/check-bazel-cargo-sync.sh` fails on a stale one. Bump the Rust version in
+`rust-toolchain.toml` and `RUST_VERSION` in `MODULE.bazel` together.
+
+Where the bytes go: `scripts/bazel.sh` keeps Bazel's output base, repository cache and toolchains in
+`~/.cache/stapler-mcp-bazel` (override with `SM_BAZEL_OUTPUT_ROOT`; about 10-15 GB once built) and runs `bazel clean`
+(then `--expunge`) before a build or test when that directory exceeds `SM_BAZEL_MAX_GB` (default 20). The action cache is
+the shared disk cache from `~/.bazelrc` (`build --disk_cache=...`); the repository does not set one. `rm -rf` of the
+output root reclaims everything the repo's Bazel builds hold besides that shared cache.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

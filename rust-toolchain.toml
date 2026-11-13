@@ -1,0 +1,6 @@
+# Explicit version: MODULE.bazel pins the same rustc, so Cargo and Bazel build with one compiler.
+# Bump both together (scripts/check-bazel-cargo-sync.sh fails when they differ).
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

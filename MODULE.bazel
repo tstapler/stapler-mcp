@@ -1,0 +1,51 @@
+"""Bazel build and test system for stapler-mcp.
+
+Cargo.toml / Cargo.lock stay the dependency source of truth: crate_universe reads them, and
+`cargo publish`, npm packaging and plain `cargo build|test|clippy` keep working.
+"""
+
+module(
+    name = "stapler_mcp",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "rules_rust", version = "0.75.0")
+bazel_dep(name = "rules_cc", version = "0.2.28")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+
+# One rustc for Bazel and Cargo: keep in step with rust-toolchain.toml.
+RUST_VERSION = "1.98.1"
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    extra_target_triples = ["wasm32-unknown-unknown"],
+    versions = [RUST_VERSION],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = [
+        "//:Cargo.toml",
+        "//crates/cli:Cargo.toml",
+        "//crates/core:Cargo.toml",
+        "//crates/native:Cargo.toml",
+        "//crates/thin-client:Cargo.toml",
+        "//crates/wasm:Cargo.toml",
+    ],
+    supported_platform_triples = [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "wasm32-unknown-unknown",
+    ],
+)
+use_repo(crate, "crates")
