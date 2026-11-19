@@ -568,6 +568,9 @@ where
                         auth_required_urls.push(info);
                         continue;
                     }
+                    Err(e @ PortError::BrowserUnavailable(_)) => {
+                        return Err(format!("render {url}: {e}"));
+                    }
                     Err(_) => {
                         fallback_failed_hosts.insert(host);
                         auth_required_urls.push(http_info);
