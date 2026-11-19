@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chromiumoxide::cdp::browser_protocol::accessibility::{EnableParams, GetPartialAxTreeParams};
@@ -448,7 +450,14 @@ fn spawn_reaper(
 /// `navigate`/`click`/`type_text`/`snapshot` (the `BrowserDriver` methods
 /// added in Epic 1), reaped by the background task in `reaper` when idle.
 pub struct NativeBrowser {
-    browser: Browser,
+    /// Replaced wholesale by `live_browser` when Chrome has died; callers
+    /// clone the `Rc` out instead of holding the `RefCell` borrow across awaits.
+    browser: RefCell<Rc<Browser>>,
+    /// Replaced on every relaunch.
+    browser_alive: RefCell<Liveness>,
+    /// Serialises relaunches so concurrent callers share one new Chrome.
+    relaunch_lock: tokio::sync::Mutex<()>,
+    launch_params: LaunchParams,
     sessions: Rc<RefCell<HashMap<String, BrowserSession>>>,
     next_id: Cell<u64>,
     /// Reservations for new sessions that have passed the `MAX_OPEN_SESSIONS`
@@ -484,6 +493,88 @@ pub struct NativeBrowser {
     /// One interactive login window at a time; concurrent auth-gated calls
     /// get `AuthRequired` instead of stacking windows.
     auth_in_progress: Cell<bool>,
+}
+
+/// Budget for a relaunch; keeps "browser unavailable" well inside the MCP call limit.
+const RELAUNCH_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// What `launch_browser` needs to start (or restart) Chrome.
+struct LaunchParams {
+    user_data_dir: PathBuf,
+    persistent_profile_dir: Option<PathBuf>,
+    headed: bool,
+}
+
+/// Whether the Chrome child is still running. chromiumoxide's CDP handler
+/// never ends when Chrome is SIGKILLed (it keeps polling a closed websocket
+/// and `new_page` waits forever), so the child pid is checked directly.
+struct Liveness {
+    handler_running: Arc<AtomicBool>,
+    pid: Option<u32>,
+}
+
+impl Liveness {
+    fn is_alive(&self) -> bool {
+        if !self.handler_running.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some(pid) = self.pid else { return true };
+        let mut status = 0;
+        // SAFETY: waitpid(2) with WNOHANG only reads/writes `status`; it also
+        // reaps the child if it already exited, so it cannot linger as a zombie.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        // 0 = still running; pid = just exited; -1 (ECHILD) = already reaped.
+        // A SIGKILLed Chrome stays a zombie (waitpid still 0) until its last
+        // thread exits; a zombie leader already cannot serve CDP.
+        let alive = r == 0 && !is_zombie(pid);
+        if !alive {
+            self.handler_running.store(false, Ordering::SeqCst);
+        }
+        alive
+    }
+}
+
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit(')')
+                .next()
+                .map(|r| r.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+/// Starts Chrome and its CDP handler task.
+async fn launch_browser(p: &LaunchParams) -> Result<(Browser, Liveness), PortError> {
+    std::fs::create_dir_all(&p.user_data_dir).map_err(|e| PortError::Other(e.to_string()))?;
+    let mut config = BrowserConfig::builder().user_data_dir(&p.user_data_dir);
+    if p.headed {
+        config = config.with_head();
+    }
+    let config = config
+        .build()
+        .map_err(|e| PortError::Other(e.to_string()))?;
+    let (mut browser, mut handler) = Browser::launch(config)
+        .await
+        .map_err(|e| describe_launch_error(e, p.persistent_profile_dir.as_deref()))?;
+
+    let pid = browser.get_mut_child().and_then(|c| c.as_mut_inner().id());
+    let alive = Arc::new(AtomicBool::new(true));
+    let alive_task = alive.clone();
+    // Drains the CDP websocket event stream for the browser's whole lifetime;
+    // dropping this JoinHandle does not stop the task.
+    tokio::spawn(async move {
+        while handler.next().await.is_some() {}
+        alive_task.store(false, Ordering::SeqCst);
+    });
+    Ok((
+        browser,
+        Liveness {
+            handler_running: alive,
+            pid,
+        },
+    ))
 }
 
 const DEFAULT_AUTH_WAIT_SECS: u64 = 300;
@@ -638,27 +729,22 @@ impl NativeBrowser {
         }
         let auth_wait = auth_wait_from(std::env::var("STAPLER_MCP_AUTH_WAIT_SECS").ok().as_deref());
 
-        let mut config = BrowserConfig::builder().user_data_dir(&user_data_dir);
-        if headed {
-            config = config.with_head();
-        }
-        let config = config
-            .build()
-            .map_err(|e| PortError::Other(e.to_string()))?;
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| describe_launch_error(e, persistent_profile_dir.as_deref()))?;
-
-        // Drains the CDP websocket event stream for the daemon's whole
-        // lifetime; dropping this JoinHandle does not stop the task.
-        tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let launch_params = LaunchParams {
+            user_data_dir,
+            persistent_profile_dir,
+            headed,
+        };
+        let (browser, alive) = launch_browser(&launch_params).await?;
 
         let sessions: Rc<RefCell<HashMap<String, BrowserSession>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let reaper = spawn_reaper(sessions.clone(), crate::NativeClock, crate::NativeSleeper);
 
         Ok(NativeBrowser {
-            browser,
+            browser: RefCell::new(Rc::new(browser)),
+            browser_alive: RefCell::new(alive),
+            relaunch_lock: tokio::sync::Mutex::new(()),
+            launch_params,
             sessions,
             next_id: Cell::new(0),
             pending_new_sessions: Cell::new(0),
@@ -670,6 +756,47 @@ impl NativeBrowser {
             auth_wait,
             auth_in_progress: Cell::new(false),
         })
+    }
+
+    /// `false` once Chrome's CDP connection has closed and until a call
+    /// relaunches it.
+    pub fn browser_alive(&self) -> bool {
+        self.browser_alive.borrow().is_alive()
+    }
+
+    fn ws_url(&self) -> String {
+        self.browser.borrow().websocket_address().clone()
+    }
+
+    /// The running browser, relaunching Chrome first if it died. Fails fast
+    /// with `BrowserUnavailable` instead of letting the caller wait out its
+    /// own timeout on a dead CDP connection.
+    async fn live_browser(&self) -> Result<Rc<Browser>, PortError> {
+        if self.browser_alive() {
+            return Ok(self.browser.borrow().clone());
+        }
+        let _guard = self.relaunch_lock.lock().await;
+        // Another caller may have relaunched while we waited for the lock.
+        if self.browser_alive() {
+            return Ok(self.browser.borrow().clone());
+        }
+        eprintln!("stapler-mcp: browser process is gone, relaunching");
+        let launched = tokio::time::timeout(RELAUNCH_TIMEOUT, launch_browser(&self.launch_params))
+            .await
+            .map_err(|_| {
+                PortError::BrowserUnavailable(format!(
+                    "relaunch did not finish within {}s",
+                    RELAUNCH_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| PortError::BrowserUnavailable(format!("relaunch failed: {e}")))?;
+        let (browser, alive) = launched;
+        let browser = Rc::new(browser);
+        // Tabs of the dead browser cannot be used again.
+        self.sessions.borrow_mut().clear();
+        *self.browser.borrow_mut() = browser.clone();
+        *self.browser_alive.borrow_mut() = alive;
+        Ok(browser)
     }
 
     pub fn headed(&self) -> bool {
@@ -751,7 +878,9 @@ impl NativeBrowser {
     /// itself, but leaving it running past shutdown would let it log/close
     /// sessions concurrently with `Browser::close()` for no benefit).
     pub async fn close(&mut self) {
-        let _ = self.browser.close().await;
+        if let Some(browser) = Rc::get_mut(self.browser.get_mut()) {
+            let _ = browser.close().await;
+        }
     }
 }
 
@@ -1714,7 +1843,8 @@ impl BrowserDriver for NativeBrowser {
         // login wait below has its own `auth_wait` budget.
         let load = async {
             let page = self
-                .browser
+                .live_browser()
+                .await?
                 .new_page(url)
                 .await
                 .map_err(|e| PortError::Other(e.to_string()))?;
@@ -1826,7 +1956,8 @@ impl BrowserDriver for NativeBrowser {
                     // listeners are provably live before the first byte of
                     // `url` is requested.
                     let page = self
-                        .browser
+                        .live_browser()
+                        .await?
                         .new_page("about:blank")
                         .await
                         .map_err(|e| PortError::Other(e.to_string()))?;
@@ -1910,13 +2041,9 @@ impl BrowserDriver for NativeBrowser {
                     // nothing to borrow across the `.await` — pass an empty
                     // map directly rather than holding a `RefCell` borrow
                     // live over an await point (clippy::await_holding_refcell_ref).
-                    let capture = wait_and_capture(
-                        &page,
-                        self.browser.websocket_address(),
-                        &next_ref_id,
-                        &HashMap::new(),
-                    )
-                    .await?;
+                    let capture =
+                        wait_and_capture(&page, &self.ws_url(), &next_ref_id, &HashMap::new())
+                            .await?;
                     let snapshot = install_snapshot(
                         &tab_state.latest_refs,
                         &tab_state.known_refs,
@@ -2040,13 +2167,9 @@ impl BrowserDriver for NativeBrowser {
                     // reused across navigations), so identity must not carry
                     // over — pass an empty map rather than the (about to be
                     // discarded) old-page `latest_refs`.
-                    let capture = wait_and_capture(
-                        &page,
-                        self.browser.websocket_address(),
-                        &next_ref_id,
-                        &HashMap::new(),
-                    )
-                    .await?;
+                    let capture =
+                        wait_and_capture(&page, &self.ws_url(), &next_ref_id, &HashMap::new())
+                            .await?;
                     let snapshot = install_snapshot(
                         &latest_refs,
                         &known_refs,
@@ -2260,13 +2383,8 @@ impl BrowserDriver for NativeBrowser {
             }
 
             let previous_refs = latest_refs.borrow().clone();
-            let capture = wait_and_capture(
-                &page,
-                self.browser.websocket_address(),
-                &next_ref_id,
-                &previous_refs,
-            )
-            .await?;
+            let capture =
+                wait_and_capture(&page, &self.ws_url(), &next_ref_id, &previous_refs).await?;
             let mut snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -2355,13 +2473,10 @@ impl BrowserDriver for NativeBrowser {
             // (and risks a panic if another task borrows `latest_refs` while
             // this future is suspended).
             let previous_refs = latest_refs.borrow().clone();
-            let capture = ax::capture_snapshot(
-                &page,
-                Some(self.browser.websocket_address()),
-                &next_ref_id,
-                &previous_refs,
-            )
-            .await?;
+            let ws_url = self.ws_url();
+            let capture =
+                ax::capture_snapshot(&page, Some(ws_url.as_str()), &next_ref_id, &previous_refs)
+                    .await?;
             let snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -2493,7 +2608,8 @@ impl BrowserDriver for NativeBrowser {
                 }
                 TabAction::New { url } => {
                     let page = self
-                        .browser
+                        .live_browser()
+                        .await?
                         .new_page("about:blank")
                         .await
                         .map_err(|e| PortError::Other(e.to_string()))?;
@@ -2581,13 +2697,9 @@ impl BrowserDriver for NativeBrowser {
                     // A brand-new tab, so (like `navigate`'s real-navigation
                     // branches) there are no refs from a prior document that
                     // could still apply.
-                    let capture = wait_and_capture(
-                        &page,
-                        self.browser.websocket_address(),
-                        &next_ref_id,
-                        &HashMap::new(),
-                    )
-                    .await?;
+                    let capture =
+                        wait_and_capture(&page, &self.ws_url(), &next_ref_id, &HashMap::new())
+                            .await?;
                     let snapshot = install_snapshot(
                         &new_tab_state.latest_refs,
                         &new_tab_state.known_refs,
@@ -2656,13 +2768,9 @@ impl BrowserDriver for NativeBrowser {
                     // tab's own history rather than whichever tab was active
                     // before this call (#34).
                     let previous_refs = latest_refs.borrow().clone();
-                    let capture = wait_and_capture(
-                        &page,
-                        self.browser.websocket_address(),
-                        &next_ref_id,
-                        &previous_refs,
-                    )
-                    .await?;
+                    let capture =
+                        wait_and_capture(&page, &self.ws_url(), &next_ref_id, &previous_refs)
+                            .await?;
                     let snapshot = install_snapshot(
                         &latest_refs,
                         &known_refs,
@@ -2876,13 +2984,8 @@ impl BrowserDriver for NativeBrowser {
             }
 
             let previous_refs = latest_refs.borrow().clone();
-            let capture = wait_and_capture(
-                &page,
-                self.browser.websocket_address(),
-                &next_ref_id,
-                &previous_refs,
-            )
-            .await?;
+            let capture =
+                wait_and_capture(&page, &self.ws_url(), &next_ref_id, &previous_refs).await?;
             let snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -3215,13 +3318,10 @@ impl BrowserDriver for NativeBrowser {
                 .map_err(|e| PortError::Other(e.to_string()))?;
 
             let previous_refs = latest_refs.borrow().clone();
-            let capture = ax::capture_snapshot(
-                &page,
-                Some(self.browser.websocket_address()),
-                &next_ref_id,
-                &previous_refs,
-            )
-            .await?;
+            let ws_url = self.ws_url();
+            let capture =
+                ax::capture_snapshot(&page, Some(ws_url.as_str()), &next_ref_id, &previous_refs)
+                    .await?;
             let snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,
@@ -3462,13 +3562,8 @@ impl NativeBrowser {
             // `RefCell` before the `.await` rather than holding a borrow
             // across it.
             let previous_refs = latest_refs.borrow().clone();
-            let capture = wait_and_capture(
-                &page,
-                self.browser.websocket_address(),
-                &next_ref_id,
-                &previous_refs,
-            )
-            .await?;
+            let capture =
+                wait_and_capture(&page, &self.ws_url(), &next_ref_id, &previous_refs).await?;
             let mut snapshot = install_snapshot(
                 &latest_refs,
                 &known_refs,

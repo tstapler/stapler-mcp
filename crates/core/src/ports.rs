@@ -61,6 +61,9 @@ pub enum PortError {
     /// content. Distinct from `Timeout`/`Other` so callers can tell "needs a
     /// human to log in" from "page broken" — see `crate::auth`.
     AuthRequired(crate::schema::AuthRequiredInfo),
+    /// The browser process is gone and could not be relaunched. Fails fast
+    /// instead of leaving the caller to wait out a timeout.
+    BrowserUnavailable(String),
 }
 
 impl std::fmt::Display for PortError {
@@ -82,6 +85,7 @@ impl std::fmt::Display for PortError {
             PortError::CredentialUnauthenticated(e) => write!(f, "vault unauthenticated: {e}"),
             PortError::CredentialRateLimited(e) => write!(f, "vault rate-limited: {e}"),
             PortError::CredentialExpired(e) => write!(f, "credential expired: {e}"),
+            PortError::BrowserUnavailable(e) => write!(f, "browser unavailable: {e}"),
             PortError::AuthRequired(info) => write!(
                 f,
                 "auth required: {} redirected to login at {}",
