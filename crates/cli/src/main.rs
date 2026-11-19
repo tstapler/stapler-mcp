@@ -409,6 +409,10 @@ async fn run_daemon() {
         "headedMode": browser.headed(),
         "authWaitTimeoutSecs": browser.auth_wait().as_secs(),
     }));
+    daemon.set_status_live({
+        let browser = browser.clone();
+        move || serde_json::json!({ "browserAlive": browser.browser_alive() })
+    });
 
     daemon.register(
         "fetch_page",

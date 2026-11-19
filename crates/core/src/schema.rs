@@ -13,7 +13,8 @@ pub struct FetchPageInput {
     /// Optional local file path to save the rendered HTML to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save_path: Option<String>,
-    /// Navigation timeout in seconds, defaults to 30.
+    /// Navigation timeout in seconds, defaults to 30. Capped at 30 s by the
+    /// MCP call limit: larger values have no effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u32>,
 }
@@ -33,6 +34,11 @@ pub struct FetchPageOutput {
     /// Set instead of page content when the URL is behind a login/SSO wall.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_required: Option<AuthRequiredInfo>,
+    /// Set when the page is a bot-challenge interstitial (e.g. Cloudflare
+    /// "Just a moment...") rather than the requested content; `title`/`text`
+    /// then describe the challenge page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_challenge: Option<String>,
 }
 
 /// Reported (instead of silently empty results) when a fetch lands on a
@@ -636,6 +642,10 @@ pub struct DaemonStatusOutput {
     /// unsafe (inside a git repo or a cloud-synced folder).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_profile_warning: Option<String>,
+    /// `false` while Chrome's process is gone (until the next browser call
+    /// relaunches it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_alive: Option<bool>,
 }
 
 impl DaemonStatusOutput {

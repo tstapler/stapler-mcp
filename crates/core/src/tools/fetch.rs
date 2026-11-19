@@ -27,17 +27,20 @@ pub async fn fetch_page<B: BrowserDriver, F: FileStore>(
                 saved_to: None,
                 final_url: info.final_url.clone(),
                 auth_required: Some(info),
+                bot_challenge: None,
             });
         }
         Err(e) => return Err(format!("render {}: {e}", input.url)),
     };
 
+    let bot_challenge = detect_bot_challenge(&extract.title, &extract.text, &extract.html);
     let mut out = FetchPageOutput {
         title: extract.title,
         text: extract.text,
         saved_to: None,
         final_url: extract.final_url,
         auth_required: None,
+        bot_challenge,
     };
 
     // Note: unlike the original Go function (which could return a partially
@@ -57,10 +60,20 @@ pub async fn fetch_page<B: BrowserDriver, F: FileStore>(
     Ok(out)
 }
 
+/// Recognises Cloudflare's interstitial; other vendors are not covered.
+fn detect_bot_challenge(title: &str, text: &str, html: &str) -> Option<String> {
+    let title_hit = title.trim().eq_ignore_ascii_case("just a moment...");
+    let html_hit = html.contains("/cdn-cgi/challenge-platform/") || html.contains("cf-mitigated");
+    let text_hit = text.contains("Verify you are human") || text.contains("Checking your browser");
+    (title_hit || (html_hit && text_hit)).then(|| {
+        "bot challenge detected (Cloudflare): the site served a verification page instead of the content; a headless browser cannot pass it".to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::{FileStore, PortError};
+    use crate::ports::{FileStore, PageExtract, PortError};
     use crate::schema::AuthRequiredInfo;
     use crate::tools::test_support::FakeBrowserDriver;
 
@@ -106,5 +119,67 @@ mod tests {
         let browser = FakeBrowserDriver::new().with_extract(Err(PortError::Timeout));
         let err = fetch_page(&browser, &NoFs, input()).await.unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_page_should_report_browser_unavailable_not_timeout() {
+        let browser = FakeBrowserDriver::new()
+            .with_extract(Err(PortError::BrowserUnavailable("relaunch failed".into())));
+        let err = fetch_page(&browser, &NoFs, input()).await.unwrap_err();
+        assert!(err.contains("browser unavailable"), "{err}");
+        assert!(!err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_page_should_flag_cloudflare_challenge_page() {
+        let browser = FakeBrowserDriver::new().with_extract(Ok(PageExtract {
+            title: "Just a moment...".into(),
+            html: "<html><script src=\"/cdn-cgi/challenge-platform/h/b\"></script></html>".into(),
+            text: "Verify you are human".into(),
+            final_url: "https://www.nexusmods.com/".into(),
+        }));
+        let out = fetch_page(&browser, &NoFs, input()).await.unwrap();
+        assert!(out
+            .bot_challenge
+            .unwrap()
+            .contains("bot challenge detected"));
+    }
+
+    #[test]
+    fn detect_bot_challenge_should_require_the_documented_signals() {
+        let script = "<script src=\"/cdn-cgi/challenge-platform/h/b\"></script>";
+        let cases = [
+            ("title only", "Just a moment...", "", "", true),
+            ("title case variant", "JUST A MOMENT...", "", "", true),
+            ("html only", "Home", "welcome", script, false),
+            (
+                "text only",
+                "Home",
+                "Verify you are human",
+                "<html></html>",
+                false,
+            ),
+            (
+                "html and text",
+                "Home",
+                "Checking your browser",
+                script,
+                true,
+            ),
+            (
+                "normal page",
+                "Example Domain",
+                "hello",
+                "<html></html>",
+                false,
+            ),
+        ];
+        for (name, title, text, html, expected) in cases {
+            assert_eq!(
+                detect_bot_challenge(title, text, html).is_some(),
+                expected,
+                "{name}"
+            );
+        }
     }
 }

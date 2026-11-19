@@ -568,6 +568,9 @@ where
                         auth_required_urls.push(info);
                         continue;
                     }
+                    Err(e @ PortError::BrowserUnavailable(_)) => {
+                        return Err(format!("render {url}: {e}"));
+                    }
                     Err(_) => {
                         fallback_failed_hosts.insert(host);
                         auth_required_urls.push(http_info);
@@ -1396,6 +1399,29 @@ mod read_website_auth_tests {
         let out = run(&http, &browser, &Fs::default()).await;
         assert!(out.pages.is_empty());
         assert_eq!(out.auth_required_urls, vec![info]);
+    }
+
+    #[tokio::test]
+    async fn should_surface_browser_unavailable_instead_of_reporting_auth_required() {
+        let http = Http {
+            status: 200,
+            body: LOGIN,
+            final_url: "https://idp.example.com/login",
+            overrides: vec![],
+        };
+        let browser = FakeBrowserDriver::new()
+            .with_extract(Err(PortError::BrowserUnavailable("relaunch failed".into())));
+        let err = read_website(
+            &http,
+            &browser,
+            &Fs::default(),
+            "/cache",
+            input(),
+            NetworkPolicy::from_env(None, None),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("browser unavailable"), "{err}");
     }
 
     #[tokio::test]

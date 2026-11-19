@@ -46,6 +46,9 @@ pub struct Daemon {
     /// response stays `{"pong": true}`). Set at most once, before `run()`'s
     /// accept loop starts — single-writer, read-only afterward.
     status_extra: RefCell<serde_json::Value>,
+    /// Live fields (e.g. `browserAlive`) evaluated on every `ping`, merged
+    /// after `status_extra`.
+    status_live: RefCell<Option<Box<dyn Fn() -> serde_json::Value>>>,
 }
 
 impl Daemon {
@@ -56,6 +59,7 @@ impl Daemon {
             #[cfg(not(target_arch = "wasm32"))]
             cancel: CancellationToken::new(),
             status_extra: RefCell::new(serde_json::json!({})),
+            status_live: RefCell::new(None),
         }
     }
 
@@ -67,6 +71,12 @@ impl Daemon {
     /// object. Intended to be called at most once, at startup.
     pub fn set_status_extra(&self, extra: serde_json::Value) {
         *self.status_extra.borrow_mut() = extra;
+    }
+
+    /// Registers a closure whose JSON object is merged into every `ping`
+    /// response, for fields that change at runtime.
+    pub fn set_status_live(&self, f: impl Fn() -> serde_json::Value + 'static) {
+        *self.status_live.borrow_mut() = Some(Box::new(f));
     }
 
     /// Sets the shutdown flag `run`/`run_cancellable` poll after each
@@ -107,6 +117,13 @@ impl Daemon {
                     (&*self.status_extra.borrow(), &mut pong)
                 {
                     pong_obj.extend(extra.clone());
+                }
+                if let (Some(live), serde_json::Value::Object(pong_obj)) =
+                    (&*self.status_live.borrow(), &mut pong)
+                {
+                    if let serde_json::Value::Object(fields) = live() {
+                        pong_obj.extend(fields);
+                    }
                 }
                 Response::ok(pong)
             }
@@ -319,6 +336,27 @@ mod tests {
                 "browserProfileWarning": null,
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn handle_request_should_reevaluate_status_live_on_every_ping() {
+        let alive = std::rc::Rc::new(std::cell::Cell::new(true));
+        let daemon = Daemon::new();
+        daemon.set_status_live({
+            let alive = alive.clone();
+            move || serde_json::json!({ "browserAlive": alive.get() })
+        });
+        let ping = || Request {
+            tool: PING_TOOL.to_string(),
+            params: None,
+        };
+
+        let first = daemon.handle_request(ping()).await;
+        alive.set(false);
+        let second = daemon.handle_request(ping()).await;
+
+        assert_eq!(first.result.unwrap()["browserAlive"], true);
+        assert_eq!(second.result.unwrap()["browserAlive"], false);
     }
 
     #[tokio::test]
