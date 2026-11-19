@@ -68,7 +68,14 @@ async fn call(
 async fn start() -> (Harness, String) {
     let h = Harness::new();
     std::env::set_var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS", "1");
-    let site = spawn_mock_site().await;
+    // STAPLER_TEST_URL=https://example.com/ runs the same sequence against a live site.
+    let site = match std::env::var("STAPLER_TEST_URL") {
+        Ok(u) => {
+            std::env::remove_var("STAPLER_MCP_ALLOW_PRIVATE_NETWORKS");
+            u
+        }
+        Err(_) => spawn_mock_site().await,
+    };
     h.ensure(Duration::from_secs(20))
         .await
         .expect("daemon start");
@@ -97,7 +104,13 @@ async fn fetch_page_should_relaunch_browser_after_chrome_child_killed() {
     )
     .await
     .expect("fetch_page should succeed via relaunch");
-    assert_eq!(out["title"], "Kill Respawn Fixture", "{out}");
+    println!(
+        "RESULT title={:?} botChallenge={:?} elapsed={:?}",
+        out["title"],
+        out["botChallenge"],
+        started.elapsed()
+    );
+    assert!(!out["title"].as_str().unwrap_or("").is_empty(), "{out}");
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "{:?}",
@@ -112,12 +125,14 @@ async fn status_should_report_browser_alive_false_after_kill_and_true_after_rela
     let up = call(&h, "ping", None, Duration::from_secs(5))
         .await
         .unwrap();
+    println!("RESULT before kill: {up}");
     assert_eq!(up["browserAlive"], true, "{up}");
 
     kill_chrome_and_wait(&h);
     let down = call(&h, "ping", None, Duration::from_secs(5))
         .await
         .unwrap();
+    println!("RESULT after kill, before relaunch: {down}");
     assert_eq!(down["browserAlive"], false, "{down}");
 
     call(
@@ -131,6 +146,7 @@ async fn status_should_report_browser_alive_false_after_kill_and_true_after_rela
     let again = call(&h, "ping", None, Duration::from_secs(5))
         .await
         .unwrap();
+    println!("RESULT after fetch_page relaunch: {again}");
     assert_eq!(again["browserAlive"], true, "{again}");
 }
 
@@ -160,6 +176,7 @@ async fn fetch_page_should_fail_fast_with_browser_unavailable_when_relaunch_fail
     .await
     .expect_err("relaunch cannot succeed");
     let _ = std::fs::remove_file(&dir);
+    println!("RESULT err={err:?} elapsed={:?}", started.elapsed());
     assert!(err.contains("browser unavailable"), "{err}");
     assert!(
         started.elapsed() < Duration::from_secs(5),
