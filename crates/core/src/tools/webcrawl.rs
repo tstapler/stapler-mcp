@@ -1402,6 +1402,29 @@ mod read_website_auth_tests {
     }
 
     #[tokio::test]
+    async fn should_surface_browser_unavailable_instead_of_reporting_auth_required() {
+        let http = Http {
+            status: 200,
+            body: LOGIN,
+            final_url: "https://idp.example.com/login",
+            overrides: vec![],
+        };
+        let browser = FakeBrowserDriver::new()
+            .with_extract(Err(PortError::BrowserUnavailable("relaunch failed".into())));
+        let err = read_website(
+            &http,
+            &browser,
+            &Fs::default(),
+            "/cache",
+            input(),
+            NetworkPolicy::from_env(None, None),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("browser unavailable"), "{err}");
+    }
+
+    #[tokio::test]
     async fn should_fall_back_to_http_detection_when_browser_fails() {
         let http = Http {
             status: 200,

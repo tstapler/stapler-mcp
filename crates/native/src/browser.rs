@@ -519,14 +519,13 @@ impl Liveness {
             return false;
         }
         let Some(pid) = self.pid else { return true };
-        let mut status = 0;
-        // SAFETY: waitpid(2) with WNOHANG only reads/writes `status`; it also
-        // reaps the child if it already exited, so it cannot linger as a zombie.
-        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-        // 0 = still running; pid = just exited; -1 (ECHILD) = already reaped.
-        // A SIGKILLed Chrome stays a zombie (waitpid still 0) until its last
-        // thread exits; a zombie leader already cannot serve CDP.
-        let alive = r == 0 && !is_zombie(pid);
+        // SAFETY: signal 0 only probes existence. It must not reap: tokio and
+        // std still own the child's exit status, and a reaped pid could later
+        // be signalled by `kill_on_drop` after the kernel recycled it.
+        let exists = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        // A SIGKILLed Chrome stays a zombie until reaped; kill(2) still
+        // succeeds on it, but a zombie leader cannot serve CDP.
+        let alive = exists && !is_zombie(pid);
         if !alive {
             self.handler_running.store(false, Ordering::SeqCst);
         }
@@ -792,8 +791,6 @@ impl NativeBrowser {
             .map_err(|e| PortError::BrowserUnavailable(format!("relaunch failed: {e}")))?;
         let (browser, alive) = launched;
         let browser = Rc::new(browser);
-        // Tabs of the dead browser cannot be used again.
-        self.sessions.borrow_mut().clear();
         *self.browser.borrow_mut() = browser.clone();
         *self.browser_alive.borrow_mut() = alive;
         Ok(browser)
@@ -878,8 +875,13 @@ impl NativeBrowser {
     /// itself, but leaving it running past shutdown would let it log/close
     /// sessions concurrently with `Browser::close()` for no benefit).
     pub async fn close(&mut self) {
-        if let Some(browser) = Rc::get_mut(self.browser.get_mut()) {
-            let _ = browser.close().await;
+        match Rc::get_mut(self.browser.get_mut()) {
+            Some(browser) => {
+                let _ = browser.close().await;
+            }
+            None => {
+                eprintln!("stapler-mcp: browser still shared at close; relying on kill-on-drop")
+            }
         }
     }
 }
@@ -3617,6 +3619,38 @@ mod tests {
     }
 
     use super::*;
+
+    fn liveness_for(pid: Option<u32>, running: bool) -> Liveness {
+        Liveness {
+            handler_running: Arc::new(AtomicBool::new(running)),
+            pid,
+        }
+    }
+
+    #[test]
+    fn liveness_should_follow_child_process_state_without_reaping() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let live = liveness_for(Some(child.id()), true);
+        assert!(live.is_alive());
+
+        child.kill().unwrap();
+        // The unreaped zombie must read as dead...
+        while !is_zombie(child.id()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!live.is_alive());
+        // ...and the probe must not have stolen the exit status from `Child`.
+        assert!(child.wait().is_ok());
+    }
+
+    #[test]
+    fn liveness_should_be_dead_when_handler_stopped_and_alive_without_pid() {
+        assert!(!liveness_for(Some(std::process::id()), false).is_alive());
+        assert!(liveness_for(None, true).is_alive());
+    }
     use std::cell::Cell as StdCell;
     use std::future::Future;
     use std::pin::Pin;

@@ -339,6 +339,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_request_should_reevaluate_status_live_on_every_ping() {
+        let alive = std::rc::Rc::new(std::cell::Cell::new(true));
+        let daemon = Daemon::new();
+        daemon.set_status_live({
+            let alive = alive.clone();
+            move || serde_json::json!({ "browserAlive": alive.get() })
+        });
+        let ping = || Request {
+            tool: PING_TOOL.to_string(),
+            params: None,
+        };
+
+        let first = daemon.handle_request(ping()).await;
+        alive.set(false);
+        let second = daemon.handle_request(ping()).await;
+
+        assert_eq!(first.result.unwrap()["browserAlive"], true);
+        assert_eq!(second.result.unwrap()["browserAlive"], false);
+    }
+
+    #[tokio::test]
     async fn request_shutdown_should_set_the_shutdown_flag_and_cancel_the_token() {
         let daemon = Daemon::new();
 

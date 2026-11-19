@@ -146,7 +146,40 @@ mod tests {
     }
 
     #[test]
-    fn detect_bot_challenge_should_ignore_normal_pages() {
-        assert!(detect_bot_challenge("Example Domain", "hello", "<html></html>").is_none());
+    fn detect_bot_challenge_should_require_the_documented_signals() {
+        let script = "<script src=\"/cdn-cgi/challenge-platform/h/b\"></script>";
+        let cases = [
+            ("title only", "Just a moment...", "", "", true),
+            ("title case variant", "JUST A MOMENT...", "", "", true),
+            ("html only", "Home", "welcome", script, false),
+            (
+                "text only",
+                "Home",
+                "Verify you are human",
+                "<html></html>",
+                false,
+            ),
+            (
+                "html and text",
+                "Home",
+                "Checking your browser",
+                script,
+                true,
+            ),
+            (
+                "normal page",
+                "Example Domain",
+                "hello",
+                "<html></html>",
+                false,
+            ),
+        ];
+        for (name, title, text, html, expected) in cases {
+            assert_eq!(
+                detect_bot_challenge(title, text, html).is_some(),
+                expected,
+                "{name}"
+            );
+        }
     }
 }
