@@ -2,16 +2,18 @@
 # Installs the thin client and daemon into the same directory: the thin client
 # finds `stapler-mcp-daemon` beside itself.
 #
-# Default: download the prebuilt release for this platform (seconds). Falls back
-# to compiling from source when no matching release/asset exists, the checksum
-# fails, or STAPLER_MCP_FROM_SOURCE=1.
+# Installs what this checkout contains: a source build by default. The prebuilt
+# release (seconds, checksum-verified) is used only when HEAD sits exactly on a
+# v* release tag, or when STAPLER_MCP_VERSION=vX.Y.Z names one; otherwise a
+# "latest" download could silently install older code than the checkout.
+# Falls back to a source build when the release/asset is missing or the checksum
+# fails; STAPLER_MCP_FROM_SOURCE=1 skips the download attempt entirely.
 #
 # Source builds use the `release-fast` profile (thin LTO, parallel codegen) for
 # the daemon; set STAPLER_MCP_PROFILE=release for the size/speed-optimized fat-LTO
 # build that releases ship. Extra args (e.g. `--root DIR`) go to cargo; only a
 # lone `--root DIR` is honoured by the prebuilt path.
 #
-# Env: STAPLER_MCP_VERSION=vX.Y.Z pins a release (default: latest).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,8 +34,9 @@ install_prebuilt() {
     *) return 1 ;;
   esac
 
-  local base="https://github.com/$REPO/releases/latest/download"
-  [[ -n "${STAPLER_MCP_VERSION:-}" ]] && base="https://github.com/$REPO/releases/download/$STAPLER_MCP_VERSION"
+  local version="${STAPLER_MCP_VERSION:-$(git describe --exact-match --tags --match 'v*' HEAD 2>/dev/null || true)}"
+  [[ -n "$version" ]] || return 1
+  local base="https://github.com/$REPO/releases/download/$version"
   base="${STAPLER_MCP_RELEASE_BASE:-$base}" # test hook: any curl-readable dir/URL
   local asset="stapler-mcp-$target.tar.gz"
 
@@ -55,7 +58,7 @@ install_prebuilt() {
 if [[ "${STAPLER_MCP_FROM_SOURCE:-0}" != "1" ]] && install_prebuilt "$@"; then
   exit 0
 fi
-echo "No usable prebuilt release; building from source" >&2
+echo "Building from source (no prebuilt release for this checkout)" >&2
 
 # Keep build artifacts in the repo so an interrupted build resumes instead of
 # recompiling every dependency (`cargo install` otherwise uses a temp dir).
